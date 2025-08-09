@@ -1,0 +1,23 @@
+## Model/binary artifacts
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.h5
+*.npz
+*.npy
+*.bin
+*.safetensors
+
+## Large directories/artifacts (relative to repo root)
+BrainLM/pretrained_models/
+CBraMod/pretrained_weights/
+wandb/
+translator_runs/
+oddball_eeg_fmri_august8_run7_overlap11_weights/
+
+## Python/OS
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store

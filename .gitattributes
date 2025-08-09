@@ -1,0 +1,4 @@
+*.pt
+*.pth
+BrainLM/pretrained_models/
+CBraMod/pretrained_weights/
