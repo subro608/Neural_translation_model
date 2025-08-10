@@ -650,8 +650,8 @@ def main() -> None:
     parser.add_argument('--eeg_root', type=str, required=True)
     parser.add_argument('--fmri_root', type=str, required=True)
     parser.add_argument('--a424_label_nii', type=str, default=str(THIS_DIR / 'BrainLM' / 'resources' / 'atlases' / 'A424_resampled_to_bold.nii.gz'))
-    parser.add_argument('--cbramod_weights', type=str, default=str(THIS_DIR / 'CBraMod' / 'pretrained_weights' / 'pretrained_weights.pth'))
-    parser.add_argument('--brainlm_model_dir', type=str, default=str(THIS_DIR / 'BrainLM' / 'pretrained_models' / '2023-06-06-22_15_00-checkpoint-1400'))
+    parser.add_argument('--cbramod_weights', type=str, default=r"D:\\Neuroinformatics_research_2025\\MNI_templates\\CBraMod\\pretrained_weights\\pretrained_weights.pth")
+    parser.add_argument('--brainlm_model_dir', type=str, default=r"D:\\Neuroinformatics_research_2025\\MNI_templates\\BrainLM\\pretrained_models\\2023-06-06-22_15_00-checkpoint-1400")
     parser.add_argument('--output_dir', type=str, default=str(THIS_DIR / 'translator_runs'))
     parser.add_argument('--device', type=str, default='cpu')
     parser.add_argument('--seed', type=int, default=42)
@@ -679,48 +679,17 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    # Resolve defaults/fallbacks if paths are missing
-    # a424_label_nii
+    # Strict path checks: let it fail if missing
     if not Path(args.a424_label_nii).exists():
-        candidates = [
-            THIS_DIR / 'BrainLM' / 'resources' / 'atlases' / 'A424_resampled_to_bold.nii.gz',
-            THIS_DIR / 'BrainLM' / 'resources' / 'atlases' / 'A424.nii.gz',
-            THIS_DIR / 'resources' / 'atlases' / 'A424_resampled_to_bold.nii.gz',
-            THIS_DIR / 'resources' / 'atlases' / 'A424.nii.gz',
-            REPO_ROOT / 'BrainLM' / 'A424_resampled_to_bold.nii.gz',
-        ]
-        for c in candidates:
-            if c.exists():
-                args.a424_label_nii = str(c)
-                break
-        else:
-            raise FileNotFoundError(f"A424 atlas not found: {args.a424_label_nii}")
+        raise FileNotFoundError(f"A424 atlas not found: {args.a424_label_nii}")
 
     # CBraMod weights
     if not Path(args.cbramod_weights).exists():
-        fallback_cbramod = CBRAMOD_DIR / 'pretrained_weights' / 'pretrained_weights.pth'
-        if fallback_cbramod.exists():
-            args.cbramod_weights = str(fallback_cbramod)
-        else:
-            alt = THIS_DIR / 'pretrained_weights' / 'pretrained_weights.pth'
-            if alt.exists():
-                args.cbramod_weights = str(alt)
-            else:
-                raise FileNotFoundError(f"CBraMod weights not found: {args.cbramod_weights}")
+        raise FileNotFoundError(f"CBraMod weights not found: {args.cbramod_weights}")
 
     # BrainLM checkpoint dir
     if not Path(args.brainlm_model_dir).exists():
-        candidates = [
-            THIS_DIR / 'BrainLM' / 'pretrained_models' / '2023-06-06-22_15_00-checkpoint-1400',
-            REPO_ROOT / 'BrainLM' / 'pretrained_models' / '2023-06-06-22_15_00-checkpoint-1400',
-            THIS_DIR / 'pretrained_models' / '2023-06-06-22_15_00-checkpoint-1400',
-        ]
-        for c in candidates:
-            if c.exists():
-                args.brainlm_model_dir = str(c)
-                break
-        else:
-            raise FileNotFoundError(f"BrainLM checkpoint dir not found: {args.brainlm_model_dir}")
+        raise FileNotFoundError(f"BrainLM checkpoint dir not found: {args.brainlm_model_dir}")
 
     cfg = TrainConfig(
         eeg_root=Path(args.eeg_root),
