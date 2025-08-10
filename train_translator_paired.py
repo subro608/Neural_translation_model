@@ -775,8 +775,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description='Train translator-decoder on paired Oddball EEG+fMRI with tri-mix masking')
     # Config file (YAML/JSON) support — values from file become defaults; CLI overrides
     parser.add_argument('--config', type=str, default=None, help='Path to YAML/JSON config. If YAML has sections, uses "train".')
-    parser.add_argument('--eeg_root', type=str, required=True)
-    parser.add_argument('--fmri_root', type=str, required=True)
+    parser.add_argument('--eeg_root', type=str)
+    parser.add_argument('--fmri_root', type=str)
     parser.add_argument('--a424_label_nii', type=str, default=str(THIS_DIR / 'BrainLM' / 'resources' / 'atlases' / 'A424_resampled_to_bold.nii.gz'))
     # Set your local defaults or change here:
     parser.add_argument('--cbramod_weights', type=str, default=r"D:\Neuroinformatics_research_2025\MNI_templates\CBraMod\pretrained_weights\pretrained_weights.pth")
