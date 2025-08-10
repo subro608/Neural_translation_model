@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Train the adapter_main_translatordecoder using paired, aligned Oddball EEG+fMRI windows.
+Train the adapter_main_translatordecoder using paired, aligned Oddball EEG+fMRI windows,
+with tri-mix training:
+  - Both modalities available
+  - Single-modality (one side missing)
+  - Partial-modality (randomly EEG or fMRI partially visible, random visible fraction)
 
-Key changes vs earlier version
-- Uses a SINGLE PairedAlignedDataset / DataLoader -> every batch always has both EEG and fMRI from same (sub, run, time)
-- Overlap control via --stride_sec (e.g., window_sec=40, stride_sec=10 -> 30s overlap)
-- Saves FULL training checkpoints (translator + optimizer + scaler + config + rng + metrics)
-- Optional --resume to pick up training exactly where you left off
+Saves FULL checkpoints (translator + optimizer + scaler + config + rng + metrics)
+and optionally resumes exactly via --resume.
 """
 
 from __future__ import annotations
@@ -18,35 +19,35 @@ import time
 import argparse
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-# wandb
+# wandb (optional)
 import wandb
 try:
     from tqdm import tqdm
 except Exception:
     tqdm = None
 
-# Local paths to import vendored modules first
+# ---------- Local repo layout ----------
 THIS_DIR = Path(__file__).parent
 REPO_ROOT = THIS_DIR.parent
 CBRAMOD_DIR = REPO_ROOT / "CBraMod"
 BRAINLM_DIR = REPO_ROOT / "BrainLM"
 
-# Prefer local copies inside Multi_modal_NTM if present
+# Prefer local copies inside project if present
 sys.path.insert(0, str(THIS_DIR))
 sys.path.insert(0, str(THIS_DIR / "CBraMod"))
 sys.path.insert(0, str(THIS_DIR / "BrainLM"))
 sys.path.append(str(CBRAMOD_DIR))
 sys.path.append(str(BRAINLM_DIR))
 
-# Adapter and core blocks
-from adapter_main_translatordecoder import (  # type: ignore
+# Adapters & core
+from module import (  # type: ignore
     BidirectionalAdaptiveCompressor,
     ConvEEGInputAdapter,
     fMRIInputAdapterConv1d,
@@ -55,13 +56,13 @@ from adapter_main_translatordecoder import (  # type: ignore
     EEGDecodingAdapter,
 )
 
-# Models (CBraMod from local vendored path if available)
+# Models
 from models.cbramod import CBraMod  # type: ignore
 from brainlm_mae.modeling_brainlm import BrainLMForPretraining  # type: ignore
-from brainlm_mae.configuration_brainlm import BrainLMConfig  # type: ignore
+from brainlm_mae.configuration_brainlm import BrainLMConfig     # type: ignore
 
-# Data (paired + aligned, with optional overlap)
-from data_oddball import (
+# Data
+from data_oddball import (  # type: ignore
     pad_timepoints_for_brainlm_torch,
     load_a424_coords,
     PairedAlignedDataset,
@@ -69,16 +70,15 @@ from data_oddball import (
 )
 
 # -----------------------------
-# Utility: Reproducibility
+# Utility
 # -----------------------------
 def seed_all(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-
 # -----------------------------
-# Feature extractors (frozen)
+# Frozen feature extractors
 # -----------------------------
 class FrozenCBraMod(nn.Module):
     def __init__(self, in_dim: int, d_model: int, seq_len: int, n_layer: int, nhead: int, dim_feedforward: int,
@@ -169,9 +169,8 @@ class FrozenBrainLM(nn.Module):
         all_hidden_states = encoder_outputs.hidden_states  # tuple of (B,T,D)
         return torch.stack(list(all_hidden_states), dim=0)
 
-
 # -----------------------------
-# Translator model (trainable)
+# Trainable translator
 # -----------------------------
 class TranslatorModel(nn.Module):
     def __init__(
@@ -241,51 +240,38 @@ class TranslatorModel(nn.Module):
         fmri_latents: torch.Tensor,       # (L,B,T,H)
         fmri_target_T: int,
         fmri_target_V: int,
-    ):
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         self._dbg("\n[Forward] start")
-        self._dbg(f"  EEG latents in: {tuple(eeg_latents.shape)} (L,B,S,C,D)")
-        self._dbg(f"  fMRI latents in: {tuple(fmri_latents.shape)} (L,B,T,H)")
+        eeg_adapted = self.adapter_eeg(eeg_latents)   # (B, N_eeg_tokens, D)
+        fmri_adapted = self.adapter_fmri(fmri_latents)# (B, N_fmri_tokens, D)
 
-        eeg_adapted = self.adapter_eeg(eeg_latents)           # (B, N_eeg_tokens, D)
-        fmri_adapted = self.adapter_fmri(fmri_latents)        # (B, N_fmri_tokens, D)
-        self._dbg(f"  EEG after adapter: {tuple(eeg_adapted.shape)}")
-        self._dbg(f"  fMRI after adapter: {tuple(fmri_adapted.shape)}")
+        _, eeg_higher = self.eeg_encoder(eeg_adapted, eeg_adapted)
+        _, fmri_higher = self.fmri_encoder(fmri_adapted, fmri_adapted)
 
-        eeg_lower_enc, eeg_higher_enc = self.eeg_encoder(eeg_adapted, eeg_adapted)
-        fmri_lower_enc, fmri_higher_enc = self.fmri_encoder(fmri_adapted, fmri_adapted)
-        self._dbg(f"  EEG enc higher: {tuple(eeg_higher_enc.shape)} | fMRI enc higher: {tuple(fmri_higher_enc.shape)}")
-
-        eeg_compressed, fmri_compressed, _ = self.compressor(eeg_higher_enc, fmri_higher_enc)
-        self._dbg(f"  After compressor EEG: {tuple(eeg_compressed.shape)} fMRI: {tuple(fmri_compressed.shape)}")
-
-        fused_output = self.cross_attn(eeg_compressed, fmri_compressed)  # (B, Tfused, D)
-        self._dbg(f"  Fused output: {tuple(fused_output.shape)}")
+        eeg_c, fmri_c, _ = self.compressor(eeg_higher, fmri_higher)
+        fused = self.cross_attn(eeg_c, fmri_c)        # (B, Tfused, D)
 
         # EEG decode
-        eeg_reconstructed_layers = self.eeg_decoder(fused_output)        # (L,B,P,C,S)
-        eeg_signal = eeg_reconstructed_layers.mean(dim=0).permute(0, 2, 1, 3).contiguous()  # (B,C,P,S)
-        self._dbg(f"  EEG signal out: {tuple(eeg_signal.shape)}")
+        eeg_layers = self.eeg_decoder(fused)          # (L,B,P,C,S)
+        eeg_signal = eeg_layers.mean(dim=0).permute(0, 2, 1, 3).contiguous()  # (B,C,P,S)
 
         # fMRI decode
-        H = self.fmri_proj(fused_output)          # (B, Tfused, D)
-        Hc = H.transpose(1, 2).contiguous()       # (B, D, Tfused)
-        Hc = self.fmri_depthwise(Hc)              # (B, D, Tfused)
+        H = self.fmri_proj(fused)                     # (B, Tfused, D)
+        Hc = H.transpose(1, 2).contiguous()           # (B, D, Tfused)
+        Hc = self.fmri_depthwise(Hc)                  # (B, D, Tfused)
         if Hc.shape[-1] != fmri_target_T:
             Hc = nn.functional.interpolate(Hc, size=fmri_target_T, mode='linear', align_corners=False)
-        H = Hc.transpose(1, 2).contiguous()       # (B, T, D)
+        H = Hc.transpose(1, 2).contiguous()           # (B, T, D)
 
         if (self.fmri_voxel_embed is None) or (self.fmri_voxel_embed.num_embeddings != fmri_target_V) or (self.fmri_voxel_embed.embedding_dim != H.shape[-1]):
             self.fmri_voxel_embed = nn.Embedding(fmri_target_V, H.shape[-1]).to(H.device)
-        E = self.fmri_voxel_embed.weight          # (V, D)
-        fmri_signal = torch.matmul(H, E.t())      # (B, T, V)
-        self._dbg(f"  fMRI signal out: {tuple(fmri_signal.shape)}")
-
+        E = self.fmri_voxel_embed.weight              # (V, D)
+        fmri_signal = torch.matmul(H, E.t())          # (B, T, V)
         self._dbg("[Forward] end\n")
         return eeg_signal, fmri_signal
 
-
 # -----------------------------
-# Training utilities
+# Config
 # -----------------------------
 @dataclass
 class TrainConfig:
@@ -301,7 +287,7 @@ class TrainConfig:
     target_fs: int = 200
     window_sec: int = 30
     stride_sec: Optional[int] = None
-    batch_size: int = 2
+    batch_size: int = 8
     lr: float = 1e-4
     weight_decay: float = 1e-4
     num_epochs: int = 5
@@ -316,12 +302,14 @@ class TrainConfig:
     # loss weights
     eeg_loss_w: float = 1.0
     fmri_loss_w: float = 1.0
-    # EEG tokenization
+    # EEG token grouping
     eeg_seconds_per_token: int = 40
     # resume
     resume: Optional[Path] = None
 
-
+# -----------------------------
+# Checkpoints
+# -----------------------------
 def save_checkpoint(path: Path, translator: TranslatorModel, optim: torch.optim.Optimizer,
                     scaler: torch.amp.GradScaler, cfg: TrainConfig, epoch: int,
                     global_step: int, best_val: float) -> None:
@@ -345,7 +333,6 @@ def save_checkpoint(path: Path, translator: TranslatorModel, optim: torch.optim.
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(ckpt, path)
-
 
 def load_checkpoint(path: Path, translator: TranslatorModel, optim: torch.optim.Optimizer,
                     scaler: torch.amp.GradScaler, device: torch.device):
@@ -374,7 +361,60 @@ def load_checkpoint(path: Path, translator: TranslatorModel, optim: torch.optim.
         pass
     return epoch, global_step, best_val
 
+# -----------------------------
+# Mask builders
+# -----------------------------
+def _rand_block_mask_time_per_sample(B: int, L: int, frac_vis_each: torch.Tensor, device) -> torch.Tensor:
+    """
+    Build boolean masks (B, L) where True==MASKED.
+    Each sample i keeps a contiguous visible block of length int(frac_vis_each[i]*L) at a random start.
+    """
+    M = torch.ones(B, L, dtype=torch.bool, device=device)  # start masked
+    for i in range(B):
+        vis = max(1, int(round(float(frac_vis_each[i]) * L)))
+        vis = min(vis, L)
+        start = 0
+        if L > vis:
+            start = int(torch.randint(0, L - vis + 1, (1,), device=device))
+        M[i, start:start+vis] = False  # False = visible
+    return M  # True = masked
 
+def _group_mask_seconds(M_time: torch.Tensor, seconds_per_token: int) -> torch.Tensor:
+    """
+    M_time: (B, P) boolean (True=masked) at 1-second resolution
+    Returns M_grp: (B, Pe) where Pe = P // seconds_per_token.
+    Group is masked if ANY second in the group is masked.
+    """
+    B, P = M_time.shape
+    g = max(1, min(seconds_per_token, P))
+    Pe = max(1, P // g)
+    if Pe * g != P:
+        M_time = M_time[:, :Pe*g]
+    M_trim = M_time.reshape(B, Pe, g)
+    return M_trim.any(dim=2)  # (B, Pe)
+
+# -----------------------------
+# EEG grouping helpers
+# -----------------------------
+def group_eeg_latents_seconds(eeg_latents: torch.Tensor, seconds_per_token: int) -> torch.Tensor:
+    # eeg_latents: (L,B,P,C,D) where P=window_sec (1s tokens)
+    L, B, P, C, D = eeg_latents.shape
+    g = max(1, min(seconds_per_token, P))
+    P_grp = max(1, P // g)
+    x = eeg_latents[:, :, :P_grp * g].reshape(L, B, P_grp, g, C, D).mean(dim=3)
+    return x
+
+def group_eeg_signal_seconds(x_eeg_sig: torch.Tensor, seconds_per_token: int) -> torch.Tensor:
+    # x_eeg_sig: (B,C,P,S)
+    B_, C_, P_, S_ = x_eeg_sig.shape
+    g = max(1, min(seconds_per_token, P_))
+    P_grp = max(1, P_ // g)
+    x = x_eeg_sig[:, :, :P_grp * g, :].reshape(B_, C_, P_grp, g, S_).mean(dim=3)
+    return x
+
+# -----------------------------
+# Training loop with tri-mix
+# -----------------------------
 def train_loop(cfg: TrainConfig) -> None:
     def dbg(msg: str) -> None:
         if cfg.debug:
@@ -391,7 +431,7 @@ def train_loop(cfg: TrainConfig) -> None:
         except Exception:
             pass
 
-    # Dataset / Loader: paired & aligned (optional overlap by stride_sec)
+    # Dataset / Loader
     ds_train = PairedAlignedDataset(
         eeg_root=cfg.eeg_root,
         fmri_root=cfg.fmri_root,
@@ -410,11 +450,18 @@ def train_loop(cfg: TrainConfig) -> None:
         return
 
     pin = device.type == 'cuda'
-    dl = DataLoader(ds_train, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers,
-                    collate_fn=collate_paired, pin_memory=pin, drop_last=False)
+    dl = DataLoader(
+        ds_train,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        collate_fn=collate_paired,
+        pin_memory=pin,
+        drop_last=False
+    )
 
     # Frozen feature extractors
-    seq_len_eeg = cfg.window_sec  # EEG tokens per second (1s per token before grouping)
+    seq_len_eeg = cfg.window_sec  # EEG: 1s tokens
     frozen_cbramod = FrozenCBraMod(
         in_dim=cfg.target_fs,
         d_model=cfg.target_fs,
@@ -427,10 +474,9 @@ def train_loop(cfg: TrainConfig) -> None:
     )
     frozen_brainlm = FrozenBrainLM(cfg.brainlm_model_dir, device=device)
 
-    # EEG grouping (e.g., 40s->1 token by default)
+    # Translator
     eeg_group = max(1, int(cfg.eeg_seconds_per_token))
     eeg_patch_num_grouped = max(1, int(cfg.window_sec) // eeg_group)
-
     translator = TranslatorModel(
         eeg_channels=34,
         eeg_patch_num=eeg_patch_num_grouped,
@@ -452,6 +498,7 @@ def train_loop(cfg: TrainConfig) -> None:
         weight_decay=cfg.weight_decay,
     )
     mse_loss = nn.MSELoss()
+    scaler = torch.amp.GradScaler('cuda', enabled=(cfg.amp and device.type == 'cuda'))
 
     # wandb
     run = None
@@ -461,64 +508,119 @@ def train_loop(cfg: TrainConfig) -> None:
             name=cfg.wandb_run_name,
             config={**asdict(cfg), "model": "Translator+CBraMod(frozen)+BrainLM(frozen)"},
         )
-        wandb.watch(translator, log="gradients", log_freq=200)
+        try:
+            wandb.watch(translator, log="gradients", log_freq=200)
+        except Exception:
+            pass
 
-    scaler = torch.amp.GradScaler('cuda', enabled=(cfg.amp and device.type == 'cuda'))
+    # Resume
     start_epoch = 1
     global_step = 0
     best_val = float('inf')
-
-    # Resume?
+    best_path = Path(cfg.output_dir) / 'translator_best.pt'
+    last_path = Path(cfg.output_dir) / 'translator_last.pt'
     if cfg.resume is not None and Path(cfg.resume).exists():
         print(f"Resuming from {cfg.resume}")
         last_epoch, global_step, best_val = load_checkpoint(Path(cfg.resume), translator, optim, scaler, device)
         start_epoch = max(1, int(last_epoch) + 1)
 
-    def group_eeg_latents_seconds(eeg_latents: torch.Tensor, seconds_per_token: int) -> torch.Tensor:
-        # eeg_latents: (L,B,P,C,D) where P=window_sec (1s tokens)
-        L, B, P, C, D = eeg_latents.shape
-        g = max(1, min(seconds_per_token, P))
-        P_grp = P // g
-        x = eeg_latents[:, :, :P_grp * g].reshape(L, B, P_grp, g, C, D).mean(dim=3)
-        return x
-
-    def group_eeg_signal_seconds(x_eeg_sig: torch.Tensor, seconds_per_token: int) -> torch.Tensor:
-        # x_eeg_sig: (B,C,P,S)
-        B_, C_, P_, S_ = x_eeg_sig.shape
-        g = max(1, min(seconds_per_token, P_))
-        P_grp = P_ // g
-        x = x_eeg_sig[:, :, :P_grp * g, :].reshape(B_, C_, P_grp, g, S_).mean(dim=3)
-        return x
+    # ---- Fixed tri-mix settings (no flags) ----
+    TRI_RATIOS = (0.34, 0.33, 0.33)        # (both, single, partial)
+    PARTIAL_VISIBLE_RANGE = (0.30, 0.80)   # random visible fraction per partial sample
+    SINGLE_SIDE = "random"                 # "random" | "eeg_only" | "fmri_only"
 
     def run_epoch(mode: str, epoch: int):
         nonlocal global_step, best_val
-        is_train = mode == 'train'
+        is_train = (mode == 'train')
         translator.train(is_train)
 
         total_eeg_loss = 0.0
         total_fmri_loss = 0.0
         steps = 0
 
-        total_steps = len(dl)
-        iterator = dl
-        if tqdm is not None:
-            iterator = tqdm(dl, total=total_steps, desc=f"{mode} {epoch}/{cfg.num_epochs}", leave=False)
+        rsum = sum(TRI_RATIOS)
+        r_both, r_single, r_partial = [r/rsum for r in TRI_RATIOS]
+
+        iterator = dl if tqdm is None else tqdm(dl, total=len(dl), desc=f"{mode} {epoch}/{cfg.num_epochs}", leave=False)
 
         for i, batch in enumerate(iterator):
-            x_eeg = batch['eeg_window'].to(device, non_blocking=True)   # (B,C,P,S) P=window_sec
-            fmri_t = batch['fmri_window'].to(device, non_blocking=True) # (B,T,V) already normalized in dataset
+            x_eeg = batch['eeg_window'].to(device, non_blocking=True)   # (B,C,P,S)
+            fmri_t = batch['fmri_window'].to(device, non_blocking=True) # (B,T,V)
 
-            # Extract latents
+            B, _, P, _ = x_eeg.shape
+            _, T, V = fmri_t.shape
+
+            # ----- assign per-sample conditions: 0=both, 1=single, 2=partial
+            nb_both   = int(round(B * r_both))
+            nb_single = int(round(B * r_single))
+            nb_part   = max(0, B - nb_both - nb_single)
+
+            cond = torch.empty(B, dtype=torch.int64, device=device)
+            perm = torch.randperm(B, device=device)
+            cond[perm[:nb_both]] = 0
+            cond[perm[nb_both:nb_both+nb_single]] = 1
+            cond[perm[nb_both+nb_single:]] = 2
+
+            # single: which side remains?
+            if SINGLE_SIDE == 'random':
+                keep_eeg = (torch.rand(B, device=device) < 0.5)
+            else:
+                keep_eeg = torch.full((B,), SINGLE_SIDE == 'eeg_only', dtype=torch.bool, device=device)
+            miss_eeg   = (cond==1) & (~keep_eeg)   # EEG missing
+            miss_fmri  = (cond==1) & ( keep_eeg)   # fMRI missing
+            is_partial = (cond==2)
+
+            # partial: which modality?
+            partial_eeg = torch.zeros(B, dtype=torch.bool, device=device)
+            partial_fmr = torch.zeros(B, dtype=torch.bool, device=device)
+            if is_partial.any():
+                choose_eeg = (torch.rand(B, device=device) < 0.5)
+                partial_eeg = is_partial & choose_eeg
+                partial_fmr = is_partial & (~choose_eeg)
+
+            # random visible fractions (unused entries ignored)
+            lo, hi = PARTIAL_VISIBLE_RANGE
+            frac_vis = torch.empty(B, device=device).uniform_(lo, hi)
+
+            # EEG time masks (B,P) for partial_eeg
+            M_eeg_time = torch.zeros(B, P, dtype=torch.bool, device=device)
+            if partial_eeg.any():
+                idx = torch.nonzero(partial_eeg, as_tuple=False).squeeze(1)
+                M_eeg_time[idx] = _rand_block_mask_time_per_sample(
+                    int(idx.numel()), P, frac_vis[idx], device
+                )
+
+            # fMRI time masks (B,T,V) for partial_fmr
+            M_fmri = torch.zeros(B, T, V, dtype=torch.bool, device=device)
+            if partial_fmr.any():
+                idx = torch.nonzero(partial_fmr, as_tuple=False).squeeze(1)
+                Mt = _rand_block_mask_time_per_sample(
+                    int(idx.numel()), T, frac_vis[idx], device
+                )  # (b_p, T)
+                M_fmri[idx, :, :] = Mt.unsqueeze(-1).expand(-1, T, V)
+
+            # ----- observed inputs to encoders (no leakage)
+            x_eeg_obs = x_eeg.clone()
+            x_eeg_obs[miss_eeg] = 0.0
+            if partial_eeg.any():
+                idx = torch.nonzero(partial_eeg, as_tuple=False).squeeze(1)
+                for b in idx.tolist():
+                    mask = M_eeg_time[b]  # (P,)
+                    x_eeg_obs[b, :, mask, :] = 0.0
+
+            fmri_obs = fmri_t.clone()
+            fmri_obs[miss_fmri] = 0.0
+            fmri_obs[M_fmri] = 0.0
+
+            # ----- frozen latents
             with torch.no_grad():
-                eeg_latents = frozen_cbramod.extract_latents(x_eeg)      # (L,B,P,C,D)
-                # fMRI prep for BrainLM
-                fmri_padded = pad_timepoints_for_brainlm_torch(fmri_t, patch_size=20)  # (B,Tp,V)
-                signal_vectors = fmri_padded.permute(0, 2, 1).contiguous()             # (B,V,Tp)
+                eeg_latents = frozen_cbramod.extract_latents(x_eeg_obs)  # (L,B,P,C,D)
 
-                # Use A424 coords if available; if V!=424, fall back to zeros
-                Bf, Tf, Vf = fmri_t.shape
+                fmri_padded = pad_timepoints_for_brainlm_torch(fmri_obs, patch_size=20)  # (B,Tp,V)
+                signal_vectors = fmri_padded.permute(0, 2, 1).contiguous()               # (B,V,Tp)
+
+                # coords (A424 normalized if V==424, else zeros) with robust search
                 try:
-                    # Prefer local BrainLM resources first, then generic resources, then repo fallback
                     cand = [
                         THIS_DIR / 'BrainLM' / 'resources' / 'atlases' / 'A424_Coordinates.dat',
                         THIS_DIR / 'resources' / 'atlases' / 'A424_Coordinates.dat',
@@ -533,24 +635,24 @@ def train_loop(cfg: TrainConfig) -> None:
                     coords_np = load_a424_coords(a424_dat)
                     max_abs = float(np.max(np.abs(coords_np))) or 1.0
                     coords_np = coords_np / max_abs
-                    if Vf == 424:
-                        xyz = torch.from_numpy(coords_np).to(device=device, dtype=torch.float32).unsqueeze(0).repeat(Bf, 1, 1)
+                    if V == 424:
+                        xyz = torch.from_numpy(coords_np).to(device=device, dtype=torch.float32).unsqueeze(0).repeat(B, 1, 1)
                     else:
-                        xyz = torch.zeros(Bf, Vf, 3, device=device)
+                        xyz = torch.zeros(B, V, 3, device=device)
                 except Exception:
-                    xyz = torch.zeros(Bf, Vf, 3, device=device)
+                    xyz = torch.zeros(B, V, 3, device=device)
 
-                fmri_latents = frozen_brainlm.extract_latents(signal_vectors, xyz, noise=None)  # (L,B,T_tokens,H)
+                fmri_latents = frozen_brainlm.extract_latents(signal_vectors, xyz, noise=None)  # (L,B,Ttok,H)
 
-            # Group EEG tokens (and targets) to match decoder tokenization
+            # extra safety: zero latents when fully missing
+            if miss_eeg.any():
+                eeg_latents[:, miss_eeg, :, :, :] = 0.0
+            if miss_fmri.any():
+                fmri_latents[:, miss_fmri, :, :] = 0.0
+
+            # ----- group EEG and forward
             eeg_latents_t = group_eeg_latents_seconds(eeg_latents, cfg.eeg_seconds_per_token)  # (L,B,Pe,C,D)
-            x_eeg_grp = group_eeg_signal_seconds(x_eeg, cfg.eeg_seconds_per_token)             # (B,C,Pe,S)
-
-            if cfg.debug:
-                print("\n[Batch Debug]")
-                print(f"  mode={mode} B={x_eeg.shape[0]}")
-                print(f"  EEG latents: {tuple(eeg_latents_t.shape)}  target x_eeg_grp: {tuple(x_eeg_grp.shape)}")
-                print(f"  fMRI latents: {tuple(fmri_latents.shape)}  target fmri_t: {tuple(fmri_t.shape)}")
+            x_eeg_grp     = group_eeg_signal_seconds(x_eeg,  cfg.eeg_seconds_per_token)        # (B,C,Pe,S)
 
             if is_train:
                 optim.zero_grad(set_to_none=True)
@@ -561,8 +663,36 @@ def train_loop(cfg: TrainConfig) -> None:
                     fmri_target_T=int(fmri_t.shape[1]),
                     fmri_target_V=int(fmri_t.shape[2]),
                 )
-                loss_eeg = mse_loss(recon_eeg, x_eeg_grp)
-                loss_fmri = mse_loss(recon_fmri, fmri_t)
+
+                # ----- losses
+                # EEG: masked-only for partial_eeg (grouped mask)
+                eeg_diff = (recon_eeg - x_eeg_grp) ** 2                     # (B,C,Pe,S)
+                eeg_diff_cs = eeg_diff.mean(dim=(1,3))                      # (B,Pe)
+                M_eeg_grp = _group_mask_seconds(M_eeg_time, cfg.eeg_seconds_per_token)  # (B,Pe)
+
+                eeg_full = eeg_diff_cs.mean(dim=1)                          # (B,)
+                masked_sum_e = (eeg_diff_cs * M_eeg_grp.float()).sum(dim=1)
+                masked_cnt_e = M_eeg_grp.sum(dim=1).clamp_min(1)
+                eeg_mask_only = masked_sum_e / masked_cnt_e
+                eeg_mse = torch.where(partial_eeg, eeg_mask_only, eeg_full)
+
+                # fMRI: masked-only for partial_fmr
+                fmri_diff = (recon_fmri - fmri_t) ** 2                      # (B,T,V)
+                fmri_full = fmri_diff.flatten(1).mean(dim=1)                # (B,)
+                masked_sum_f = (fmri_diff * M_fmri.float()).flatten(1).sum(dim=1)
+                masked_cnt_f = M_fmri.flatten(1).sum(dim=1).clamp_min(1)
+                fmri_mask_only = masked_sum_f / masked_cnt_f
+                fmri_mse = torch.where(partial_fmr, fmri_mask_only, fmri_full)
+
+                # emphasize cross-modal when single; otherwise equal
+                alpha_miss, beta_pres = 1.0, 1.0
+                w_eeg = torch.where(miss_eeg, torch.as_tensor(alpha_miss, device=device),
+                                              torch.as_tensor(beta_pres,  device=device))
+                w_fmr = torch.where(miss_fmri, torch.as_tensor(alpha_miss, device=device),
+                                              torch.as_tensor(beta_pres,  device=device))
+
+                loss_eeg  = (w_eeg * eeg_mse).mean()
+                loss_fmri = (w_fmr * fmri_mse).mean()
                 loss = cfg.eeg_loss_w * loss_eeg + cfg.fmri_loss_w * loss_fmri
 
             if is_train:
@@ -576,19 +706,18 @@ def train_loop(cfg: TrainConfig) -> None:
             total_fmri_loss += float(loss_fmri.detach().cpu())
             steps += 1
 
-            # Progress bar: epochs left and steps left
+            # progress bar
             if tqdm is not None:
-                epochs_left = max(0, cfg.num_epochs - epoch)
-                steps_left = (total_steps - (i + 1)) + epochs_left * total_steps
-                iterator.set_postfix_str(f"left: {epochs_left}e {steps_left}s, loss:{float(loss.detach().cpu()):.3f}")
+                iterator.set_postfix_str(f"loss:{float(loss.detach().cpu()):.3f}")
 
             if is_train and not cfg.wandb_off:
                 wandb.log({
                     "train/step_total_loss": float(loss.detach().cpu()),
                     "train/step_eeg_loss": float(loss_eeg.detach().cpu()),
                     "train/step_fmri_loss": float(loss_fmri.detach().cpu()),
-                    "train/eeg_loss_w": cfg.eeg_loss_w,
-                    "train/fmri_loss_w": cfg.fmri_loss_w,
+                    "train/frac_both":   float((cond==0).float().mean().cpu()),
+                    "train/frac_single": float((cond==1).float().mean().cpu()),
+                    "train/frac_partial":float((cond==2).float().mean().cpu()),
                 }, step=global_step)
 
         scalars = {
@@ -597,14 +726,11 @@ def train_loop(cfg: TrainConfig) -> None:
         }
         return scalars
 
-    best_path = Path(cfg.output_dir) / 'translator_best.pt'
-    last_path = Path(cfg.output_dir) / 'translator_last.pt'
-
+    # ---- epochs
     for epoch in range(start_epoch, cfg.num_epochs + 1):
         t0 = time.time()
         tr = run_epoch('train', epoch)
-        # In this paired setup we’re using a single dataset; if you want a held-out val split,
-        # make a second PairedAlignedDataset on separate files. For now, treat train loss as val proxy.
+        # Single dataset used; use train as val proxy
         va = {"val_eeg_loss": tr['train_eeg_loss'], "val_fmri_loss": tr['train_fmri_loss']}
         dur = time.time() - t0
 
@@ -612,19 +738,18 @@ def train_loop(cfg: TrainConfig) -> None:
               f"train EEG {tr['train_eeg_loss']:.6f} FMRI {tr['train_fmri_loss']:.6f} | "
               f"val EEG {va['val_eeg_loss']:.6f} FMRI {va['val_fmri_loss']:.6f}")
 
-        # Save "last" full checkpoint every epoch
+        # Save "last"
         save_checkpoint(last_path, translator, optim, scaler, cfg, epoch, global_step, best_val)
 
-        # Track best by (val_eeg + val_fmri)
+        # Best by sum
         val_score = va['val_eeg_loss'] + va['val_fmri_loss']
         if val_score < best_val:
             best_val = val_score
             save_checkpoint(best_path, translator, optim, scaler, cfg, epoch, global_step, best_val)
             print(f"  ✅ Saved BEST checkpoint to {best_path}")
             if not cfg.wandb_off:
-                wandb.summary["best_val_total_loss"] = best_val
                 try:
-                    wandb.save(str(best_path))
+                    wandb.summary["best_val_total_loss"] = best_val
                 except Exception:
                     pass
 
@@ -640,18 +765,20 @@ def train_loop(cfg: TrainConfig) -> None:
                 "best/val_total_loss": best_val,
             }, step=global_step)
 
-    # Optional: finish wandb
     if not cfg.wandb_off:
         wandb.finish()
 
-
+# -----------------------------
+# CLI
+# -----------------------------
 def main() -> None:
-    parser = argparse.ArgumentParser(description='Train translator-decoder on paired Oddball EEG+fMRI (aligned, optional overlap)')
+    parser = argparse.ArgumentParser(description='Train translator-decoder on paired Oddball EEG+fMRI with tri-mix masking')
     parser.add_argument('--eeg_root', type=str, required=True)
     parser.add_argument('--fmri_root', type=str, required=True)
     parser.add_argument('--a424_label_nii', type=str, default=str(THIS_DIR / 'BrainLM' / 'resources' / 'atlases' / 'A424_resampled_to_bold.nii.gz'))
-    parser.add_argument('--cbramod_weights', type=str, default=r"D:\\Neuroinformatics_research_2025\\MNI_templates\\CBraMod\\pretrained_weights\\pretrained_weights.pth")
-    parser.add_argument('--brainlm_model_dir', type=str, default=r"D:\\Neuroinformatics_research_2025\\MNI_templates\\BrainLM\\pretrained_models\\2023-06-06-22_15_00-checkpoint-1400")
+    # Set your local defaults or change here:
+    parser.add_argument('--cbramod_weights', type=str, default=r"D:\Neuroinformatics_research_2025\MNI_templates\CBraMod\pretrained_weights\pretrained_weights.pth")
+    parser.add_argument('--brainlm_model_dir', type=str, default=r"D:\Neuroinformatics_research_2025\MNI_templates\BrainLM\pretrained_models\2023-06-06-22_15_00-checkpoint-1400")
     parser.add_argument('--output_dir', type=str, default=str(THIS_DIR / 'translator_runs'))
     parser.add_argument('--device', type=str, default='cpu')
     parser.add_argument('--seed', type=int, default=42)
@@ -660,7 +787,7 @@ def main() -> None:
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--window_sec', type=int, default=30)
-    parser.add_argument('--stride_sec', type=int, default=None, help='Stride in seconds between paired windows (controls overlap)')
+    parser.add_argument('--stride_sec', type=int, default=None, help='Stride in seconds between windows (controls overlap)')
     parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--amp', action='store_true')
     parser.add_argument('--debug', action='store_true')
@@ -679,15 +806,11 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    # Strict path checks: let it fail if missing
+    # Strict path checks: fail fast if missing
     if not Path(args.a424_label_nii).exists():
         raise FileNotFoundError(f"A424 atlas not found: {args.a424_label_nii}")
-
-    # CBraMod weights
     if not Path(args.cbramod_weights).exists():
         raise FileNotFoundError(f"CBraMod weights not found: {args.cbramod_weights}")
-
-    # BrainLM checkpoint dir
     if not Path(args.brainlm_model_dir).exists():
         raise FileNotFoundError(f"BrainLM checkpoint dir not found: {args.brainlm_model_dir}")
 
@@ -720,7 +843,6 @@ def main() -> None:
     )
 
     train_loop(cfg)
-
 
 if __name__ == '__main__':
     main()
