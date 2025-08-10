@@ -484,6 +484,8 @@ def run_test(cfg: TestConfig):
 # -----------------------------
 def main():
     ap = argparse.ArgumentParser(description="Test EEG↔fMRI translator under various masking regimes.")
+    # Config file (JSON) support — values from file become defaults; CLI overrides them
+    ap.add_argument('--config', type=str, default=None, help='Path to JSON config file. Values become defaults; CLI overrides.')
     ap.add_argument('--eeg_root', type=str, required=True)
     ap.add_argument('--fmri_root', type=str, required=True)
     ap.add_argument('--a424_label_nii', type=str, required=True)
@@ -506,6 +508,26 @@ def main():
     ap.add_argument('--partial_visible_frac', type=float, default=0.5)
     ap.add_argument('--save_recons', type=str, default=None)
     ap.add_argument('--save_n_batches', type=int, default=0)
+    # Two-pass parse to allow config file to set defaults before final parse
+    temp_parser = argparse.ArgumentParser(add_help=False)
+    temp_parser.add_argument('--config', type=str, default=None)
+    temp_args, _ = temp_parser.parse_known_args()
+    if temp_args.config is not None:
+        cfg_path = Path(temp_args.config)
+        with open(cfg_path, 'r') as f:
+            if cfg_path.suffix.lower() in ('.yaml', '.yml'):
+                try:
+                    import yaml  # type: ignore
+                except Exception as e:
+                    raise RuntimeError("PyYAML is required for YAML configs. Install with 'pip install pyyaml'.") from e
+                file_cfg = yaml.safe_load(f)
+            else:
+                file_cfg = json.load(f)
+        if isinstance(file_cfg, dict) and 'test' in file_cfg:
+            file_cfg = file_cfg['test'] or {}
+        # Set defaults from config file; CLI will override
+        ap.set_defaults(**(file_cfg or {}))
+
     args = ap.parse_args()
 
     cfg = TestConfig(

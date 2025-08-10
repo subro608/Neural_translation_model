@@ -773,6 +773,8 @@ def train_loop(cfg: TrainConfig) -> None:
 # -----------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(description='Train translator-decoder on paired Oddball EEG+fMRI with tri-mix masking')
+    # Config file (YAML/JSON) support — values from file become defaults; CLI overrides
+    parser.add_argument('--config', type=str, default=None, help='Path to YAML/JSON config. If YAML has sections, uses "train".')
     parser.add_argument('--eeg_root', type=str, required=True)
     parser.add_argument('--fmri_root', type=str, required=True)
     parser.add_argument('--a424_label_nii', type=str, default=str(THIS_DIR / 'BrainLM' / 'resources' / 'atlases' / 'A424_resampled_to_bold.nii.gz'))
@@ -803,6 +805,25 @@ def main() -> None:
     parser.add_argument('--eeg_seconds_per_token', type=int, default=40)
     # resume
     parser.add_argument('--resume', type=str, default=None, help='Path to a full checkpoint to resume training')
+
+    # Two-pass parse to allow config file to set defaults before final parse
+    temp_parser = argparse.ArgumentParser(add_help=False)
+    temp_parser.add_argument('--config', type=str, default=None)
+    temp_args, _ = temp_parser.parse_known_args()
+    if temp_args.config is not None:
+        cfg_path = Path(temp_args.config)
+        with open(cfg_path, 'r') as f:
+            if cfg_path.suffix.lower() in ('.yaml', '.yml'):
+                try:
+                    import yaml  # type: ignore
+                except Exception as e:
+                    raise RuntimeError("PyYAML is required for YAML configs. Install with 'pip install pyyaml'.") from e
+                file_cfg = yaml.safe_load(f)
+            else:
+                file_cfg = json.load(f)
+        if isinstance(file_cfg, dict) and 'train' in file_cfg:
+            file_cfg = file_cfg['train'] or {}
+        parser.set_defaults(**(file_cfg or {}))
 
     args = parser.parse_args()
 

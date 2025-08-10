@@ -1,1 +1,9 @@
-python train_translator_paired.py --eeg_root ../Oddball/ds116_eeg --fmri_root ../Oddball/ds000116 --a424_label_nii ../BrainLM/A424_resampled_to_bold.nii.gz --brainlm_model_dir ../BrainLM/pretrained_models/2023-06-06-22_15_00-checkpoint-1400 --output_dir translator_runs --device cuda --epochs 10 --batch_size 16 --window_sec 40 --stride_sec 10 --debug --fmri_norm zscore --wandb_project brain_fusion --wandb_run_name oddball_eeg_fmri_august8_run7_overlap11 --eeg_loss_w 1.0 --fmri_loss_w 1.0
+Train (YAML config):
+  python train_translator_paired.py --config configs/translator.yaml
+
+Test (YAML config):
+  python test_translator_paired.py --config configs/translator.yaml
+
+Notes:
+- CLI flags override YAML values if provided (e.g., add `--device cuda`).
+- To enable Weights & Biases logging, set `wandb_off: false` and fill `wandb_project` and `wandb_run_name` in `configs/translator.yaml`.
