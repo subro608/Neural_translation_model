@@ -367,7 +367,20 @@ def load_checkpoint(path: Path, translator: TranslatorModel, optim: torch.optim.
         ckpt = torch.load(path, map_location=device)
     except Exception:
         ckpt = torch.load(path, map_location=device, weights_only=False)
-    translator.load_state_dict(ckpt["translator_state"])
+
+    # Pre-initialize dynamic voxel embedding if present in checkpoint
+    tsd = ckpt.get("translator_state", {})
+    if isinstance(tsd, dict) and any(k.endswith("fmri_voxel_embed.weight") for k in tsd.keys()):
+        for k, tensor in tsd.items():
+            if k.endswith("fmri_voxel_embed.weight") and hasattr(tensor, 'shape'):
+                num_embeddings, embedding_dim = int(tensor.shape[0]), int(tensor.shape[1])
+                if getattr(translator, 'fmri_voxel_embed', None) is None \
+                   or translator.fmri_voxel_embed.num_embeddings != num_embeddings \
+                   or translator.fmri_voxel_embed.embedding_dim != embedding_dim:
+                    translator.fmri_voxel_embed = nn.Embedding(num_embeddings, embedding_dim).to(device)
+                break
+
+    translator.load_state_dict(tsd, strict=False)
     if "optimizer_state" in ckpt:
         optim.load_state_dict(ckpt["optimizer_state"])
     if "scaler_state" in ckpt and isinstance(scaler, torch.amp.GradScaler):
