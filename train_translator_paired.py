@@ -570,15 +570,20 @@ def train_loop(cfg: TrainConfig) -> None:
         except Exception:
             pass
 
-    # Resume
+    # Resume (auto-detect last checkpoint if available)
     start_epoch = 1
     global_step = 0
     best_val = float('inf')
     best_path = Path(cfg.output_dir) / 'translator_best.pt'
     last_path = Path(cfg.output_dir) / 'translator_last.pt'
+    resume_path: Optional[Path] = None
     if cfg.resume is not None and Path(cfg.resume).exists():
-        print(f"Resuming from {cfg.resume}")
-        last_epoch, global_step, best_val = load_checkpoint(Path(cfg.resume), translator, optim, scaler, device)
+        resume_path = Path(cfg.resume)
+    elif last_path.exists():
+        resume_path = last_path
+    if resume_path is not None:
+        print(f"Resuming from {resume_path}")
+        last_epoch, global_step, best_val = load_checkpoint(resume_path, translator, optim, scaler, device)
         start_epoch = max(1, int(last_epoch) + 1)
 
     # ---- Fixed tri-mix settings (no flags) ----
