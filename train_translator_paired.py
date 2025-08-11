@@ -316,11 +316,23 @@ class TrainConfig:
 def save_checkpoint(path: Path, translator: TranslatorModel, optim: torch.optim.Optimizer,
                     scaler: torch.amp.GradScaler, cfg: TrainConfig, epoch: int,
                     global_step: int, best_val: float) -> None:
+    # Convert any Path objects in config to strings for safe serialization (PyTorch 2.6 safe loader)
+    def _to_jsonable(obj):
+        if isinstance(obj, Path):
+            return str(obj)
+        if isinstance(obj, dict):
+            return {k: _to_jsonable(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple, set)):
+            return [_to_jsonable(v) for v in obj]
+        return obj
+
+    cfg_dict = _to_jsonable(asdict(cfg))
+
     ckpt = {
         "translator_state": translator.state_dict(),
         "optimizer_state": optim.state_dict(),
         "scaler_state": scaler.state_dict(),
-        "config": asdict(cfg),
+        "config": cfg_dict,
         "epoch": epoch,
         "global_step": global_step,
         "best_val": best_val,
@@ -339,7 +351,22 @@ def save_checkpoint(path: Path, translator: TranslatorModel, optim: torch.optim.
 
 def load_checkpoint(path: Path, translator: TranslatorModel, optim: torch.optim.Optimizer,
                     scaler: torch.amp.GradScaler, device: torch.device):
-    ckpt = torch.load(path, map_location=device)
+    # PyTorch 2.6: default weights_only=True uses a restricted unpickler.
+    # Our checkpoints may include pathlib Paths inside config. Allowlist them,
+    # and fallback to weights_only=False if needed (trusted local files only).
+    try:
+        from pathlib import PosixPath, WindowsPath  # type: ignore
+        try:
+            torch.serialization.add_safe_globals([PosixPath, WindowsPath])  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    try:
+        ckpt = torch.load(path, map_location=device)
+    except Exception:
+        ckpt = torch.load(path, map_location=device, weights_only=False)
     translator.load_state_dict(ckpt["translator_state"])
     if "optimizer_state" in ckpt:
         optim.load_state_dict(ckpt["optimizer_state"])
