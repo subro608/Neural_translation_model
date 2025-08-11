@@ -61,6 +61,9 @@ from data_oddball import (  # type: ignore
     load_a424_coords,
     PairedAlignedDataset,
     collate_paired,
+    find_eeg_files,
+    find_bold_files,
+    _parse_sr_from_path,
 )
 
 
@@ -304,9 +307,18 @@ def build_models(cfg: TestConfig, device: torch.device):
         dropout=0.1,
     ).to(device)
 
-    # Load checkpoint (translator only)
-    ckpt = torch.load(str(cfg.checkpoint), map_location=device)
-    translator.load_state_dict(ckpt["translator_state"], strict=True)
+    # Load checkpoint (translator only). PyTorch 2.6 defaults weights_only=True, which breaks
+    # loading full checkpoints containing Python objects (e.g., pathlib.Path). We trust this file,
+    # so load with weights_only=False.
+    try:
+        ckpt = torch.load(str(cfg.checkpoint), map_location=device, weights_only=False)
+    except TypeError:
+        ckpt = torch.load(str(cfg.checkpoint), map_location=device)
+    state = ckpt.get("translator_state", ckpt)
+    # Filter out keys that are not in current model (e.g., dynamic fmri_voxel_embed)
+    current = translator.state_dict()
+    filtered = {k: v for k, v in state.items() if k in current and getattr(current[k], 'shape', None) == getattr(v, 'shape', None)}
+    missing, unexpected = translator.load_state_dict(filtered, strict=False)
     translator.eval()
 
     return frozen_eeg, frozen_fmri, translator
@@ -316,7 +328,31 @@ def run_test(cfg: TestConfig):
     set_seed(cfg.seed)
     device = torch.device(cfg.device)
 
-    # Data
+    # Build subject-run TEST split deterministically (70/10/20 using same seed)
+    eeg_files = find_eeg_files(cfg.eeg_root)
+    fmri_files = find_bold_files(cfg.fmri_root)
+    key_to_eeg, key_to_fmri = {}, {}
+    for p in eeg_files:
+        sr = _parse_sr_from_path(p)
+        if all(sr):
+            key_to_eeg[(sr[0], sr[1])] = p
+    for p in fmri_files:
+        sr = _parse_sr_from_path(p)
+        if all(sr):
+            key_to_fmri[(sr[0], sr[1])] = p
+    inter_keys = sorted(set(key_to_eeg.keys()) & set(key_to_fmri.keys()))
+    if len(inter_keys) == 0:
+        print("No paired aligned (subject,run) found for test. Check your paths.")
+        return
+    rng = np.random.default_rng(cfg.seed)
+    indices = np.arange(len(inter_keys))
+    rng.shuffle(indices)
+    n_train = int(len(indices) * 0.7)
+    n_val = int(len(indices) * 0.1)
+    test_idx = indices[n_train + n_val:]
+    test_keys = tuple(inter_keys[i] for i in test_idx)
+
+    # Data restricted to TEST subjects only
     ds = PairedAlignedDataset(
         eeg_root=cfg.eeg_root,
         fmri_root=cfg.fmri_root,
@@ -329,6 +365,7 @@ def run_test(cfg: TestConfig):
         fmri_norm=cfg.fmri_norm,
         stride_sec=cfg.stride_sec,
         device='cpu',
+        include_sr_keys=test_keys,
     )
     if len(ds) == 0:
         print("No samples found.")
@@ -486,12 +523,12 @@ def main():
     ap = argparse.ArgumentParser(description="Test EEG↔fMRI translator under various masking regimes.")
     # Config file (JSON) support — values from file become defaults; CLI overrides them
     ap.add_argument('--config', type=str, default=None, help='Path to JSON config file. Values become defaults; CLI overrides.')
-    ap.add_argument('--eeg_root', type=str, required=True)
-    ap.add_argument('--fmri_root', type=str, required=True)
-    ap.add_argument('--a424_label_nii', type=str, required=True)
-    ap.add_argument('--cbramod_weights', type=str, required=True)
-    ap.add_argument('--brainlm_model_dir', type=str, required=True)
-    ap.add_argument('--checkpoint', type=str, required=True, help="Path to translator_best.pt (or last)")
+    ap.add_argument('--eeg_root', type=str)
+    ap.add_argument('--fmri_root', type=str)
+    ap.add_argument('--a424_label_nii', type=str)
+    ap.add_argument('--cbramod_weights', type=str)
+    ap.add_argument('--brainlm_model_dir', type=str)
+    ap.add_argument('--checkpoint', type=str, help="Path to translator_best.pt (or last)")
     ap.add_argument('--device', type=str, default='cuda')
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--fmri_norm', type=str, default='zscore', choices=['zscore','psc','mad','none'])
@@ -555,8 +592,12 @@ def main():
     )
 
     # Quick existence checks
-    for pth in [cfg.eeg_root, cfg.fmri_root, cfg.a424_label_nii, cfg.cbramod_weights, cfg.brainlm_model_dir, cfg.checkpoint]:
-        if not Path(pth).exists():
+    required_paths = [
+        cfg.eeg_root, cfg.fmri_root, cfg.a424_label_nii,
+        cfg.cbramod_weights, cfg.brainlm_model_dir, cfg.checkpoint,
+    ]
+    for pth in required_paths:
+        if pth is None or not Path(pth).exists():
             raise FileNotFoundError(f"Missing path: {pth}")
 
     run_test(cfg)

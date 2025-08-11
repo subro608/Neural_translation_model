@@ -16,6 +16,7 @@ import os
 import sys
 import json
 import time
+import math
 import argparse
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -189,10 +190,12 @@ class TranslatorModel(nn.Module):
         n_heads: int = 8,
         d_ff: int = 1024,
         dropout: float = 0.1,
+        voxel_count: int = 424,   # <-- constant V
         debug: bool = False,
     ) -> None:
         super().__init__()
         self.debug = debug
+        self._voxel_count = int(voxel_count)
 
         # Adapters
         self.adapter_eeg = ConvEEGInputAdapter(
@@ -231,7 +234,9 @@ class TranslatorModel(nn.Module):
             nn.Linear(d_model * 2, d_model), nn.LayerNorm(d_model)
         )
         self.fmri_depthwise = nn.Conv1d(in_channels=d_model, out_channels=d_model, kernel_size=3, padding=1, groups=d_model)
-        self.fmri_voxel_embed: Optional[nn.Embedding] = None
+
+        # Allocate voxel embedding ONCE (constant V)
+        self.fmri_voxel_embed = nn.Embedding(self._voxel_count, d_model)
 
     def _dbg(self, msg: str) -> None:
         if self.debug:
@@ -245,30 +250,31 @@ class TranslatorModel(nn.Module):
         fmri_target_V: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         self._dbg("\n[Forward] start")
-        eeg_adapted = self.adapter_eeg(eeg_latents)   # (B, N_eeg_tokens, D)
-        fmri_adapted = self.adapter_fmri(fmri_latents)# (B, N_fmri_tokens, D)
+        if fmri_target_V != self._voxel_count:
+            raise ValueError(f"TranslatorModel expects V={self._voxel_count}, got V={fmri_target_V}")
+
+        eeg_adapted = self.adapter_eeg(eeg_latents)    # (B, N_eeg_tokens, D)
+        fmri_adapted = self.adapter_fmri(fmri_latents) # (B, N_fmri_tokens, D)
 
         _, eeg_higher = self.eeg_encoder(eeg_adapted, eeg_adapted)
         _, fmri_higher = self.fmri_encoder(fmri_adapted, fmri_adapted)
 
         eeg_c, fmri_c, _ = self.compressor(eeg_higher, fmri_higher)
-        fused = self.cross_attn(eeg_c, fmri_c)        # (B, Tfused, D)
+        fused = self.cross_attn(eeg_c, fmri_c)         # (B, Tfused, D)
 
         # EEG decode
-        eeg_layers = self.eeg_decoder(fused)          # (L,B,P,C,S)
+        eeg_layers = self.eeg_decoder(fused)           # (L,B,P,C,S)
         eeg_signal = eeg_layers.mean(dim=0).permute(0, 2, 1, 3).contiguous()  # (B,C,P,S)
 
         # fMRI decode
-        H = self.fmri_proj(fused)                     # (B, Tfused, D)
+        H = self.fmri_proj(fused)                      # (B, Tfused, D)
         Hc = H.transpose(1, 2).contiguous()           # (B, D, Tfused)
         Hc = self.fmri_depthwise(Hc)                  # (B, D, Tfused)
         if Hc.shape[-1] != fmri_target_T:
             Hc = nn.functional.interpolate(Hc, size=fmri_target_T, mode='linear', align_corners=False)
         H = Hc.transpose(1, 2).contiguous()           # (B, T, D)
 
-        if (self.fmri_voxel_embed is None) or (self.fmri_voxel_embed.num_embeddings != fmri_target_V) or (self.fmri_voxel_embed.embedding_dim != H.shape[-1]):
-            self.fmri_voxel_embed = nn.Embedding(fmri_target_V, H.shape[-1]).to(H.device)
-        E = self.fmri_voxel_embed.weight              # (V, D)
+        E = self.fmri_voxel_embed.weight              # (V=424, D)
         fmri_signal = torch.matmul(H, E.t())          # (B, T, V)
         self._dbg("[Forward] end\n")
         return eeg_signal, fmri_signal
@@ -351,36 +357,16 @@ def save_checkpoint(path: Path, translator: TranslatorModel, optim: torch.optim.
 
 def load_checkpoint(path: Path, translator: TranslatorModel, optim: torch.optim.Optimizer,
                     scaler: torch.amp.GradScaler, device: torch.device):
-    # PyTorch 2.6: default weights_only=True uses a restricted unpickler.
-    # Our checkpoints may include pathlib Paths inside config. Allowlist them,
-    # and fallback to weights_only=False if needed (trusted local files only).
-    try:
-        from pathlib import PosixPath, WindowsPath  # type: ignore
-        try:
-            torch.serialization.add_safe_globals([PosixPath, WindowsPath])  # type: ignore[attr-defined]
-        except Exception:
-            pass
-    except Exception:
-        pass
-
+    # PyTorch 2.6 safe loader fallback
     try:
         ckpt = torch.load(path, map_location=device)
     except Exception:
         ckpt = torch.load(path, map_location=device, weights_only=False)
 
-    # Pre-initialize dynamic voxel embedding if present in checkpoint
     tsd = ckpt.get("translator_state", {})
-    if isinstance(tsd, dict) and any(k.endswith("fmri_voxel_embed.weight") for k in tsd.keys()):
-        for k, tensor in tsd.items():
-            if k.endswith("fmri_voxel_embed.weight") and hasattr(tensor, 'shape'):
-                num_embeddings, embedding_dim = int(tensor.shape[0]), int(tensor.shape[1])
-                if getattr(translator, 'fmri_voxel_embed', None) is None \
-                   or translator.fmri_voxel_embed.num_embeddings != num_embeddings \
-                   or translator.fmri_voxel_embed.embedding_dim != embedding_dim:
-                    translator.fmri_voxel_embed = nn.Embedding(num_embeddings, embedding_dim).to(device)
-                break
-
+    # Allow missing keys (e.g., older ckpts without fmri_voxel_embed)
     translator.load_state_dict(tsd, strict=False)
+
     if "optimizer_state" in ckpt:
         optim.load_state_dict(ckpt["optimizer_state"])
     if "scaler_state" in ckpt and isinstance(scaler, torch.amp.GradScaler):
@@ -388,9 +374,11 @@ def load_checkpoint(path: Path, translator: TranslatorModel, optim: torch.optim.
             scaler.load_state_dict(ckpt["scaler_state"])
         except Exception:
             pass
+
     epoch = ckpt.get("epoch", 0)
     global_step = ckpt.get("global_step", 0)
     best_val = ckpt.get("best_val", float("inf"))
+
     # Restore RNG (best-effort)
     rng = ckpt.get("rng_state", {})
     try:
@@ -459,6 +447,8 @@ def group_eeg_signal_seconds(x_eeg_sig: torch.Tensor, seconds_per_token: int) ->
 # Training loop with tri-mix
 # -----------------------------
 def train_loop(cfg: TrainConfig) -> None:
+    from torch.optim.lr_scheduler import LambdaLR
+
     def dbg(msg: str) -> None:
         if cfg.debug:
             print(msg, flush=True)
@@ -505,57 +495,54 @@ def train_loop(cfg: TrainConfig) -> None:
     val_keys = tuple(inter_keys[i] for i in val_idx)
     test_keys = tuple(inter_keys[i] for i in test_idx)
 
-    ds_train = PairedAlignedDataset(
-        eeg_root=cfg.eeg_root,
-        fmri_root=cfg.fmri_root,
-        a424_label_nii=cfg.a424_label_nii,
-        window_sec=cfg.window_sec,
-        original_fs=cfg.original_fs,
-        target_fs=cfg.target_fs,
-        tr=2.0,
-        channels_limit=34,
-        fmri_norm=cfg.fmri_norm,
-        stride_sec=cfg.stride_sec,
-        device='cpu',
-        include_sr_keys=train_keys,
+    # DataLoaders (persistent workers/prefetch for speed)
+    pin = device.type == 'cuda'
+    dl_train_kwargs = dict(
+        dataset=PairedAlignedDataset(
+            eeg_root=cfg.eeg_root,
+            fmri_root=cfg.fmri_root,
+            a424_label_nii=cfg.a424_label_nii,
+            window_sec=cfg.window_sec,
+            original_fs=cfg.original_fs,
+            target_fs=cfg.target_fs,
+            tr=2.0,
+            channels_limit=34,
+            fmri_norm=cfg.fmri_norm,
+            stride_sec=cfg.stride_sec,
+            device='cpu',
+            include_sr_keys=train_keys,
+        ),
+        batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers,
+        collate_fn=collate_paired, pin_memory=pin, drop_last=False
     )
-    ds_val = PairedAlignedDataset(
-        eeg_root=cfg.eeg_root,
-        fmri_root=cfg.fmri_root,
-        a424_label_nii=cfg.a424_label_nii,
-        window_sec=cfg.window_sec,
-        original_fs=cfg.original_fs,
-        target_fs=cfg.target_fs,
-        tr=2.0,
-        channels_limit=34,
-        fmri_norm=cfg.fmri_norm,
-        stride_sec=cfg.stride_sec,
-        device='cpu',
-        include_sr_keys=val_keys,
+    dl_val_kwargs = dict(
+        dataset=PairedAlignedDataset(
+            eeg_root=cfg.eeg_root,
+            fmri_root=cfg.fmri_root,
+            a424_label_nii=cfg.a424_label_nii,
+            window_sec=cfg.window_sec,
+            original_fs=cfg.original_fs,
+            target_fs=cfg.target_fs,
+            tr=2.0,
+            channels_limit=34,
+            fmri_norm=cfg.fmri_norm,
+            stride_sec=cfg.stride_sec,
+            device='cpu',
+            include_sr_keys=val_keys,
+        ),
+        batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers,
+        collate_fn=collate_paired, pin_memory=pin, drop_last=False
     )
-    ds_test = PairedAlignedDataset(
-        eeg_root=cfg.eeg_root,
-        fmri_root=cfg.fmri_root,
-        a424_label_nii=cfg.a424_label_nii,
-        window_sec=cfg.window_sec,
-        original_fs=cfg.original_fs,
-        target_fs=cfg.target_fs,
-        tr=2.0,
-        channels_limit=34,
-        fmri_norm=cfg.fmri_norm,
-        stride_sec=cfg.stride_sec,
-        device='cpu',
-        include_sr_keys=test_keys,
-    )
-    if len(ds_train) == 0 or len(ds_val) == 0:
+    if cfg.num_workers > 0:
+        dl_train_kwargs.update(persistent_workers=True, prefetch_factor=2)
+        dl_val_kwargs.update(persistent_workers=True, prefetch_factor=2)
+
+    dl_train = DataLoader(**dl_train_kwargs)
+    dl_val = DataLoader(**dl_val_kwargs)
+
+    if len(dl_train.dataset) == 0 or len(dl_val.dataset) == 0:
         print("Empty train or val split. Adjust split ratios or check data.")
         return
-
-    pin = device.type == 'cuda'
-    dl_train = DataLoader(ds_train, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers,
-                          collate_fn=collate_paired, pin_memory=pin, drop_last=False)
-    dl_val = DataLoader(ds_val, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers,
-                        collate_fn=collate_paired, pin_memory=pin, drop_last=False)
 
     # Frozen feature extractors
     seq_len_eeg = cfg.window_sec  # EEG: 1s tokens
@@ -571,7 +558,7 @@ def train_loop(cfg: TrainConfig) -> None:
     )
     frozen_brainlm = FrozenBrainLM(cfg.brainlm_model_dir, device=device)
 
-    # Translator
+    # Translator (constant V=424)
     eeg_group = max(1, int(cfg.eeg_seconds_per_token))
     eeg_patch_num_grouped = max(1, int(cfg.window_sec) // eeg_group)
     translator = TranslatorModel(
@@ -586,9 +573,11 @@ def train_loop(cfg: TrainConfig) -> None:
         n_heads=8,
         d_ff=1024,
         dropout=0.1,
+        voxel_count=424,
         debug=cfg.debug,
     ).to(device)
 
+    # Optimizer
     optim = torch.optim.AdamW(
         [p for p in translator.parameters() if p.requires_grad],
         lr=cfg.lr,
@@ -596,6 +585,19 @@ def train_loop(cfg: TrainConfig) -> None:
     )
     mse_loss = nn.MSELoss()
     scaler = torch.amp.GradScaler('cuda', enabled=(cfg.amp and device.type == 'cuda'))
+
+    # Scheduler: warmup (5%) + cosine to 10% of base LR
+    total_steps = max(1, cfg.num_epochs * len(dl_train))
+    warmup_steps = max(1, int(0.05 * total_steps))
+
+    def lr_lambda(step: int):
+        if step < warmup_steps:
+            return float(step + 1) / float(warmup_steps)
+        progress = (step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        # cosine from 1.0 -> 0.1
+        return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda)
 
     # wandb
     run = None
@@ -625,6 +627,7 @@ def train_loop(cfg: TrainConfig) -> None:
         print(f"Resuming from {resume_path}")
         last_epoch, global_step, best_val = load_checkpoint(resume_path, translator, optim, scaler, device)
         start_epoch = max(1, int(last_epoch) + 1)
+        # (Scheduler state is not restored here; optional to add if needed.)
 
     # ---- Fixed tri-mix settings (no flags) ----
     TRI_RATIOS = (0.34, 0.33, 0.33)        # (both, single, partial)
@@ -705,11 +708,11 @@ def train_loop(cfg: TrainConfig) -> None:
             # ----- observed inputs to encoders (no leakage)
             x_eeg_obs = x_eeg.clone()
             x_eeg_obs[miss_eeg] = 0.0
+            # Vectorized masking for EEG partial
             if partial_eeg.any():
-                idx = torch.nonzero(partial_eeg, as_tuple=False).squeeze(1)
-                for b in idx.tolist():
-                    mask = M_eeg_time[b]  # (P,)
-                    x_eeg_obs[b, :, mask, :] = 0.0
+                be = torch.nonzero(partial_eeg, as_tuple=False).squeeze(1)  # (b_p,)
+                Mm = M_eeg_time[be].unsqueeze(1).unsqueeze(-1)              # (b_p,1,P,1)
+                x_eeg_obs[be] = x_eeg_obs[be].masked_fill(Mm, 0.0)
 
             fmri_obs = fmri_t.clone()
             fmri_obs[miss_fmri] = 0.0
@@ -803,6 +806,7 @@ def train_loop(cfg: TrainConfig) -> None:
                 torch.nn.utils.clip_grad_norm_(translator.parameters(), 1.0)
                 scaler.step(optim)
                 scaler.update()
+                scheduler.step()
                 global_step += 1
 
             total_eeg_loss += float(loss_eeg.detach().cpu())
@@ -811,13 +815,14 @@ def train_loop(cfg: TrainConfig) -> None:
 
             # progress bar
             if tqdm is not None:
-                iterator.set_postfix_str(f"loss:{float(loss.detach().cpu()):.3f}")
+                iterator.set_postfix_str(f"loss:{float(loss.detach().cpu()):.3f} lr:{optim.param_groups[0]['lr']:.2e}")
 
             if is_train and not cfg.wandb_off:
                 wandb.log({
                     "train/step_total_loss": float(loss.detach().cpu()),
                     "train/step_eeg_loss": float(loss_eeg.detach().cpu()),
                     "train/step_fmri_loss": float(loss_fmri.detach().cpu()),
+                    "train/lr": float(optim.param_groups[0]['lr']),
                     "train/frac_both":   float((cond==0).float().mean().cpu()),
                     "train/frac_single": float((cond==1).float().mean().cpu()),
                     "train/frac_partial":float((cond==2).float().mean().cpu()),
@@ -841,6 +846,8 @@ def train_loop(cfg: TrainConfig) -> None:
               f"val EEG {va['val_eeg_loss']:.6f} FMRI {va['val_fmri_loss']:.6f}")
 
         # Save "last"
+        last_path = Path(cfg.output_dir) / 'translator_last.pt'
+        best_path = Path(cfg.output_dir) / 'translator_best.pt'
         save_checkpoint(last_path, translator, optim, scaler, cfg, epoch, global_step, best_val)
 
         # Best by sum

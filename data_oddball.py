@@ -651,3 +651,6 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+
+
+# python data_oddball.py --eeg_root D:\Neuroinformatics_research_2025\Oddball\ds116_eeg --fmri_root D:\Neuroinformatics_research_2025\Oddball\ds000116 --a424_label_nii D:\Neuroinformatics_research_2025\BrainLM\A424_resampled_to_bold.nii.gz --window_sec 40 --original_fs 1000 --target_fs 200 --tr 2.0 --fmri_norm zscore --channels_limit 34 --stride_sec 10
