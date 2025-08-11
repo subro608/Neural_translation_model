@@ -537,7 +537,7 @@ def run_once(cfg: VizConfig, subset: str = "test", mode: str = "both", partial_v
     out_dir = cfg.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Build subject-run split (70/10/20) and select subset
+    # Build subject-run split (fixed subjects from config if provided; else 70/10/20)
     eeg_files = find_eeg_files(cfg.eeg_root)
     fmri_files = find_bold_files(cfg.fmri_root)
     key_to_eeg, key_to_fmri = {}, {}
@@ -552,17 +552,38 @@ def run_once(cfg: VizConfig, subset: str = "test", mode: str = "both", partial_v
     inter_keys = sorted(set(key_to_eeg.keys()) & set(key_to_fmri.keys()))
     if len(inter_keys) == 0:
         raise RuntimeError("No aligned (subject,run) pairs found; check paths.")
-    rng = np.random.default_rng(cfg.seed)
-    indices = np.arange(len(inter_keys))
-    rng.shuffle(indices)
-    n_train = int(len(indices) * 0.7)
-    n_val = int(len(indices) * 0.1)
-    train_idx = indices[:n_train]
-    val_idx = indices[n_train:n_train + n_val]
-    test_idx = indices[n_train + n_val:]
-    train_keys = tuple(inter_keys[i] for i in train_idx)
-    val_keys = tuple(inter_keys[i] for i in val_idx)
-    test_keys = tuple(inter_keys[i] for i in test_idx)
+    def to_set(xs):
+        return set(str(int(s)) for s in (xs or []))
+    # Try to read fixed split from a sidecar YAML if present (same base path as checkpoint)
+    fixed_train, fixed_val, fixed_test = set(), set(), set()
+    try:
+        sidecar = Path(str(cfg.checkpoint) + '.splits.yaml')
+        if sidecar.exists():
+            import yaml  # type: ignore
+            with open(sidecar, 'r') as f:
+                d = yaml.safe_load(f) or {}
+            fixed_train = to_set(d.get('train_subjects'))
+            fixed_val   = to_set(d.get('val_subjects'))
+            fixed_test  = to_set(d.get('test_subjects'))
+    except Exception:
+        pass
+
+    if fixed_train or fixed_val or fixed_test:
+        train_keys = tuple(k for k in inter_keys if k[0] in fixed_train)
+        val_keys   = tuple(k for k in inter_keys if k[0] in fixed_val)
+        test_keys  = tuple(k for k in inter_keys if k[0] in fixed_test)
+    else:
+        rng = np.random.default_rng(cfg.seed)
+        indices = np.arange(len(inter_keys))
+        rng.shuffle(indices)
+        n_train = int(len(indices) * 0.7)
+        n_val = int(len(indices) * 0.1)
+        train_idx = indices[:n_train]
+        val_idx = indices[n_train:n_train + n_val]
+        test_idx = indices[n_train + n_val:]
+        train_keys = tuple(inter_keys[i] for i in train_idx)
+        val_keys = tuple(inter_keys[i] for i in val_idx)
+        test_keys = tuple(inter_keys[i] for i in test_idx)
 
     include_sr = None
     if subset == 'train':
@@ -574,6 +595,7 @@ def run_once(cfg: VizConfig, subset: str = "test", mode: str = "both", partial_v
     elif subset == 'all':
         include_sr = None
 
+    print("include_sr", include_sr)
     # Data restricted to chosen subset
     ds = PairedAlignedDataset(
         eeg_root=cfg.eeg_root,

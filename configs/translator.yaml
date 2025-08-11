@@ -18,12 +18,16 @@ train:
   debug: false
   fmri_norm: zscore
   wandb_project: Neural_translation_august10
-  wandb_run_name: oddball_Neural_translation_run1_aug10
+  wandb_run_name: oddball_Neural_translation_run3_aug10_data_split
   wandb_off: false
   eeg_loss_w: 1.0
   fmri_loss_w: 1.0
   eeg_seconds_per_token: 40
   resume: null
+  # fixed subject splits (optional). Example below enables 1-12 train, 13 val, 14,15,17 test
+  train_subjects: [1,2,3,4,5,6,7,8,9,10,11,12]
+  val_subjects: [13]
+  test_subjects: [14,15,17]
 
 test:
   eeg_root: D:/Neuroinformatics_research_2025/Oddball/ds116_eeg
@@ -31,7 +35,7 @@ test:
   a424_label_nii: D:/Neuroinformatics_research_2025/BrainLM/A424_resampled_to_bold.nii.gz
   cbramod_weights: D:/Neuroinformatics_research_2025/MNI_templates/CBraMod/pretrained_weights/pretrained_weights.pth
   brainlm_model_dir: D:/Neuroinformatics_research_2025/MNI_templates/BrainLM/pretrained_models/2023-06-06-22_15_00-checkpoint-1400
-  checkpoint: D:/Neuroinformatics_research_2025/Multi_modal_NTM/translator_runs/odd_both_single_partial_run/translator_best.pt
+  checkpoint: translator_runs/translator_best.pt
   device: cuda
   seed: 42
   fmri_norm: zscore
@@ -47,4 +51,8 @@ test:
   partial_visible_frac: 0.5
   save_recons: null
   save_n_batches: 0
+  # fixed test subjects (optional). If provided, used instead of random split for test
+  train_subjects: [1,2,3,4,5,6,7,8,9,10,11,12]
+  val_subjects: [13]
+  test_subjects: [14,15,17]
 

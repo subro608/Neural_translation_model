@@ -280,6 +280,10 @@ class TestConfig:
     # saving
     save_recons: Optional[Path] = None
     save_n_batches: int = 0  # 0 = don't save; >0 = save first N batches
+    # fixed subject splits (optional)
+    train_subjects: Optional[list[int]] = None
+    val_subjects: Optional[list[int]] = None
+    test_subjects: Optional[list[int]] = None
 
 
 def build_models(cfg: TestConfig, device: torch.device):
@@ -328,7 +332,7 @@ def run_test(cfg: TestConfig):
     set_seed(cfg.seed)
     device = torch.device(cfg.device)
 
-    # Build subject-run TEST split deterministically (70/10/20 using same seed)
+    # Build subject-run split (fixed subjects if provided)
     eeg_files = find_eeg_files(cfg.eeg_root)
     fmri_files = find_bold_files(cfg.fmri_root)
     key_to_eeg, key_to_fmri = {}, {}
@@ -344,14 +348,18 @@ def run_test(cfg: TestConfig):
     if len(inter_keys) == 0:
         print("No paired aligned (subject,run) found for test. Check your paths.")
         return
-    rng = np.random.default_rng(cfg.seed)
-    indices = np.arange(len(inter_keys))
-    rng.shuffle(indices)
-    n_train = int(len(indices) * 0.7)
-    n_val = int(len(indices) * 0.1)
-    test_idx = indices[n_train + n_val:]
-    test_keys = tuple(inter_keys[i] for i in test_idx)
-
+    if cfg.test_subjects:
+        sub_set = set(str(int(s)) for s in cfg.test_subjects)
+        test_keys = tuple(k for k in inter_keys if k[0] in sub_set)
+    else:
+        rng = np.random.default_rng(cfg.seed)
+        indices = np.arange(len(inter_keys))
+        rng.shuffle(indices)
+        n_train = int(len(indices) * 0.7)
+        n_val = int(len(indices) * 0.1)
+        test_idx = indices[n_train + n_val:]
+        test_keys = tuple(inter_keys[i] for i in test_idx)
+    print("test_keys", test_keys)
     # Data restricted to TEST subjects only
     ds = PairedAlignedDataset(
         eeg_root=cfg.eeg_root,

@@ -20,7 +20,7 @@ import math
 import argparse
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import numpy as np
 import torch
@@ -315,6 +315,10 @@ class TrainConfig:
     eeg_seconds_per_token: int = 40
     # resume
     resume: Optional[Path] = None
+    # fixed subject splits (optional). Use subject numeric IDs.
+    train_subjects: Optional[List[int]] = None
+    val_subjects: Optional[List[int]] = None
+    test_subjects: Optional[List[int]] = None
 
 # -----------------------------
 # Checkpoints
@@ -482,19 +486,29 @@ def train_loop(cfg: TrainConfig) -> None:
         print("No paired aligned (subject,run) found. Check your paths.")
         return
 
-    rng = np.random.default_rng(cfg.seed)
-    indices = np.arange(len(inter_keys))
-    rng.shuffle(indices)
-    r_train, r_val, r_test = 0.7, 0.1, 0.2
-    n_train = int(len(indices) * r_train)
-    n_val = int(len(indices) * r_val)
-    train_idx = indices[:n_train]
-    val_idx = indices[n_train:n_train + n_val]
-    test_idx = indices[n_train + n_val:]
-    train_keys = tuple(inter_keys[i] for i in train_idx)
-    val_keys = tuple(inter_keys[i] for i in val_idx)
-    test_keys = tuple(inter_keys[i] for i in test_idx)
-
+    # Fixed subject lists take precedence if provided; else deterministic split
+    if cfg.train_subjects or cfg.val_subjects or cfg.test_subjects:
+        to_str = lambda xs: set(str(int(s)) for s in (xs or []))
+        train_subj = to_str(cfg.train_subjects)
+        val_subj = to_str(cfg.val_subjects)
+        test_subj = to_str(cfg.test_subjects)
+        train_keys = tuple(k for k in inter_keys if k[0] in train_subj)
+        val_keys = tuple(k for k in inter_keys if k[0] in val_subj)
+        test_keys = tuple(k for k in inter_keys if k[0] in test_subj)
+    else:
+        rng = np.random.default_rng(cfg.seed)
+        indices = np.arange(len(inter_keys))
+        rng.shuffle(indices)
+        r_train, r_val, r_test = 0.7, 0.1, 0.2
+        n_train = int(len(indices) * r_train)
+        n_val = int(len(indices) * r_val)
+        train_idx = indices[:n_train]
+        val_idx = indices[n_train:n_train + n_val]
+        test_idx = indices[n_train + n_val:]
+        train_keys = tuple(inter_keys[i] for i in train_idx)
+        val_keys = tuple(inter_keys[i] for i in val_idx)
+        test_keys = tuple(inter_keys[i] for i in test_idx)
+    print("train_keys", train_keys, "val_keys", val_keys, "test_keys", test_keys)
     # DataLoaders (persistent workers/prefetch for speed)
     pin = device.type == 'cuda'
     dl_train_kwargs = dict(
