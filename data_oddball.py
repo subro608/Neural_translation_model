@@ -385,6 +385,8 @@ class PairedAlignedDataset(Dataset):
     """
     Builds aligned EEG–fMRI windows for the same subject/task/run and time interval.
 
+    Optional filtering by subject-run keys via include_sr_keys to enable clean splits.
+
     Each item returns:
       - eeg_window: (C, P=window_sec, S=target_fs)  [z-scored per channel]
       - fmri_window: (T=round(window_sec/TR), V)    [z-scored per voxel]
@@ -404,6 +406,7 @@ class PairedAlignedDataset(Dataset):
         fmri_norm: str = 'zscore',
         stride_sec: Optional[int] = None,
         device: str = 'cpu',
+        include_sr_keys: Optional[Tuple[Tuple[str, str], ...]] = None,
     ) -> None:
         self.eeg_root = eeg_root
         self.fmri_root = fmri_root
@@ -434,7 +437,12 @@ class PairedAlignedDataset(Dataset):
 
         # Intersect keys and create aligned window index
         self.index: List[Tuple[Tuple[str, str], Path, Path, int]] = []
-        inter_keys = sorted(set(key_to_eeg.keys()) & set(key_to_fmri.keys()))
+        inter_all = sorted(set(key_to_eeg.keys()) & set(key_to_fmri.keys()))
+        if include_sr_keys is not None:
+            include_set = set(include_sr_keys)
+            inter_keys = [k for k in inter_all if k in include_set]
+        else:
+            inter_keys = inter_all
         for key in inter_keys:
             eeg_p = key_to_eeg[key]
             fmri_p = key_to_fmri[key]

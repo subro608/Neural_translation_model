@@ -67,6 +67,9 @@ from data_oddball import (  # type: ignore
     load_a424_coords,
     PairedAlignedDataset,
     collate_paired,
+    find_eeg_files,
+    find_bold_files,
+    _parse_sr_from_path,
 )
 
 # -----------------------------
@@ -431,7 +434,37 @@ def train_loop(cfg: TrainConfig) -> None:
         except Exception:
             pass
 
-    # Dataset / Loader
+    # Dataset splits by subject-run
+    eeg_files = find_eeg_files(cfg.eeg_root)
+    fmri_files = find_bold_files(cfg.fmri_root)
+    key_to_eeg = {}
+    key_to_fmri = {}
+    for p in eeg_files:
+        k = _parse_sr_from_path(p)
+        if all(k):
+            key_to_eeg[(k[0], k[1])] = p
+    for p in fmri_files:
+        k = _parse_sr_from_path(p)
+        if all(k):
+            key_to_fmri[(k[0], k[1])] = p
+    inter_keys = sorted(set(key_to_eeg.keys()) & set(key_to_fmri.keys()))
+    if len(inter_keys) == 0:
+        print("No paired aligned (subject,run) found. Check your paths.")
+        return
+
+    rng = np.random.default_rng(cfg.seed)
+    indices = np.arange(len(inter_keys))
+    rng.shuffle(indices)
+    r_train, r_val, r_test = 0.7, 0.1, 0.2
+    n_train = int(len(indices) * r_train)
+    n_val = int(len(indices) * r_val)
+    train_idx = indices[:n_train]
+    val_idx = indices[n_train:n_train + n_val]
+    test_idx = indices[n_train + n_val:]
+    train_keys = tuple(inter_keys[i] for i in train_idx)
+    val_keys = tuple(inter_keys[i] for i in val_idx)
+    test_keys = tuple(inter_keys[i] for i in test_idx)
+
     ds_train = PairedAlignedDataset(
         eeg_root=cfg.eeg_root,
         fmri_root=cfg.fmri_root,
@@ -444,21 +477,45 @@ def train_loop(cfg: TrainConfig) -> None:
         fmri_norm=cfg.fmri_norm,
         stride_sec=cfg.stride_sec,
         device='cpu',
+        include_sr_keys=train_keys,
     )
-    if len(ds_train) == 0:
-        print("No paired aligned samples found. Check your paths and filename patterns.")
+    ds_val = PairedAlignedDataset(
+        eeg_root=cfg.eeg_root,
+        fmri_root=cfg.fmri_root,
+        a424_label_nii=cfg.a424_label_nii,
+        window_sec=cfg.window_sec,
+        original_fs=cfg.original_fs,
+        target_fs=cfg.target_fs,
+        tr=2.0,
+        channels_limit=34,
+        fmri_norm=cfg.fmri_norm,
+        stride_sec=cfg.stride_sec,
+        device='cpu',
+        include_sr_keys=val_keys,
+    )
+    ds_test = PairedAlignedDataset(
+        eeg_root=cfg.eeg_root,
+        fmri_root=cfg.fmri_root,
+        a424_label_nii=cfg.a424_label_nii,
+        window_sec=cfg.window_sec,
+        original_fs=cfg.original_fs,
+        target_fs=cfg.target_fs,
+        tr=2.0,
+        channels_limit=34,
+        fmri_norm=cfg.fmri_norm,
+        stride_sec=cfg.stride_sec,
+        device='cpu',
+        include_sr_keys=test_keys,
+    )
+    if len(ds_train) == 0 or len(ds_val) == 0:
+        print("Empty train or val split. Adjust split ratios or check data.")
         return
 
     pin = device.type == 'cuda'
-    dl = DataLoader(
-        ds_train,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=cfg.num_workers,
-        collate_fn=collate_paired,
-        pin_memory=pin,
-        drop_last=False
-    )
+    dl_train = DataLoader(ds_train, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers,
+                          collate_fn=collate_paired, pin_memory=pin, drop_last=False)
+    dl_val = DataLoader(ds_val, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers,
+                        collate_fn=collate_paired, pin_memory=pin, drop_last=False)
 
     # Frozen feature extractors
     seq_len_eeg = cfg.window_sec  # EEG: 1s tokens
@@ -541,7 +598,8 @@ def train_loop(cfg: TrainConfig) -> None:
         rsum = sum(TRI_RATIOS)
         r_both, r_single, r_partial = [r/rsum for r in TRI_RATIOS]
 
-        iterator = dl if tqdm is None else tqdm(dl, total=len(dl), desc=f"{mode} {epoch}/{cfg.num_epochs}", leave=False)
+        data_iter = dl_train if is_train else dl_val
+        iterator = data_iter if tqdm is None else tqdm(data_iter, total=len(data_iter), desc=f"{mode} {epoch}/{cfg.num_epochs}", leave=False)
 
         for i, batch in enumerate(iterator):
             x_eeg = batch['eeg_window'].to(device, non_blocking=True)   # (B,C,P,S)
@@ -730,8 +788,7 @@ def train_loop(cfg: TrainConfig) -> None:
     for epoch in range(start_epoch, cfg.num_epochs + 1):
         t0 = time.time()
         tr = run_epoch('train', epoch)
-        # Single dataset used; use train as val proxy
-        va = {"val_eeg_loss": tr['train_eeg_loss'], "val_fmri_loss": tr['train_fmri_loss']}
+        va = run_epoch('val', epoch)
         dur = time.time() - t0
 
         print(f"Epoch {epoch:02d} | {dur:.1f}s | "
