@@ -372,7 +372,14 @@ def load_checkpoint(path: Path, translator: TranslatorModel, optim: torch.optim.
     translator.load_state_dict(tsd, strict=False)
 
     if "optimizer_state" in ckpt:
-        optim.load_state_dict(ckpt["optimizer_state"])
+        try:
+            optim.load_state_dict(ckpt["optimizer_state"])
+        except ValueError as e:
+            # Optimizer param groups differ (model/params changed). Proceed with fresh optimizer.
+            print(f"[WARN] Optimizer state incompatible with current model parameters: {e}\n"
+                  f"       Proceeding with a fresh optimizer state (weights are loaded).")
+        except Exception as e:
+            print(f"[WARN] Failed to load optimizer state: {e}. Proceeding with a fresh optimizer state.")
     if "scaler_state" in ckpt and isinstance(scaler, torch.amp.GradScaler):
         try:
             scaler.load_state_dict(ckpt["scaler_state"])
