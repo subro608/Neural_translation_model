@@ -3,12 +3,14 @@
 Train the adapter_main_translatordecoder using paired, aligned Oddball EEG+fMRI windows,
 with tri-mix training and CONDITIONAL MASKING AWARENESS.
 
-Key additions vs. original:
+Major features:
+  • Subject-based splits (no shuffling). You can pin exact subject IDs via YAML/CLI.
+    - If train/val/test subjects are provided (as ints), they are used as-is.
+    - Otherwise, subjects are split deterministically by sorted IDs into 70/10/20.
   • Condition embeddings in TranslatorModel:
       self.condition_embed = nn.Embedding(5, d_model)
       0: both_available, 1: eeg_missing, 2: fmri_missing, 3: eeg_partial, 4: fmri_partial
       Forward accepts condition_ids and adds them to both modality token streams.
-  • Training loop constructs per-sample condition_ids and passes them to the model.
   • Cross-modal loss emphasis when a modality is missing: alpha_miss=1.5, beta_pres=1.0.
 
 fMRI decode path (new design):
@@ -23,13 +25,14 @@ from __future__ import annotations
 
 import os
 import sys
+import re
 import json
 import time
 import math
 import argparse
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import numpy as np
 import torch
@@ -354,6 +357,10 @@ class TrainConfig:
     eeg_seconds_per_token: int = 40
     # resume
     resume: Optional[Path] = None
+    # fixed subject splits (optional). Use subject numeric IDs.
+    train_subjects: Optional[List[int]] = None
+    val_subjects: Optional[List[int]] = None
+    test_subjects: Optional[List[int]] = None
 
 # -----------------------------
 # Checkpoints
@@ -397,8 +404,7 @@ def save_checkpoint(path: Path, translator: TranslatorModel, optim: torch.optim.
 def load_checkpoint(path: Path, translator: TranslatorModel, optim: torch.optim.Optimizer,
                     scaler: torch.amp.GradScaler, device: torch.device):
     # PyTorch 2.6: default weights_only=True uses a restricted unpickler.
-    # Our checkpoints may include pathlib Paths inside config. Allowlist them,
-    # and fallback to weights_only=False if needed (trusted local files only).
+    # Allowlist pathlib path classes; fallback to weights_only=False if needed.
     try:
         from pathlib import PosixPath, WindowsPath  # type: ignore
         try:
@@ -514,7 +520,7 @@ def train_loop(cfg: TrainConfig) -> None:
         except Exception:
             pass
 
-    # Dataset splits by subject-run
+    # Dataset keys by (subject, run)
     eeg_files = find_eeg_files(cfg.eeg_root)
     fmri_files = find_bold_files(cfg.fmri_root)
     key_to_eeg = {}
@@ -532,23 +538,53 @@ def train_loop(cfg: TrainConfig) -> None:
         print("No paired aligned (subject,run) found. Check your paths.")
         return
 
-    rng = np.random.default_rng(cfg.seed)
-    indices = np.arange(len(inter_keys))
-    rng.shuffle(indices)
-    r_train, r_val, r_test = 0.7, 0.1, 0.2
-    n_train = int(len(indices) * r_train)
-    n_val = int(len(indices) * r_val)
-    train_idx = indices[:n_train]
-    val_idx = indices[n_train:n_train + n_val]
-    test_idx = indices[n_train + n_val:]
-    train_keys = tuple(inter_keys[i] for i in train_idx)
-    val_keys = tuple(inter_keys[i] for i in val_idx)
-    test_keys = tuple(inter_keys[i] for i in test_idx)
-
-    # ---------- Sanity checks: subjects & keys (no leakage) ----------
+    # ---------- Subject-based, leak-free split ----------
     def _subjects_from_keys(keys):
         return {str(k[0]) for k in keys}
 
+    # All subjects present (as strings without leading zeros)
+    all_subjects = sorted({str(k[0]) for k in inter_keys}, key=lambda s: int(s))
+
+    def _to_str_set(xs: Optional[List[int]]) -> Optional[set]:
+        if xs is None:
+            return None
+        return set(str(int(s)) for s in xs)
+
+    train_subj = _to_str_set(cfg.train_subjects)
+    val_subj   = _to_str_set(cfg.val_subjects)
+    test_subj  = _to_str_set(cfg.test_subjects)
+
+    if train_subj or val_subj or test_subj:
+        # Use explicit lists; sanity: they must be disjoint and subset of all_subjects
+        train_subj = train_subj or set()
+        val_subj   = val_subj or set()
+        test_subj  = test_subj or set()
+        # Disjointness
+        if (train_subj & val_subj) or (train_subj & test_subj) or (val_subj & test_subj):
+            raise ValueError(f"Provided subject lists must be disjoint; got overlaps.")
+        # Subset
+        for name, sset in (("train", train_subj), ("val", val_subj), ("test", test_subj)):
+            unknown = sset - set(all_subjects)
+            if unknown:
+                raise ValueError(f"{name}_subjects contains unknown IDs: {sorted(list(unknown))}")
+    else:
+        # Deterministic split by subjects (70/10/20) based on sorted subject IDs
+        n = len(all_subjects)
+        n_train = max(1, int(round(0.7 * n)))
+        n_val   = max(1, int(round(0.1 * n)))
+        n_test  = max(1, n - n_train - n_val)
+        if n_train + n_val + n_test > n:
+            n_test = n - n_train - n_val
+        train_subj = set(all_subjects[:n_train])
+        val_subj   = set(all_subjects[n_train:n_train + n_val])
+        test_subj  = set(all_subjects[n_train + n_val:])
+
+    # Build split keys strictly by subject (no leakage)
+    train_keys = tuple(k for k in inter_keys if k[0] in train_subj)
+    val_keys   = tuple(k for k in inter_keys if k[0] in val_subj)
+    test_keys  = tuple(k for k in inter_keys if k[0] in test_subj)
+
+    # ---------- Sanity checks: subjects & keys (no leakage) ----------
     def _assert_disjoint_sets(a, b, aname="A", bname="B"):
         inter = set(a) & set(b)
         if inter:
@@ -874,10 +910,10 @@ def train_loop(cfg: TrainConfig) -> None:
 
             # ----- condition IDs (0..4) per sample
             condition_ids = torch.zeros(B, dtype=torch.long, device=device)
-            condition_ids[miss_eeg]   = 1
-            condition_ids[miss_fmri]  = 2
-            condition_ids[partial_eeg]= 3
-            condition_ids[partial_fmr]= 4
+            condition_ids[miss_eeg]    = 1
+            condition_ids[miss_fmri]   = 2
+            condition_ids[partial_eeg] = 3
+            condition_ids[partial_fmr] = 4
 
             if is_train:
                 optim.zero_grad(set_to_none=True)
@@ -1000,6 +1036,17 @@ def train_loop(cfg: TrainConfig) -> None:
 # -----------------------------
 # CLI
 # -----------------------------
+def _parse_subjects_arg(s: Optional[str]) -> Optional[List[int]]:
+    if not s:
+        return None
+    # allow "1,2,3" or "1 2 3"
+    parts = re.split(r"[,\s]+", s.strip())
+    out = []
+    for p in parts:
+        if p:
+            out.append(int(p))
+    return out or None
+
 def main() -> None:
     parser = argparse.ArgumentParser(description='Train translator-decoder on paired Oddball EEG+fMRI with tri-mix masking + conditional embeddings + token-seq fMRI head')
     # Config file (YAML/JSON) support — values from file become defaults; CLI overrides
@@ -1034,6 +1081,10 @@ def main() -> None:
     parser.add_argument('--eeg_seconds_per_token', type=int, default=40)
     # resume
     parser.add_argument('--resume', type=str, default=None, help='Path to a full checkpoint to resume training')
+    # fixed subject lists (optional; comma-separated or space-separated)
+    parser.add_argument('--train_subjects', type=str, default=None, help='Comma/space-separated subject IDs for TRAIN split (e.g., "1,2,3")')
+    parser.add_argument('--val_subjects', type=str, default=None, help='Comma/space-separated subject IDs for VAL split')
+    parser.add_argument('--test_subjects', type=str, default=None, help='Comma/space-separated subject IDs for TEST split')
 
     # Two-pass parse to allow config file to set defaults before final parse
     temp_parser = argparse.ArgumentParser(add_help=False)
@@ -1090,6 +1141,10 @@ def main() -> None:
         fmri_loss_w=args.fmri_loss_w,
         eeg_seconds_per_token=args.eeg_seconds_per_token,
         resume=Path(args.resume) if args.resume else None,
+        # parse subject lists from CLI if provided (YAML can also set these directly)
+        train_subjects=_parse_subjects_arg(args.train_subjects),
+        val_subjects=_parse_subjects_arg(args.val_subjects),
+        test_subjects=_parse_subjects_arg(args.test_subjects),
     )
 
     train_loop(cfg)
