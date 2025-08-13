@@ -583,8 +583,8 @@ def train_loop(cfg: TrainConfig) -> None:
         )
 
     # Helpful prints
-    print(f"[splits] subjects: train={sorted(list(train_subj_from_keys))} "
-          f"val={sorted(list(val_subj_from_keys))} test={sorted(list(test_subj_from_keys))}")
+    print(f"[splits] subjects: train={sorted(list(train_subj_from_keys), key=int)} "
+          f"val={sorted(list(val_subj_from_keys), key=int)} test={sorted(list(test_subj_from_keys), key=int)}")
     print(f"[splits] keys:     train={len(train_keys)} val={len(val_keys)} test={len(test_keys)}")
 
     # Save split subjects for later auditing in test
@@ -593,9 +593,9 @@ def train_loop(cfg: TrainConfig) -> None:
         split_path.parent.mkdir(parents=True, exist_ok=True)
         with open(split_path, "w") as f:
             json.dump({
-                "train_subjects": sorted(list(train_subj_from_keys)),
-                "val_subjects":   sorted(list(val_subj_from_keys)),
-                "test_subjects":  sorted(list(test_subj_from_keys)),
+                "train_subjects": sorted(list(train_subj_from_keys), key=int),
+                "val_subjects":   sorted(list(val_subj_from_keys), key=int),
+                "test_subjects":  sorted(list(test_subj_from_keys), key=int),
             }, f, indent=2)
         print(f"[splits] saved -> {split_path}")
     except Exception as e:
@@ -1150,6 +1150,13 @@ def main() -> None:
     parser.add_argument('--eeg_seconds_per_token', type=int, default=40)
     # resume
     parser.add_argument('--resume', type=str, default=None, help='Path to a full checkpoint to resume training')
+    # explicit subject splits (can be provided via YAML or CLI)
+    parser.add_argument('--train_subjects', type=int, nargs='*', default=None,
+                        help='Explicit train subject IDs (e.g., --train_subjects 1 2 3). Overrides auto split.')
+    parser.add_argument('--val_subjects', type=int, nargs='*', default=None,
+                        help='Explicit val subject IDs (e.g., --val_subjects 13). Overrides auto split.')
+    parser.add_argument('--test_subjects', type=int, nargs='*', default=None,
+                        help='Explicit test subject IDs (e.g., --test_subjects 14 15 17). Overrides auto split.')
     parser.add_argument('--dry_run', action='store_true',
                         help='Run a synthetic forward pass and print shapes; no data or training.')
 
@@ -1208,6 +1215,9 @@ def main() -> None:
         fmri_loss_w=args.fmri_loss_w,
         eeg_seconds_per_token=args.eeg_seconds_per_token,
         resume=Path(args.resume) if args.resume else None,
+        train_subjects=args.train_subjects,
+        val_subjects=args.val_subjects,
+        test_subjects=args.test_subjects,
     )
     if args.dry_run:
         dev = torch.device(args.device)
