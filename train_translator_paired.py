@@ -15,6 +15,11 @@ Changes vs previous version:
 - fmri_n_layers and fmri_hidden_size are derived from BrainLM config for robustness.
 - fmri_target_T and fmri_target_V are passed when building the translator so the decoder
   is shaped correctly from the start.
+
+New in this version:
+- Uses fixed, deterministic subject intake via data_oddball.fixed_subject_keys / collect_common_sr_keys
+- No random shuffling when forming splits; default subject split is deterministic by subject ID order
+- DataLoader shuffle disabled (train/val) for full determinism of sample order
 """
 
 from __future__ import annotations
@@ -27,7 +32,7 @@ import math
 import argparse
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Set
 
 import numpy as np
 import torch
@@ -70,15 +75,14 @@ from models.cbramod import CBraMod  # type: ignore
 from brainlm_mae.modeling_brainlm import BrainLMForPretraining  # type: ignore
 from brainlm_mae.configuration_brainlm import BrainLMConfig     # type: ignore
 
-# Data
+# Data (updated helpers)
 from data_oddball import (  # type: ignore
     pad_timepoints_for_brainlm_torch,
     load_a424_coords,
     PairedAlignedDataset,
     collate_paired,
-    find_eeg_files,
-    find_bold_files,
-    _parse_sr_from_path,
+    collect_common_sr_keys,
+    fixed_subject_keys,
 )
 
 # -----------------------------
@@ -194,13 +198,13 @@ class TranslatorModel(nn.Module):
         fmri_n_layers: int,
         fmri_hidden_size: int,
         fmri_tokens_target: int,
-        fmri_target_T: int,          # <-- NEW: fix decoder shape at build time
-        fmri_target_V: int,          # <-- NEW: fix decoder shape at build time
+        fmri_target_T: int,
+        fmri_target_V: int,
         d_model: int = 256,
         n_heads: int = 8,
         d_ff: int = 1024,
         dropout: float = 0.1,
-        voxel_count: int = 424,      # <-- constant V
+        voxel_count: int = 424,
         debug: bool = False,
     ) -> None:
         super().__init__()
@@ -219,7 +223,7 @@ class TranslatorModel(nn.Module):
             output_dim=d_model,
         )
         self.adapter_fmri = fMRIInputAdapterConv1d(
-            seq_len=fmri_tokens_target,        # informational; not strictly required for asserts
+            seq_len=fmri_tokens_target,
             n_layers=fmri_n_layers,
             input_dim=fmri_hidden_size,
             output_dim=d_model,
@@ -496,54 +500,52 @@ def train_loop(cfg: TrainConfig) -> None:
         except Exception:
             pass
 
-    # Dataset splits by subject-run
-    eeg_files = find_eeg_files(cfg.eeg_root)
-    fmri_files = find_bold_files(cfg.fmri_root)
-    key_to_eeg = {}
-    key_to_fmri = {}
-    for p in eeg_files:
-        k = _parse_sr_from_path(p)
-        if all(k):
-            key_to_eeg[(k[0], k[1])] = p
-    for p in fmri_files:
-        k = _parse_sr_from_path(p)
-        if all(k):
-            key_to_fmri[(k[0], k[1])] = p
-    inter_keys = sorted(set(key_to_eeg.keys()) & set(key_to_fmri.keys()))
+    # ---------- Deterministic subject-run splits (no shuffling) ----------
+    inter_keys = collect_common_sr_keys(cfg.eeg_root, cfg.fmri_root)  # sorted by (subject, run)
     if len(inter_keys) == 0:
         print("No paired aligned (subject,run) found. Check your paths.")
         return
 
-    # Fixed subject lists take precedence if provided; else deterministic split
+    # If user supplies explicit subject lists, use them exactly
     if cfg.train_subjects or cfg.val_subjects or cfg.test_subjects:
-        to_str = lambda xs: set(str(int(s)) for s in (xs or []))
-        train_subj = to_str(cfg.train_subjects)
-        val_subj = to_str(cfg.val_subjects)
-        test_subj = to_str(cfg.test_subjects)
-        train_keys = tuple(k for k in inter_keys if k[0] in train_subj)
-        val_keys = tuple(k for k in inter_keys if k[0] in val_subj)
-        test_keys = tuple(k for k in inter_keys if k[0] in test_subj)
+        train_keys, val_keys, test_keys = fixed_subject_keys(
+            cfg.eeg_root,
+            cfg.fmri_root,
+            cfg.train_subjects or [],
+            cfg.val_subjects or [],
+            cfg.test_subjects or [],
+        )
     else:
-        rng = np.random.default_rng(cfg.seed)
-        indices = np.arange(len(inter_keys))
-        rng.shuffle(indices)
-        r_train, r_val, r_test = 0.7, 0.1, 0.2
-        n_train = int(len(indices) * r_train)
-        n_val = int(len(indices) * r_val)
-        train_idx = indices[:n_train]
-        val_idx = indices[n_train:n_train + n_val]
-        test_idx = indices[n_train + n_val:]
-        train_keys = tuple(inter_keys[i] for i in train_idx)
-        val_keys = tuple(inter_keys[i] for i in val_idx)
-        test_keys = tuple(inter_keys[i] for i in test_idx)
+        # Deterministic default split by SUBJECT (70/10/20), ordered by subject ID
+        subjects_sorted = sorted({k[0] for k in inter_keys}, key=lambda s: int(s))
+        n_subj = len(subjects_sorted)
+        if n_subj < 3:
+            # Require user to specify lists if we can't make 3 non-empty splits deterministically
+            raise RuntimeError(f"Found {n_subj} subjects; please provide --train_subjects/--val_subjects/--test_subjects.")
+        n_train = max(1, int(n_subj * 0.7))
+        n_val   = max(1, int(n_subj * 0.1))
+        # ensure sum==n_subj and all non-empty
+        if n_train + n_val >= n_subj:
+            n_val = 1
+            n_train = max(1, n_subj - n_val - 1)
+        n_test = n_subj - n_train - n_val
+
+        train_subj = set(subjects_sorted[:n_train])
+        val_subj   = set(subjects_sorted[n_train:n_train+n_val])
+        test_subj  = set(subjects_sorted[n_train+n_val:])
+
+        # Build keys deterministically
+        train_keys = tuple(k for k in inter_keys if k[0] in train_subj)
+        val_keys   = tuple(k for k in inter_keys if k[0] in val_subj)
+        test_keys  = tuple(k for k in inter_keys if k[0] in test_subj)
 
     # --- Sanity checks: subjects & keys (no leakage) ---
-    def _assert_disjoint_sets(a, b, aname="A", bname="B"):
+    def _assert_disjoint_sets(a: Set[str], b: Set[str], aname="A", bname="B"):
         inter = set(a) & set(b)
         if inter:
             raise ValueError(f"Leakage: {aname} ∩ {bname} = {sorted(inter)}")
 
-    def _subjects_from_keys(keys):
+    def _subjects_from_keys(keys: Tuple[Tuple[str, str], ...]):
         return {str(k[0]) for k in keys}
 
     # Subjects present in each split (as derived from keys)
@@ -551,7 +553,7 @@ def train_loop(cfg: TrainConfig) -> None:
     val_subj_from_keys   = _subjects_from_keys(val_keys)
     test_subj_from_keys  = _subjects_from_keys(test_keys)
 
-    # If user provided explicit subject lists, enforce membership
+    # If user provided explicit lists, enforce membership
     if cfg.train_subjects or cfg.val_subjects or cfg.test_subjects:
         exp_train = set(str(int(s)) for s in (cfg.train_subjects or []))
         exp_val   = set(str(int(s)) for s in (cfg.val_subjects or []))
@@ -599,10 +601,10 @@ def train_loop(cfg: TrainConfig) -> None:
     except Exception as e:
         print(f"[splits] WARN: couldn't save subject_splits.json ({e})")
 
-    # Original debug print of keys (optional, can be noisy)
+    # Optional: print concrete keys (can be verbose)
     print("train_keys", train_keys, "val_keys", val_keys, "test_keys", test_keys)
 
-    # DataLoaders (persistent workers/prefetch for speed)
+    # DataLoaders (no shuffle for determinism)
     pin = device.type == 'cuda'
     dl_train_kwargs = dict(
         dataset=PairedAlignedDataset(
@@ -619,7 +621,8 @@ def train_loop(cfg: TrainConfig) -> None:
             device='cpu',
             include_sr_keys=train_keys,
         ),
-        batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers,
+        batch_size=cfg.batch_size, shuffle=False,  # <<< no shuffling
+        num_workers=cfg.num_workers,
         collate_fn=collate_paired, pin_memory=pin, drop_last=False
     )
     dl_val_kwargs = dict(
@@ -637,7 +640,8 @@ def train_loop(cfg: TrainConfig) -> None:
             device='cpu',
             include_sr_keys=val_keys,
         ),
-        batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers,
+        batch_size=cfg.batch_size, shuffle=False,
+        num_workers=cfg.num_workers,
         collate_fn=collate_paired, pin_memory=pin, drop_last=False
     )
     if cfg.num_workers > 0:
@@ -648,7 +652,7 @@ def train_loop(cfg: TrainConfig) -> None:
     dl_val = DataLoader(**dl_val_kwargs)
 
     if len(dl_train.dataset) == 0 or len(dl_val.dataset) == 0:
-        print("Empty train or val split. Adjust split ratios or check data.")
+        print("Empty train or val split. Adjust subject lists or check data.")
         return
 
     # Frozen feature extractors
@@ -694,7 +698,7 @@ def train_loop(cfg: TrainConfig) -> None:
         debug=cfg.debug,
     ).to(device)
 
-    # Optimizer (decoder now registered -> will be trained)
+    # Optimizer
     optim = torch.optim.AdamW(
         [p for p in translator.parameters() if p.requires_grad],
         lr=cfg.lr,
@@ -838,7 +842,7 @@ def train_loop(cfg: TrainConfig) -> None:
                 eeg_latents = frozen_cbramod.extract_latents(x_eeg_obs)  # (L,B,P,C,D)
 
                 fmri_padded = pad_timepoints_for_brainlm_torch(fmri_obs, patch_size=20)  # (B,Tp,V)
-                signal_vectors = fmri_padded.permute(0, 2, 1).contiguous()               # (B,V,Tp)
+                signal_vectors = fmri_padded.permute(0, 2, 1).contiguous()               # (B,V, Tp)
 
                 # coords (A424 normalized if V==424, else zeros) with robust search
                 try:
@@ -1035,13 +1039,9 @@ def dry_run_debug(
     print(f"d_model, n_heads, d_ff : {d_model}, {n_heads}, {d_ff}\n")
 
     # -------- Synthetic latents (already GROUPED for EEG) --------
-    # EEG latents that would come *after* grouping: (L,B,Pe,C,D) with D=target_fs
     eeg_latents = torch.randn(L_eeg, batch_size, Pe, eeg_channels, S, device=device)
-
-    # fMRI latents that would come out of BrainLM: (L,B,Ttok,H)
     fmri_latents = torch.randn(L_fmri, batch_size, Ttok_dummy, fmri_hidden_size, device=device)
 
-    # -------- Build translator exactly like training --------
     translator = TranslatorModel(
         eeg_channels=eeg_channels,
         eeg_patch_num=Pe,
@@ -1061,39 +1061,32 @@ def dry_run_debug(
     ).to(device)
     translator.eval()
 
-    # -------- Print param counts --------
     total_params = sum(p.numel() for p in translator.parameters())
     trainable_params = sum(p.numel() for p in translator.parameters() if p.requires_grad)
     print(f"Translator params (total/trainable): {total_params:,} / {trainable_params:,}\n")
 
-    # -------- Walk the stack with shapes --------
     with torch.no_grad():
-        # Adapters
         eeg_adapt = translator.adapter_eeg(eeg_latents)      # (B, Neeg, D)
         fmri_adapt = translator.adapter_fmri(fmri_latents)   # (B, Nfmri, D)
         print("[adapter_eeg]  ->", shp(eeg_adapt))
         print("[adapter_fmri] ->", shp(fmri_adapt))
 
-        # Encoders
         _, eeg_hi = translator.eeg_encoder(eeg_adapt, eeg_adapt)
         _, fmr_hi = translator.fmri_encoder(fmri_adapt, fmri_adapt)
         print("[eeg_encoder]  ->", shp(eeg_hi))
         print("[fmri_encoder] ->", shp(fmr_hi))
 
-        # Compressor & cross-attention
         eeg_c, fmr_c, _ = translator.compressor(eeg_hi, fmr_hi)
         print("[compressor] eeg_c:", shp(eeg_c), " fmri_c:", shp(fmr_c))
         fused = translator.cross_attn(eeg_c, fmr_c)
         print("[cross_attn] fused:", shp(fused))
 
-        # EEG decoder
         eeg_layers = translator.eeg_decoder(fused)           # (L,B,P,C,S)
         print("[eeg_decoder] layers:", shp(eeg_layers))
         eeg_signal = eeg_layers.mean(dim=0).permute(0, 2, 1, 3).contiguous()  # (B,C,P,S)
         print("[eeg_signal] ->", shp(eeg_signal), "(expect (B,C,Pe,S) =",
               (batch_size, eeg_channels, Pe, S), ")")
 
-        # fMRI decoder path (NEW design)
         dec_tokens, eff_len, _ = translator.fmri_decoder(fused)  # (L,B,eff_len,H)
         print("[fmri_decoder] tokens:", shp(dec_tokens), "eff_len:", int(eff_len))
         dec_mean = dec_tokens.mean(dim=0)                        # (B,eff_len,H)
