@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-Visualize original vs reconstructed EEG and fMRI (A424), parity with training.
+Visualize original vs reconstructed EEG and fMRI (A424) using the UPDATED training setup:
 
-Key alignments with training:
-- Fixed subject splits via collect_common_sr_keys / fixed_subject_keys (no shuffle)
-- Translator built with fmri_tokens_target = T * V (NOT Ttok)
-- Same fMRI decode path: fMRIDecodingAdapter + token-scalar head + tanh + learnable affine
+- Uses Lite decoders (EEGDecodingAdapterLite / fMRIDecodingAdapterLite)
+- Small translator (d_model=128, n_heads=4, d_ff=512, 1 encoder stack)
+- Sinusoidal positional encodings on EEG & fMRI token sequences
+- STRICT subject split: loads subject_splits.json from the checkpoint's folder
+- fMRI tokens target = T * V (NOT BrainLM Ttok), same as training
 """
 
 from __future__ import annotations
 
 import os
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, List
@@ -41,8 +43,8 @@ from module import (  # type: ignore
     fMRIInputAdapterConv1d,
     HierarchicalEncoder,
     CrossAttentionLayer,
-    EEGDecodingAdapter,
-    fMRIDecodingAdapter,
+    EEGDecodingAdapterLite,      # UPDATED: Lite
+    fMRIDecodingAdapterLite,     # UPDATED: Lite
 )
 
 from models.cbramod import CBraMod  # type: ignore
@@ -64,11 +66,8 @@ FMRI_ROOT = r"D:\Neuroinformatics_research_2025\Oddball\ds000116"
 A424_LABEL_NII = r"D:\Neuroinformatics_research_2025\BrainLM\A424_resampled_to_bold.nii.gz"
 CBRAMOD_WEIGHTS = r"D:\Neuroinformatics_research_2025\MNI_templates\CBraMod\pretrained_weights\pretrained_weights.pth"
 BRAINLM_MODEL_DIR = r"D:\Neuroinformatics_research_2025\MNI_templates\BrainLM\pretrained_models\2023-06-06-22_15_00-checkpoint-1400"
-CHECKPOINT = r"D:\Neuroinformatics_research_2025\Multi_modal_NTM\oddball_Neural_translation_run3_aug13_data_split_eeg1_fmri6_bs16\translator_best.pt"
-OUT_DIR = r"D:\Neuroinformatics_research_2025\Multi_modal_NTM\viz_out_test_aug13"
-
-# Optional: if you want to auto-read the exact splits saved by training:
-TRAIN_OUTPUT_DIR = r"D:\Neuroinformatics_research_2025\Multi_modal_NTM\oddball_Neural_translation_run3_aug13_data_split_eeg1_fmri6_bs16"  # where training saved subject_splits.json
+CHECKPOINT = r"D:\Neuroinformatics_research_2025\Multi_modal_NTM\translator_runs\translator_best.pt"
+OUT_DIR = r"D:\Neuroinformatics_research_2025\Multi_modal_NTM\viz_out"
 
 DEVICE = "cuda"
 SEED = 42
@@ -83,17 +82,29 @@ NUM_WORKERS = 0
 EEG_SECONDS_PER_TOKEN = 40
 TR = 2.0
 
-SUBSET = "train"    # train | val | test | all
-MODE = "eeg2fmri"   # both | eeg2fmri | fmri2eeg | partial_eeg | partial_fmri
+SUBSET = "test"     # train | val | test | all
+MODE = "fmri2eeg"   # both | eeg2fmri | fmri2eeg | partial_eeg | partial_fmri
 PARTIAL_VISIBLE_FRAC = 0.5
 
 EEG_CHANNELS_TO_PLOT = "0,1,2,3"
 FMRI_ROIS_TO_PLOT = [0, 1, 2, 3, 4]
 
-# Fixed subjects (mirror translator.yaml)
-FIXED_TRAIN_SUBJECTS = [1,2,3,4,5,6,7,8,9,10,11]
-FIXED_VAL_SUBJECTS   = [12]
-FIXED_TEST_SUBJECTS  = [13,14,15,17]
+# -----------------------------
+# Positional Encoding (sin/cos)
+# -----------------------------
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, max_len: int = 100_000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer("pe", pe)  # (max_len, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, D)
+        return x + self.pe[: x.size(1), :].unsqueeze(0)
 
 # -----------------------------
 # Frozen feature extractors
@@ -164,7 +175,7 @@ class FrozenBrainLM(nn.Module):
         return torch.stack(list(enc.hidden_states), dim=0)  # (L,B,Ttok,H)
 
 # -----------------------------
-# Translator (matches training fMRI path)
+# Translator (Lite + small + PEs)
 # -----------------------------
 class TranslatorModel(nn.Module):
     def __init__(
@@ -178,9 +189,9 @@ class TranslatorModel(nn.Module):
         fmri_tokens_target: int,
         fmri_target_T: int,
         fmri_target_V: int,
-        d_model: int = 256,
-        n_heads: int = 8,
-        d_ff: int = 1024,
+        d_model: int = 128,         # small
+        n_heads: int = 4,           # small
+        d_ff: int = 512,            # small
         dropout: float = 0.1,
         voxel_count: int = 424,
         debug: bool = False,
@@ -190,77 +201,58 @@ class TranslatorModel(nn.Module):
         self._voxel_count = int(voxel_count)
         self._fmri_n_layers = int(fmri_n_layers)
         self._fmri_hidden_size = int(fmri_hidden_size)
-        self._d_model = int(d_model)
 
         # Adapters
         self.adapter_eeg = ConvEEGInputAdapter(
-            seq_len=eeg_patch_num, n_layers=eeg_n_layers, channels=eeg_channels,
-            input_dim=eeg_input_dim, output_dim=d_model,
+            seq_len=eeg_patch_num, n_layers=eeg_n_layers,
+            channels=eeg_channels, input_dim=eeg_input_dim, output_dim=d_model,
         )
         self.adapter_fmri = fMRIInputAdapterConv1d(
             seq_len=fmri_tokens_target, n_layers=fmri_n_layers,
             input_dim=fmri_hidden_size, output_dim=d_model, target_seq_len=512,
         )
 
-        # Encoders & fusion
-        self.eeg_encoder = HierarchicalEncoder(d_model, n_heads, d_ff, dropout, n_layers_per_stack=2)
-        self.fmri_encoder = HierarchicalEncoder(d_model, n_heads, d_ff, dropout, n_layers_per_stack=2)
-        self.cross_attn = CrossAttentionLayer(d_model, n_heads, dropout)
-        self.compressor = BidirectionalAdaptiveCompressor()
+        # Positional encodings
+        self.pos_eeg  = PositionalEncoding(d_model)
+        self.pos_fmri = PositionalEncoding(d_model)
 
-        # Decoders
-        self.eeg_decoder = EEGDecodingAdapter(
-            channels=eeg_channels, patch_num=eeg_patch_num, n_layers=eeg_n_layers,
-            patch_size=eeg_input_dim, d_model=d_model,
+        # Encoders & fusion (shallower: 1 stack)
+        self.eeg_encoder  = HierarchicalEncoder(d_model, n_heads, d_ff, dropout, n_layers_per_stack=1)
+        self.fmri_encoder = HierarchicalEncoder(d_model, n_heads, d_ff, dropout, n_layers_per_stack=1)
+        self.cross_attn   = CrossAttentionLayer(d_model, n_heads, dropout)
+        self.compressor   = BidirectionalAdaptiveCompressor()
+
+        # Lite decoders
+        self.eeg_decoder = EEGDecodingAdapterLite(
+            channels=eeg_channels, patch_num=eeg_patch_num,
+            patch_size=eeg_input_dim, d_model=d_model, rank=32,
         )
-        self.fmri_decoder = fMRIDecodingAdapter(
-            num_voxels=fmri_target_V,
-            timepoints_per_voxel=fmri_target_T,
-            n_layers=fmri_n_layers,
-            hidden_size=fmri_hidden_size,
-            d_model=d_model,
-            max_target_tokens=100_000,
-            downsample_to_cap=True,
+        self.fmri_decoder = fMRIDecodingAdapterLite(
+            target_T=fmri_target_T, target_V=fmri_target_V,
+            d_model=d_model, rank=16,
         )
-        self.fmri_token_head = nn.Linear(self._fmri_hidden_size, 1)
+
         self.fmri_out_scale = nn.Parameter(torch.tensor(1.0))
         self.fmri_out_bias  = nn.Parameter(torch.tensor(0.0))
-
-    def _dbg(self, msg: str) -> None:
-        if self.debug:
-            print(msg, flush=True)
 
     def forward(self, eeg_latents, fmri_latents, fmri_target_T: int, fmri_target_V: int):
         if int(fmri_target_V) != self._voxel_count:
             raise ValueError(f"TranslatorModel expects V={self._voxel_count}, got V={fmri_target_V}")
 
-        # Adapt & encode
-        eeg_adapt = self.adapter_eeg(eeg_latents)     # (B, Neeg, D)
-        fmri_adapt = self.adapter_fmri(fmri_latents)  # (B, Nfmri, D)
+        # Adapt + add PE
+        eeg_adapt  = self.pos_eeg( self.adapter_eeg(eeg_latents) )
+        fmri_adapt = self.pos_fmri(self.adapter_fmri(fmri_latents))
+
+        # Encode, compress, fuse
         _, eeg_hi = self.eeg_encoder(eeg_adapt, eeg_adapt)
         _, fmr_hi = self.fmri_encoder(fmri_adapt, fmri_adapt)
         eeg_c, fmr_c, _ = self.compressor(eeg_hi, fmr_hi)
-        fused = self.cross_attn(eeg_c, fmr_c)         # (B, Tfused, D)
+        fused = self.cross_attn(eeg_c, fmr_c)
 
-        # EEG decode to signal
-        eeg_layers = self.eeg_decoder(fused)          # (L,B,P,C,S)
-        eeg_signal = eeg_layers.mean(dim=0).permute(0, 2, 1, 3).contiguous()  # (B,C,P,S)
-
-        # fMRI decode to (B,T,V)
-        dec_tokens, eff_len, _ = self.fmri_decoder(fused)  # (L,B,eff_len,H)
-        dec_mean = dec_tokens.mean(dim=0)                  # (B,eff_len,H)
-        token_scalar = self.fmri_token_head(dec_mean)      # (B,eff_len,1)
-        token_scalar = token_scalar.transpose(1, 2)        # (B,1,eff_len)
-
-        target_tokens = int(fmri_target_T) * int(fmri_target_V)
-        if eff_len != target_tokens:
-            if eff_len < target_tokens:
-                token_scalar = nn.functional.interpolate(token_scalar, size=target_tokens, mode="linear", align_corners=False)
-            else:
-                token_scalar = nn.functional.adaptive_avg_pool1d(token_scalar, target_tokens)
-
-        token_scalar = token_scalar.transpose(1, 2).contiguous().squeeze(-1)  # (B,target_tokens)
-        fmri_signal = token_scalar.view(-1, int(fmri_target_T), int(fmri_target_V))  # (B,T,V)
+        # Decode (Lite)
+        eeg_signal = self.eeg_decoder(fused)                 # (B,C,Pe,S)
+        fmri_flat  = self.fmri_decoder(fused)                # (B, T*V)
+        fmri_signal = fmri_flat.view(-1, int(fmri_target_T), int(fmri_target_V))
         fmri_signal = torch.tanh(fmri_signal)
         fmri_signal = self.fmri_out_scale * fmri_signal + self.fmri_out_bias
         return eeg_signal, fmri_signal
@@ -373,12 +365,15 @@ def plot_fmri_masked_segment_zooms(ts_true: torch.Tensor, ts_recon: torch.Tensor
     b0_reco = ts_recon[0].detach().cpu().numpy()
     T, V = b0_true.shape
     t = np.arange(T) * tr
-    segments = _contiguous_true_segments(mask_bool_T)
-    if not segments:
+    idx = np.flatnonzero(mask_bool_T)
+    if idx.size == 0:
         return
+    splits = np.where(np.diff(idx) != 1)[0] + 1
+    segments = np.split(idx, splits)
     sel = [r for r in rois if 0 <= r < V]
     for r in sel:
-        for si, (s, e) in enumerate(segments):
+        for si, seg in enumerate(segments):
+            s, e = int(seg[0]), int(seg[-1])
             sl = slice(s, e + 1)
             plt.figure(figsize=(9,3))
             plt.plot(t[sl], b0_true[sl, r], label='fMRI true')
@@ -404,7 +399,7 @@ class VizConfig:
     device: str = "cuda"
     seed: int = 42
     fmri_norm: str = "zscore"
-    window_sec: int = 40
+    window_sec: int = 30
     original_fs: int = 1000
     target_fs: int = 200
     stride_sec: Optional[int] = None
@@ -446,12 +441,12 @@ def build_translator(
         fmri_tokens_target=fmri_tokens_target,  # MUST be T * V (as in training)
         fmri_target_T=fmri_target_T,
         fmri_target_V=fmri_target_V,
-        d_model=256, n_heads=8, d_ff=1024, dropout=0.1,
+        d_model=128, n_heads=4, d_ff=512, dropout=0.1,  # match training
         voxel_count=fmri_target_V,
         debug=False,
     ).to(device)
 
-    # Load translator weights (filter unexpected keys)
+    # Load translator weights (filter unexpected/mismatched shapes)
     try:
         ckpt = torch.load(str(cfg.checkpoint), map_location=device, weights_only=False)
     except TypeError:
@@ -464,43 +459,45 @@ def build_translator(
     translator.eval()
     return translator
 
-def _load_fixed_subjects_from_json(output_dir: str) -> Optional[Tuple[List[int], List[int], List[int]]]:
-    try:
-        p = Path(output_dir) / "subject_splits.json"
-        if not p.exists():
-            return None
-        with open(p, "r") as f:
-            j = json.load(f)
-        tr = [int(s) for s in j.get("train_subjects", [])]
-        va = [int(s) for s in j.get("val_subjects", [])]
-        te = [int(s) for s in j.get("test_subjects", [])]
-        if not tr or not va or not te:
-            return None
-        return tr, va, te
-    except Exception:
-        return None
+def _load_fixed_subjects_from_json(run_dir: Path) -> Tuple[List[int], List[int], List[int]]:
+    p = Path(run_dir) / "subject_splits.json"
+    if not p.exists():
+        raise FileNotFoundError(
+            f"subject_splits.json not found at {p}. "
+            "Ensure you point CHECKPOINT to the training run folder that contains this file."
+        )
+    with open(p, "r") as f:
+        j = json.load(f)
+    tr = [int(s) for s in j.get("train_subjects", [])]
+    va = [int(s) for s in j.get("val_subjects", [])]
+    te = [int(s) for s in j.get("test_subjects", [])]
+    if not tr or not va or not te:
+        raise RuntimeError(f"Invalid subject_splits.json at {p} (empty list(s)).")
+    return tr, va, te
 
 def run_once(cfg: VizConfig, subset: str = "test", mode: str = "both", partial_visible_frac: float = 0.5):
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
     torch.cuda.manual_seed_all(cfg.seed)
 
+    if torch.cuda.is_available() and cfg.device.startswith("cuda"):
+        try:
+            torch.set_float32_matmul_precision('high')
+        except Exception:
+            pass
+
     device = torch.device(cfg.device)
     out_dir = cfg.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ----- Build subject-run split exactly like training (no shuffle) -----
+    # ----- Subject-run split exactly like training (STRICT; no shuffle) -----
     inter_keys = collect_common_sr_keys(cfg.eeg_root, cfg.fmri_root)
     if len(inter_keys) == 0:
         raise RuntimeError("No aligned (subject, run) pairs found; check paths.")
 
-    # Prefer subjects saved by training; otherwise fall back to translator.yaml lists
-    loaded = _load_fixed_subjects_from_json(TRAIN_OUTPUT_DIR)
-    if loaded is not None:
-        train_subj, val_subj, test_subj = loaded
-    else:
-        train_subj, val_subj, test_subj = FIXED_TRAIN_SUBJECTS, FIXED_VAL_SUBJECTS, FIXED_TEST_SUBJECTS
-
+    # Load splits from the checkpoint's parent directory (training run folder)
+    run_dir = Path(cfg.checkpoint).parent
+    train_subj, val_subj, test_subj = _load_fixed_subjects_from_json(run_dir)
     train_keys, val_keys, test_keys = fixed_subject_keys(
         cfg.eeg_root, cfg.fmri_root, train_subj, val_subj, test_subj
     )
@@ -615,10 +612,9 @@ def run_once(cfg: VizConfig, subset: str = "test", mode: str = "both", partial_v
     fmri_hidden_size = int(getattr(frozen_fmri.model.config, "hidden_size", 256))
 
     # ---- Translator (built AFTER we know T and V)
-    # IMPORTANT: fmri_tokens_target MUST be T * V (same as training), not Ttok
     translator = build_translator(
         cfg, device,
-        fmri_tokens_target=int(fmri_t.shape[1]) * int(fmri_t.shape[2]),
+        fmri_tokens_target=int(fmri_t.shape[1]) * int(fmri_t.shape[2]),  # T * V (same as training)
         fmri_target_T=int(fmri_t.shape[1]),
         fmri_target_V=int(fmri_t.shape[2]),
         fmri_n_layers=fmri_n_layers,

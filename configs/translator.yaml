@@ -1,7 +1,7 @@
 train:
   eeg_root: D:/Neuroinformatics_research_2025/Oddball/ds116_eeg
   fmri_root: D:/Neuroinformatics_research_2025/Oddball/ds000116
-  a424_label_nii: D:\Neuroinformatics_research_2025\BrainLM\A424_resampled_to_bold.nii.gz
+  a424_label_nii: D:/Neuroinformatics_research_2025/BrainLM/A424_resampled_to_bold.nii.gz
   cbramod_weights: D:/Neuroinformatics_research_2025/MNI_templates/CBraMod/pretrained_weights/pretrained_weights.pth
   brainlm_model_dir: D:/Neuroinformatics_research_2025/MNI_templates/BrainLM/pretrained_models/2023-06-06-22_15_00-checkpoint-1400
   output_dir: D:/Neuroinformatics_research_2025/Multi_modal_NTM/translator_runs
@@ -24,10 +24,11 @@ train:
   fmri_loss_w: 1.0
   eeg_seconds_per_token: 40
   resume: null
-  # fixed subject splits (optional). Example below enables 1-12 train, 13 val, 14,15,17 test
-  train_subjects: [1,2,3,4,5,6,7,8,9,10,11,12]
-  val_subjects: [13]
-  test_subjects: [14,15,17]
+
+  # fixed subject splits (anchors so test reuses these)
+  train_subjects: &train_subjects [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+  val_subjects:   &val_subjects   [13]
+  test_subjects:  &test_subjects  [14, 15, 17]
 
 test:
   eeg_root: D:/Neuroinformatics_research_2025/Oddball/ds116_eeg
@@ -51,8 +52,8 @@ test:
   partial_visible_frac: 0.5
   save_recons: null
   save_n_batches: 0
-  # fixed test subjects (optional). If provided, used instead of random split for test
-  train_subjects: [1,2,3,4,5,6,7,8,9,10,11,12]
-  val_subjects: [13]
-  test_subjects: [14,15,17]
 
+  # reuse IDs from train via aliases
+  train_subjects: *train_subjects
+  val_subjects:   *val_subjects
+  test_subjects:  *test_subjects

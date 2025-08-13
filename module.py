@@ -21,6 +21,90 @@ import torch.nn.functional as F
 sys.path.append(str(Path(__file__).parent.parent / "CBraMod"))
 sys.path.append(str(Path(__file__).parent.parent / "BrainLM"))
 
+class EEGDecodingAdapterLite(nn.Module):
+    """
+    Very small EEG decoder.
+    Input:  (B, Tfused, D)
+    Output: (B, C, P, S)  with P=patch_num (grouped seconds), S=patch_size (e.g., 200)
+    """
+    def __init__(self, channels, patch_num, patch_size=200, d_model=128, rank=32):
+        super().__init__()
+        self.channels = int(channels)
+        self.patch_num = int(patch_num)
+        self.patch_size = int(patch_size)
+        self.d_model = int(d_model)
+        self.rank = int(rank)
+        self.target_tokens = self.channels * self.patch_num
+
+        self.seq_adjust = nn.Sequential(
+            nn.Linear(self.d_model, self.d_model, bias=True),
+            nn.GELU(),
+            nn.LayerNorm(self.d_model),
+        )
+        # low-rank factorization D -> r -> S
+        self.to_rank   = nn.Linear(self.d_model, self.rank, bias=False)
+        self.from_rank = nn.Linear(self.rank, self.patch_size, bias=True)
+
+    def forward(self, fused: torch.Tensor) -> torch.Tensor:
+        B, T, D = fused.shape
+        x = self.seq_adjust(fused)
+
+        # resample sequence len to channels*patch_num
+        xt = x.transpose(1, 2)                       # (B, D, T)
+        if T != self.target_tokens:
+            if T < self.target_tokens:
+                xt = F.interpolate(xt, size=self.target_tokens, mode="linear", align_corners=False)
+            else:
+                xt = F.adaptive_avg_pool1d(xt, self.target_tokens)
+        x = xt.transpose(1, 2)                        # (B, target_tokens, D)
+
+        # low-rank projection per token -> patch_size
+        z = self.to_rank(x)                           # (B, target_tokens, r)
+        z = self.from_rank(z)                         # (B, target_tokens, S)
+
+        # reshape tokens back to (C, P)
+        z = z.view(B, self.channels, self.patch_num, self.patch_size)  # (B,C,P,S)
+        return z
+
+
+class fMRIDecodingAdapterLite(nn.Module):
+    """
+    Very small fMRI decoder that outputs scalar tokens directly.
+    Input:  (B, Tfused, D)
+    Output: (B, T*V) tokens (scalar), caller reshapes to (B,T,V)
+    """
+    def __init__(self, target_T: int, target_V: int, d_model: int = 128, rank: int = 16):
+        super().__init__()
+        self.target_tokens = int(target_T) * int(target_V)
+        self.d_model = int(d_model)
+        self.rank = int(rank)
+
+        self.seq_adjust = nn.Sequential(
+            nn.Linear(self.d_model, self.d_model, bias=True),
+            nn.GELU(),
+            nn.LayerNorm(self.d_model),
+        )
+        # low-rank projection D -> r -> 1
+        self.to_rank   = nn.Linear(self.d_model, self.rank, bias=False)
+        self.from_rank = nn.Linear(self.rank, 1, bias=True)
+
+    def forward(self, fused: torch.Tensor) -> torch.Tensor:
+        B, T, D = fused.shape
+        x = self.seq_adjust(fused)                    # (B,T,D)
+
+        # produce scalar token per fused step
+        z = self.from_rank(self.to_rank(x))           # (B,T,1)
+        z = z.transpose(1, 2)                         # (B,1,T)
+
+        # resize to exactly T*V scalar tokens
+        if T != self.target_tokens:
+            if T < self.target_tokens:
+                z = F.interpolate(z, size=self.target_tokens, mode="linear", align_corners=False)
+            else:
+                z = F.adaptive_avg_pool1d(z, self.target_tokens)
+
+        z = z.squeeze(1)                              # (B, target_tokens)
+        return z
 # -------------------------------
 # Simplified Bidirectional Adaptive Compressor
 # -------------------------------
