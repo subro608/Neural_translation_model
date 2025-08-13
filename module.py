@@ -329,7 +329,7 @@ class fMRIDecodingAdapter(nn.Module):
             nn.Linear(n_layers * hidden_size * 2, n_layers * hidden_size),
             nn.LayerNorm(n_layers * hidden_size)
         )
-        self.final_activation = nn.Tanh()
+        self.final_activation = nn.Identity() 
 
     def forward(self, fused_representation):
         B, T, D = fused_representation.shape

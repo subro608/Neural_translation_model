@@ -1,7 +1,7 @@
 train:
   eeg_root: D:/Neuroinformatics_research_2025/Oddball/ds116_eeg
   fmri_root: D:/Neuroinformatics_research_2025/Oddball/ds000116
-  a424_label_nii: D:/Neuroinformatics_research_2025/BrainLM/A424_resampled_to_bold.nii.gz
+  a424_label_nii: D:\Neuroinformatics_research_2025\BrainLM\A424_resampled_to_bold.nii.gz
   cbramod_weights: D:/Neuroinformatics_research_2025/MNI_templates/CBraMod/pretrained_weights/pretrained_weights.pth
   brainlm_model_dir: D:/Neuroinformatics_research_2025/MNI_templates/BrainLM/pretrained_models/2023-06-06-22_15_00-checkpoint-1400
   output_dir: D:/Neuroinformatics_research_2025/Multi_modal_NTM/translator_runs

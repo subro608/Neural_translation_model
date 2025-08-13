@@ -8,6 +8,13 @@ with tri-mix training:
 
 Saves FULL checkpoints (translator + optimizer + scaler + config + rng + metrics)
 and optionally resumes exactly via --resume.
+
+Changes vs previous version:
+- fMRIDecodingAdapter is now instantiated in TranslatorModel.__init__ (not in forward),
+  so it’s trainable and checkpointed.
+- fmri_n_layers and fmri_hidden_size are derived from BrainLM config for robustness.
+- fmri_target_T and fmri_target_V are passed when building the translator so the decoder
+  is shaped correctly from the start.
 """
 
 from __future__ import annotations
@@ -55,6 +62,7 @@ from module import (  # type: ignore
     HierarchicalEncoder,
     CrossAttentionLayer,
     EEGDecodingAdapter,
+    fMRIDecodingAdapter,
 )
 
 # Models
@@ -186,16 +194,21 @@ class TranslatorModel(nn.Module):
         fmri_n_layers: int,
         fmri_hidden_size: int,
         fmri_tokens_target: int,
+        fmri_target_T: int,          # <-- NEW: fix decoder shape at build time
+        fmri_target_V: int,          # <-- NEW: fix decoder shape at build time
         d_model: int = 256,
         n_heads: int = 8,
         d_ff: int = 1024,
         dropout: float = 0.1,
-        voxel_count: int = 424,   # <-- constant V
+        voxel_count: int = 424,      # <-- constant V
         debug: bool = False,
     ) -> None:
         super().__init__()
         self.debug = debug
         self._voxel_count = int(voxel_count)
+        self._fmri_n_layers = int(fmri_n_layers)
+        self._fmri_hidden_size = int(fmri_hidden_size)
+        self._d_model = int(d_model)
 
         # Adapters
         self.adapter_eeg = ConvEEGInputAdapter(
@@ -206,7 +219,7 @@ class TranslatorModel(nn.Module):
             output_dim=d_model,
         )
         self.adapter_fmri = fMRIInputAdapterConv1d(
-            seq_len=fmri_tokens_target,
+            seq_len=fmri_tokens_target,        # informational; not strictly required for asserts
             n_layers=fmri_n_layers,
             input_dim=fmri_hidden_size,
             output_dim=d_model,
@@ -228,15 +241,19 @@ class TranslatorModel(nn.Module):
             d_model=d_model,
         )
 
-        # fMRI factorized head
-        self.fmri_proj = nn.Sequential(
-            nn.Linear(d_model, d_model * 2), nn.GELU(), nn.Dropout(0.1),
-            nn.Linear(d_model * 2, d_model), nn.LayerNorm(d_model)
+        # fMRI decoder (token sequence) + head to scalarize tokens and reshape to (T,V)
+        self.fmri_decoder = fMRIDecodingAdapter(
+            num_voxels=fmri_target_V,
+            timepoints_per_voxel=fmri_target_T,
+            n_layers=fmri_n_layers,
+            hidden_size=fmri_hidden_size,
+            d_model=d_model,
+            max_target_tokens=100_000,
+            downsample_to_cap=True,
         )
-        self.fmri_depthwise = nn.Conv1d(in_channels=d_model, out_channels=d_model, kernel_size=3, padding=1, groups=d_model)
-
-        # Allocate voxel embedding ONCE (constant V)
-        self.fmri_voxel_embed = nn.Embedding(self._voxel_count, d_model)
+        self.fmri_token_head = nn.Linear(self._fmri_hidden_size, 1)
+        self.fmri_out_scale = nn.Parameter(torch.tensor(1.0))
+        self.fmri_out_bias  = nn.Parameter(torch.tensor(0.0))
 
     def _dbg(self, msg: str) -> None:
         if self.debug:
@@ -266,16 +283,22 @@ class TranslatorModel(nn.Module):
         eeg_layers = self.eeg_decoder(fused)           # (L,B,P,C,S)
         eeg_signal = eeg_layers.mean(dim=0).permute(0, 2, 1, 3).contiguous()  # (B,C,P,S)
 
-        # fMRI decode
-        H = self.fmri_proj(fused)                      # (B, Tfused, D)
-        Hc = H.transpose(1, 2).contiguous()           # (B, D, Tfused)
-        Hc = self.fmri_depthwise(Hc)                  # (B, D, Tfused)
-        if Hc.shape[-1] != fmri_target_T:
-            Hc = nn.functional.interpolate(Hc, size=fmri_target_T, mode='linear', align_corners=False)
-        H = Hc.transpose(1, 2).contiguous()           # (B, T, D)
+        # fMRI decode via fMRIDecodingAdapter → (L,B,eff_len,H)
+        dec_tokens, eff_len, _ = self.fmri_decoder(fused)  # (L,B,eff_len,H)
+        dec_mean = dec_tokens.mean(dim=0)                  # (B,eff_len,H)
+        token_scalar = self.fmri_token_head(dec_mean)      # (B,eff_len,1)
+        token_scalar = token_scalar.transpose(1, 2)        # (B,1,eff_len)
 
-        E = self.fmri_voxel_embed.weight              # (V=424, D)
-        fmri_signal = torch.matmul(H, E.t())          # (B, T, V)
+        target_tokens = int(fmri_target_T) * int(fmri_target_V)
+        if eff_len != target_tokens:
+            if eff_len < target_tokens:
+                token_scalar = nn.functional.interpolate(token_scalar, size=target_tokens, mode="linear", align_corners=False)
+            else:
+                token_scalar = nn.functional.adaptive_avg_pool1d(token_scalar, target_tokens)
+        token_scalar = token_scalar.transpose(1, 2).contiguous().squeeze(-1)  # (B,target_tokens)
+        fmri_signal = token_scalar.view(-1, int(fmri_target_T), int(fmri_target_V))  # (B,T,V)
+        fmri_signal = torch.tanh(fmri_signal)
+        fmri_signal = self.fmri_out_scale * fmri_signal + self.fmri_out_bias
         self._dbg("[Forward] end\n")
         return eeg_signal, fmri_signal
 
@@ -368,14 +391,13 @@ def load_checkpoint(path: Path, translator: TranslatorModel, optim: torch.optim.
         ckpt = torch.load(path, map_location=device, weights_only=False)
 
     tsd = ckpt.get("translator_state", {})
-    # Allow missing keys (e.g., older ckpts without fmri_voxel_embed)
+    # Allow missing keys (e.g., older ckpts)
     translator.load_state_dict(tsd, strict=False)
 
     if "optimizer_state" in ckpt:
         try:
             optim.load_state_dict(ckpt["optimizer_state"])
         except ValueError as e:
-            # Optimizer param groups differ (model/params changed). Proceed with fresh optimizer.
             print(f"[WARN] Optimizer state incompatible with current model parameters: {e}\n"
                   f"       Proceeding with a fresh optimizer state (weights are loaded).")
         except Exception as e:
@@ -415,9 +437,10 @@ def _rand_block_mask_time_per_sample(B: int, L: int, frac_vis_each: torch.Tensor
     for i in range(B):
         vis = max(1, int(round(float(frac_vis_each[i]) * L)))
         vis = min(vis, L)
-        start = 0
         if L > vis:
             start = int(torch.randint(0, L - vis + 1, (1,), device=device))
+        else:
+            start = 0
         M[i, start:start+vis] = False  # False = visible
     return M  # True = masked
 
@@ -458,8 +481,6 @@ def group_eeg_signal_seconds(x_eeg_sig: torch.Tensor, seconds_per_token: int) ->
 # Training loop with tri-mix
 # -----------------------------
 def train_loop(cfg: TrainConfig) -> None:
-    from torch.optim.lr_scheduler import LambdaLR
-
     def dbg(msg: str) -> None:
         if cfg.debug:
             print(msg, flush=True)
@@ -515,7 +536,72 @@ def train_loop(cfg: TrainConfig) -> None:
         train_keys = tuple(inter_keys[i] for i in train_idx)
         val_keys = tuple(inter_keys[i] for i in val_idx)
         test_keys = tuple(inter_keys[i] for i in test_idx)
+
+    # --- Sanity checks: subjects & keys (no leakage) ---
+    def _assert_disjoint_sets(a, b, aname="A", bname="B"):
+        inter = set(a) & set(b)
+        if inter:
+            raise ValueError(f"Leakage: {aname} ∩ {bname} = {sorted(inter)}")
+
+    def _subjects_from_keys(keys):
+        return {str(k[0]) for k in keys}
+
+    # Subjects present in each split (as derived from keys)
+    train_subj_from_keys = _subjects_from_keys(train_keys)
+    val_subj_from_keys   = _subjects_from_keys(val_keys)
+    test_subj_from_keys  = _subjects_from_keys(test_keys)
+
+    # If user provided explicit subject lists, enforce membership
+    if cfg.train_subjects or cfg.val_subjects or cfg.test_subjects:
+        exp_train = set(str(int(s)) for s in (cfg.train_subjects or []))
+        exp_val   = set(str(int(s)) for s in (cfg.val_subjects or []))
+        exp_test  = set(str(int(s)) for s in (cfg.test_subjects or []))
+        assert train_subj_from_keys.issubset(exp_train), \
+            f"TRAIN keys include subjects not in train_subjects: {sorted(train_subj_from_keys - exp_train)}"
+        assert val_subj_from_keys.issubset(exp_val), \
+            f"VAL keys include subjects not in val_subjects: {sorted(val_subj_from_keys - exp_val)}"
+        assert test_subj_from_keys.issubset(exp_test), \
+            f"TEST keys include subjects not in test_subjects: {sorted(test_subj_from_keys - exp_test)}"
+
+    # Subject-level disjointness
+    _assert_disjoint_sets(train_subj_from_keys, val_subj_from_keys, "train", "val")
+    _assert_disjoint_sets(train_subj_from_keys, test_subj_from_keys, "train", "test")
+    _assert_disjoint_sets(val_subj_from_keys,   test_subj_from_keys, "val",   "test")
+
+    # Key-level disjointness
+    train_key_set, val_key_set, test_key_set = set(train_keys), set(val_keys), set(test_keys)
+    assert train_key_set.isdisjoint(val_key_set),  "Key leakage: train ∩ val is non-empty"
+    assert train_key_set.isdisjoint(test_key_set), "Key leakage: train ∩ test is non-empty"
+    assert val_key_set.isdisjoint(test_key_set),   "Key leakage: val ∩ test is non-empty"
+
+    # Non-empty splits
+    if not train_keys or not val_keys or not test_keys:
+        raise RuntimeError(
+            f"Empty split: sizes -> train={len(train_keys)} val={len(val_keys)} test={len(test_keys)}"
+        )
+
+    # Helpful prints
+    print(f"[splits] subjects: train={sorted(list(train_subj_from_keys))} "
+          f"val={sorted(list(val_subj_from_keys))} test={sorted(list(test_subj_from_keys))}")
+    print(f"[splits] keys:     train={len(train_keys)} val={len(val_keys)} test={len(test_keys)}")
+
+    # Save split subjects for later auditing in test
+    try:
+        split_path = Path(cfg.output_dir) / "subject_splits.json"
+        split_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(split_path, "w") as f:
+            json.dump({
+                "train_subjects": sorted(list(train_subj_from_keys)),
+                "val_subjects":   sorted(list(val_subj_from_keys)),
+                "test_subjects":  sorted(list(test_subj_from_keys)),
+            }, f, indent=2)
+        print(f"[splits] saved -> {split_path}")
+    except Exception as e:
+        print(f"[splits] WARN: couldn't save subject_splits.json ({e})")
+
+    # Original debug print of keys (optional, can be noisy)
     print("train_keys", train_keys, "val_keys", val_keys, "test_keys", test_keys)
+
     # DataLoaders (persistent workers/prefetch for speed)
     pin = device.type == 'cuda'
     dl_train_kwargs = dict(
@@ -579,6 +665,14 @@ def train_loop(cfg: TrainConfig) -> None:
     )
     frozen_brainlm = FrozenBrainLM(cfg.brainlm_model_dir, device=device)
 
+    # ----- Derive BrainLM properties robustly
+    fmri_n_layers = int(getattr(frozen_brainlm.model.config, "num_hidden_layers", 4)) + 1  # +1 for embeddings output
+    fmri_hidden_size = int(getattr(frozen_brainlm.model.config, "hidden_size", 256))
+
+    # ----- Fix fMRI decoder target shape at build time
+    fmri_target_V = 424
+    fmri_target_T = int(round(cfg.window_sec / 2.0))  # TR=2s → frames per window
+
     # Translator (constant V=424)
     eeg_group = max(1, int(cfg.eeg_seconds_per_token))
     eeg_patch_num_grouped = max(1, int(cfg.window_sec) // eeg_group)
@@ -587,18 +681,20 @@ def train_loop(cfg: TrainConfig) -> None:
         eeg_patch_num=eeg_patch_num_grouped,
         eeg_n_layers=12,
         eeg_input_dim=cfg.target_fs,
-        fmri_n_layers=5,
-        fmri_hidden_size=256,
-        fmri_tokens_target=424 * int(round(cfg.window_sec / 2.0)),
+        fmri_n_layers=fmri_n_layers,
+        fmri_hidden_size=fmri_hidden_size,
+        fmri_tokens_target=fmri_target_V * fmri_target_T,  # informational
+        fmri_target_T=fmri_target_T,
+        fmri_target_V=fmri_target_V,
         d_model=256,
         n_heads=8,
         d_ff=1024,
         dropout=0.1,
-        voxel_count=424,
+        voxel_count=fmri_target_V,
         debug=cfg.debug,
     ).to(device)
 
-    # Optimizer
+    # Optimizer (decoder now registered -> will be trained)
     optim = torch.optim.AdamW(
         [p for p in translator.parameters() if p.requires_grad],
         lr=cfg.lr,
@@ -615,8 +711,7 @@ def train_loop(cfg: TrainConfig) -> None:
         if step < warmup_steps:
             return float(step + 1) / float(warmup_steps)
         progress = (step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-        # cosine from 1.0 -> 0.1
-        return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress))
+        return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress))  # cosine 1.0 -> 0.1
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda)
 
@@ -648,7 +743,6 @@ def train_loop(cfg: TrainConfig) -> None:
         print(f"Resuming from {resume_path}")
         last_epoch, global_step, best_val = load_checkpoint(resume_path, translator, optim, scaler, device)
         start_epoch = max(1, int(last_epoch) + 1)
-        # (Scheduler state is not restored here; optional to add if needed.)
 
     # ---- Fixed tri-mix settings (no flags) ----
     TRI_RATIOS = (0.34, 0.33, 0.33)        # (both, single, partial)
@@ -898,6 +992,134 @@ def train_loop(cfg: TrainConfig) -> None:
     if not cfg.wandb_off:
         wandb.finish()
 
+def dry_run_debug(
+    device: torch.device,
+    window_sec: int = 30,
+    target_fs: int = 200,
+    eeg_seconds_per_token: int = 40,
+    eeg_channels: int = 34,
+    fmri_voxels: int = 424,
+    fmri_hidden_size: int = 256,
+    fmri_n_layers: int = 5,
+    batch_size: int = 2,
+    d_model: int = 256,
+    n_heads: int = 8,
+    d_ff: int = 1024,
+    dropout: float = 0.1,
+):
+    """
+    Run a synthetic forward pass through the exact module stack and print shapes.
+    Mirrors training-time shapes & grouping.
+    """
+
+    def shp(x): return tuple(int(d) for d in x.shape)
+
+    # -------- Derived dims (match training defaults) --------
+    P = int(window_sec)                # EEG time tokens at 1s resolution
+    S = int(target_fs)                 # EEG samples per second
+    T = int(round(window_sec / 2.0))   # fMRI time points (TR = 2s)
+    V = int(fmri_voxels)               # voxels
+    g = max(1, min(eeg_seconds_per_token, P))
+    Pe = max(1, P // g)                # grouped EEG tokens
+    L_eeg = 12                         # matches FrozenCBraMod n_layer
+    L_fmri = int(fmri_n_layers)        # ~ num_hidden_layers + 1 used in training
+    Ttok_dummy = 512                   # Brain tokens fed to fMRI adapter
+
+    print("\n=== DRY-RUN DEBUG (synthetic tensors) ===")
+    print(f"Batch size B        : {batch_size}")
+    print(f"EEG -> C,P,S        : {eeg_channels}, {P}, {S}")
+    print(f"EEG grouping g, Pe  : {g}, {Pe}")
+    print(f"fMRI -> T,V         : {T}, {V}")
+    print(f"BrainLM dummy tokens: {Ttok_dummy} (len of token seq into fMRI adapter)")
+    print(f"Latent layers (EEG,fMRI): {L_eeg}, {L_fmri}")
+    print(f"d_model, n_heads, d_ff : {d_model}, {n_heads}, {d_ff}\n")
+
+    # -------- Synthetic latents (already GROUPED for EEG) --------
+    # EEG latents that would come *after* grouping: (L,B,Pe,C,D) with D=target_fs
+    eeg_latents = torch.randn(L_eeg, batch_size, Pe, eeg_channels, S, device=device)
+
+    # fMRI latents that would come out of BrainLM: (L,B,Ttok,H)
+    fmri_latents = torch.randn(L_fmri, batch_size, Ttok_dummy, fmri_hidden_size, device=device)
+
+    # -------- Build translator exactly like training --------
+    translator = TranslatorModel(
+        eeg_channels=eeg_channels,
+        eeg_patch_num=Pe,
+        eeg_n_layers=12,
+        eeg_input_dim=S,
+        fmri_n_layers=L_fmri,
+        fmri_hidden_size=fmri_hidden_size,
+        fmri_tokens_target=V * T,   # informational
+        fmri_target_T=T,
+        fmri_target_V=V,
+        d_model=d_model,
+        n_heads=n_heads,
+        d_ff=d_ff,
+        dropout=dropout,
+        voxel_count=V,
+        debug=True,
+    ).to(device)
+    translator.eval()
+
+    # -------- Print param counts --------
+    total_params = sum(p.numel() for p in translator.parameters())
+    trainable_params = sum(p.numel() for p in translator.parameters() if p.requires_grad)
+    print(f"Translator params (total/trainable): {total_params:,} / {trainable_params:,}\n")
+
+    # -------- Walk the stack with shapes --------
+    with torch.no_grad():
+        # Adapters
+        eeg_adapt = translator.adapter_eeg(eeg_latents)      # (B, Neeg, D)
+        fmri_adapt = translator.adapter_fmri(fmri_latents)   # (B, Nfmri, D)
+        print("[adapter_eeg]  ->", shp(eeg_adapt))
+        print("[adapter_fmri] ->", shp(fmri_adapt))
+
+        # Encoders
+        _, eeg_hi = translator.eeg_encoder(eeg_adapt, eeg_adapt)
+        _, fmr_hi = translator.fmri_encoder(fmri_adapt, fmri_adapt)
+        print("[eeg_encoder]  ->", shp(eeg_hi))
+        print("[fmri_encoder] ->", shp(fmr_hi))
+
+        # Compressor & cross-attention
+        eeg_c, fmr_c, _ = translator.compressor(eeg_hi, fmr_hi)
+        print("[compressor] eeg_c:", shp(eeg_c), " fmri_c:", shp(fmr_c))
+        fused = translator.cross_attn(eeg_c, fmr_c)
+        print("[cross_attn] fused:", shp(fused))
+
+        # EEG decoder
+        eeg_layers = translator.eeg_decoder(fused)           # (L,B,P,C,S)
+        print("[eeg_decoder] layers:", shp(eeg_layers))
+        eeg_signal = eeg_layers.mean(dim=0).permute(0, 2, 1, 3).contiguous()  # (B,C,P,S)
+        print("[eeg_signal] ->", shp(eeg_signal), "(expect (B,C,Pe,S) =",
+              (batch_size, eeg_channels, Pe, S), ")")
+
+        # fMRI decoder path (NEW design)
+        dec_tokens, eff_len, _ = translator.fmri_decoder(fused)  # (L,B,eff_len,H)
+        print("[fmri_decoder] tokens:", shp(dec_tokens), "eff_len:", int(eff_len))
+        dec_mean = dec_tokens.mean(dim=0)                        # (B,eff_len,H)
+        token_scalar = translator.fmri_token_head(dec_mean)      # (B,eff_len,1)
+        print("[token_head]  ->", shp(token_scalar))
+        token_scalar = token_scalar.transpose(1, 2)              # (B,1,eff_len)
+
+        target_tokens = T * V
+        if eff_len != target_tokens:
+            if eff_len < target_tokens:
+                token_scalar = nn.functional.interpolate(token_scalar, size=target_tokens,
+                                                        mode="linear", align_corners=False)
+                print(f"[resample] upsample  {int(eff_len)} -> {target_tokens}")
+            else:
+                token_scalar = nn.functional.adaptive_avg_pool1d(token_scalar, target_tokens)
+                print(f"[resample] downsample {int(eff_len)} -> {target_tokens}")
+
+        token_scalar = token_scalar.transpose(1, 2).contiguous().squeeze(-1)  # (B,target_tokens)
+        fmri_signal = token_scalar.view(batch_size, T, V)                     # (B,T,V)
+        fmri_signal = torch.tanh(fmri_signal)
+        fmri_signal = translator.fmri_out_scale * fmri_signal + translator.fmri_out_bias
+        print("[fmri_signal] ->", shp(fmri_signal), "(expect (B,T,V) =",
+              (batch_size, T, V), ")")
+
+    print("\n✅ DRY-RUN DONE\n")
+
 # -----------------------------
 # CLI
 # -----------------------------
@@ -935,6 +1157,8 @@ def main() -> None:
     parser.add_argument('--eeg_seconds_per_token', type=int, default=40)
     # resume
     parser.add_argument('--resume', type=str, default=None, help='Path to a full checkpoint to resume training')
+    parser.add_argument('--dry_run', action='store_true',
+                        help='Run a synthetic forward pass and print shapes; no data or training.')
 
     # Two-pass parse to allow config file to set defaults before final parse
     temp_parser = argparse.ArgumentParser(add_help=False)
@@ -992,6 +1216,21 @@ def main() -> None:
         eeg_seconds_per_token=args.eeg_seconds_per_token,
         resume=Path(args.resume) if args.resume else None,
     )
+    if args.dry_run:
+        dev = torch.device(args.device)
+        dry_run_debug(
+            device=dev,
+            window_sec=cfg.window_sec,
+            target_fs=cfg.target_fs,
+            eeg_seconds_per_token=cfg.eeg_seconds_per_token,
+            eeg_channels=34,              # matches translator build
+            fmri_voxels=424,              # fixed in translator
+            fmri_hidden_size=256,
+            fmri_n_layers=5,
+            batch_size=2,                 # tweak to taste
+            d_model=256, n_heads=8, d_ff=1024, dropout=0.1,
+        )
+        return
 
     train_loop(cfg)
 
