@@ -4,10 +4,10 @@ train:
   a424_label_nii: D:/Neuroinformatics_research_2025/BrainLM/A424_resampled_to_bold.nii.gz
   cbramod_weights: D:/Neuroinformatics_research_2025/MNI_templates/CBraMod/pretrained_weights/pretrained_weights.pth
   brainlm_model_dir: D:/Neuroinformatics_research_2025/MNI_templates/BrainLM/pretrained_models/2023-06-06-22_15_00-checkpoint-1400
-  output_dir: D:/Neuroinformatics_research_2025/Multi_modal_NTM/translator_runs
+  output_dir: D:/Neuroinformatics_research_2025/Multi_modal_NTM/translator_runs_aug14_updated_fmri_loss_w_6_eeg_loss_w_1
   device: cuda
   seed: 42
-  epochs: 20
+  epochs: 200
   batch_size: 16
   lr: 0.0001
   weight_decay: 0.0001
@@ -17,18 +17,18 @@ train:
   amp: false
   debug: false
   fmri_norm: zscore
-  wandb_project: Neural_translation_august10
-  wandb_run_name: oddball_Neural_translation_run3_aug10_data_split
+  wandb_project: Neural_translation_august14
+  wandb_run_name: oddball_Neural_translation_run1_aug14_data_split_updated_fmri_loss_w_6_eeg_loss_w_1
   wandb_off: false
   eeg_loss_w: 1.0
-  fmri_loss_w: 1.0
+  fmri_loss_w: 6.0
   eeg_seconds_per_token: 40
   resume: null
 
   # fixed subject splits (anchors so test reuses these)
-  train_subjects: &train_subjects [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-  val_subjects:   &val_subjects   [13]
-  test_subjects:  &test_subjects  [14, 15, 17]
+  train_subjects: &train_subjects [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+  val_subjects:   &val_subjects   [16]
+  test_subjects:  &test_subjects  [17]
 
 test:
   eeg_root: D:/Neuroinformatics_research_2025/Oddball/ds116_eeg

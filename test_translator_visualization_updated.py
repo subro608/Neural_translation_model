@@ -66,8 +66,8 @@ FMRI_ROOT = r"D:\Neuroinformatics_research_2025\Oddball\ds000116"
 A424_LABEL_NII = r"D:\Neuroinformatics_research_2025\BrainLM\A424_resampled_to_bold.nii.gz"
 CBRAMOD_WEIGHTS = r"D:\Neuroinformatics_research_2025\MNI_templates\CBraMod\pretrained_weights\pretrained_weights.pth"
 BRAINLM_MODEL_DIR = r"D:\Neuroinformatics_research_2025\MNI_templates\BrainLM\pretrained_models\2023-06-06-22_15_00-checkpoint-1400"
-CHECKPOINT = r"D:\Neuroinformatics_research_2025\Multi_modal_NTM\translator_runs\translator_best.pt"
-OUT_DIR = r"D:\Neuroinformatics_research_2025\Multi_modal_NTM\viz_out"
+CHECKPOINT = r"D:\Neuroinformatics_research_2025\Multi_modal_NTM\oddball_Neural_translation_run2_aug14_data_split_fmri6_eeg1_bs16\translator_best.pt"
+OUT_DIR = r"D:\Neuroinformatics_research_2025\Multi_modal_NTM\viz_out_aug14s"
 
 DEVICE = "cuda"
 SEED = 42
@@ -79,11 +79,11 @@ STRIDE_SEC = 10
 CHANNELS_LIMIT = 34
 BATCH_SIZE = 8
 NUM_WORKERS = 0
-EEG_SECONDS_PER_TOKEN = 40
+EEG_SECONDS_PER_TOKEN = 1
 TR = 2.0
 
-SUBSET = "test"     # train | val | test | all
-MODE = "fmri2eeg"   # both | eeg2fmri | fmri2eeg | partial_eeg | partial_fmri
+SUBSET = "train"     # train | val | test | all
+MODE = "eeg2fmri"   # both | eeg2fmri | fmri2eeg | partial_eeg | partial_fmri
 PARTIAL_VISIBLE_FRAC = 0.5
 
 EEG_CHANNELS_TO_PLOT = "0,1,2,3"
@@ -253,8 +253,8 @@ class TranslatorModel(nn.Module):
         eeg_signal = self.eeg_decoder(fused)                 # (B,C,Pe,S)
         fmri_flat  = self.fmri_decoder(fused)                # (B, T*V)
         fmri_signal = fmri_flat.view(-1, int(fmri_target_T), int(fmri_target_V))
-        fmri_signal = torch.tanh(fmri_signal)
-        fmri_signal = self.fmri_out_scale * fmri_signal + self.fmri_out_bias
+        # fmri_signal = torch.tanh(fmri_signal)
+        # fmri_signal = self.fmri_out_scale * fmri_signal + self.fmri_out_bias
         return eeg_signal, fmri_signal
 
 # -----------------------------

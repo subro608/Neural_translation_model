@@ -64,11 +64,11 @@ FMRI_ROOT = r"D:\Neuroinformatics_research_2025\Oddball\ds000116"
 A424_LABEL_NII = r"D:\Neuroinformatics_research_2025\BrainLM\A424_resampled_to_bold.nii.gz"
 CBRAMOD_WEIGHTS = r"D:\Neuroinformatics_research_2025\MNI_templates\CBraMod\pretrained_weights\pretrained_weights.pth"
 BRAINLM_MODEL_DIR = r"D:\Neuroinformatics_research_2025\MNI_templates\BrainLM\pretrained_models\2023-06-06-22_15_00-checkpoint-1400"
-CHECKPOINT = r"D:\Neuroinformatics_research_2025\Multi_modal_NTM\oddball_Neural_translation_run3_aug13_data_split_eeg1_fmri6_bs16\translator_best.pt"
-OUT_DIR = r"D:\Neuroinformatics_research_2025\Multi_modal_NTM\viz_out_test_aug13"
+CHECKPOINT = r"D:\Neuroinformatics_research_2025\Multi_modal_NTM\oddball_Neural_translation_run1_aug13_data_split_eeg1_fmri2_bs16\translator_best.pt"
+OUT_DIR = r"D:\Neuroinformatics_research_2025\Multi_modal_NTM\viz_out_test_aug13_eeg2fmri_new"
 
 # Optional: if you want to auto-read the exact splits saved by training:
-TRAIN_OUTPUT_DIR = r"D:\Neuroinformatics_research_2025\Multi_modal_NTM\oddball_Neural_translation_run3_aug13_data_split_eeg1_fmri6_bs16"  # where training saved subject_splits.json
+TRAIN_OUTPUT_DIR = r"D:\Neuroinformatics_research_2025\Multi_modal_NTM\oddball_Neural_translation_run1_aug13_data_split_eeg1_fmri2_bs16"  # where training saved subject_splits.json
 
 DEVICE = "cuda"
 SEED = 42
@@ -80,7 +80,7 @@ STRIDE_SEC = 10
 CHANNELS_LIMIT = 34
 BATCH_SIZE = 8
 NUM_WORKERS = 0
-EEG_SECONDS_PER_TOKEN = 40
+EEG_SECONDS_PER_TOKEN = 1
 TR = 2.0
 
 SUBSET = "train"    # train | val | test | all
