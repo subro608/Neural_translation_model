@@ -1,22 +1,39 @@
 #!/usr/bin/env python3
 """
-Visualize original vs reconstructed EEG and fMRI (A424) using the UPDATED training setup:
+Top-k correlation visualization for EEG & fMRI (A424) reconstructions + leakage checks.
 
-- Uses Lite decoders (EEGDecodingAdapterLite / fMRIDecodingAdapterLite)
-- Small translator (d_model=128, n_heads=4, d_ff=512, 1 encoder stack)
-- Sinusoidal positional encodings on EEG & fMRI token sequences
-- STRICT subject split: loads subject_splits.json from the checkpoint's folder
-- fMRI tokens target = T * V (NOT BrainLM Ttok), same as training
+What this script does
+---------------------
+- Loads one batch from PairedAlignedDataset (STRICT subject split from checkpoint folder).
+- Runs Frozen CBraMod + Frozen BrainLM + your small TranslatorModel (Lite decoders).
+- Computes Pearson r:
+    * EEG: per-channel over time (flatten (Pe*S,))
+    * fMRI: per-ROI over time (T,)
+- Selects top-10 channels/ROIs by r and produces TWO figures:
+    1) top10_eeg_corr.png  (10 subplots: GT vs recon per EEG channel)
+    2) top10_fmri_corr.png (10 subplots: GT vs recon per ROI)
+- Also saves TWO bar charts across ALL series:
+    3) corr_bars_eeg.png   (Pearson r for all EEG channels)
+    4) corr_bars_fmri.png  (Pearson r for all fMRI ROIs)
+- Auto-downsamples time series for plotting readability (configurable).
+- Saves CSVs with r-values for all channels/ROIs.
+- Performs leakage checks: prints allowed subjects for the chosen subset, verifies
+  dataset subjects are within that set, and shows the subjects in the first batch.
+
+Notes
+-----
+- fMRI tokens target = T * V (as in training).
+- Uses Lite decoders, small translator, sinusoidal PEs.
+- If a vector has zero variance, r is set to 0.0 (to avoid NaNs).
 """
 
 from __future__ import annotations
 
-import os
 import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Iterable
 
 import numpy as np
 import torch
@@ -43,8 +60,8 @@ from module import (  # type: ignore
     fMRIInputAdapterConv1d,
     HierarchicalEncoder,
     CrossAttentionLayer,
-    EEGDecodingAdapterLite,      # UPDATED: Lite
-    fMRIDecodingAdapterLite,     # UPDATED: Lite
+    EEGDecodingAdapterLite,
+    fMRIDecodingAdapterLite,
 )
 
 from models.cbramod import CBraMod  # type: ignore
@@ -60,6 +77,7 @@ from data_oddball import (  # type: ignore
     fixed_subject_keys,
 )
 
+# ---------- Hardcoded paths (adjust if needed) ----------
 # ---------- Hardcoded configuration (adjust as needed) ----------
 EEG_ROOT = r"D:\Neuroinformatics_research_2025\Oddball\ds116_eeg"
 FMRI_ROOT = r"D:\Neuroinformatics_research_2025\Oddball\ds000116"
@@ -67,8 +85,9 @@ A424_LABEL_NII = r"D:\Neuroinformatics_research_2025\BrainLM\A424_resampled_to_b
 CBRAMOD_WEIGHTS = r"D:\Neuroinformatics_research_2025\MNI_templates\CBraMod\pretrained_weights\pretrained_weights.pth"
 BRAINLM_MODEL_DIR = r"D:\Neuroinformatics_research_2025\MNI_templates\BrainLM\pretrained_models\2023-06-06-22_15_00-checkpoint-1400"
 CHECKPOINT = r"D:\Neuroinformatics_research_2025\Multi_modal_NTM\translator_run_2_aug15_updated_fmri_6_eeg_1_patchfmri_translator_fixed\translator_best.pt"
-OUT_DIR = r"D:\Neuroinformatics_research_2025\Multi_modal_NTM\viz_output_pcorr_eeg2fmri_test_fixed_patchfmri"
+OUT_DIR = r"D:\Neuroinformatics_research_2025\Multi_modal_NTM\viz_output_17augmri_test_fixed_patchfmri"
 
+# ---------- General config ----------
 DEVICE = "cuda"
 SEED = 42
 FMRI_NORM = "zscore"
@@ -82,12 +101,14 @@ NUM_WORKERS = 0
 EEG_SECONDS_PER_TOKEN = 1
 TR = 2.0
 
-SUBSET = "test" # train | val | test | all
-MODE = "eeg2fmri"   # both | eeg2fmri | fmri2eeg | partial_eeg | partial_fmri
-PARTIAL_VISIBLE_FRAC = 0.5
+SUBSET = "test" # "train" | "val" | "test" | "all"
+MODE = "eeg2fmri"     # keep both observed so GT is intact
 
-EEG_CHANNELS_TO_PLOT = "0,1,2,3"
-FMRI_ROIS_TO_PLOT = [0, 1, 2, 3, 4]
+# Plotting downsample caps (prevents 8000+ points spam)
+PLOT_MAX_POINTS_EEG = 200
+PLOT_MAX_POINTS_FMRI = 1000
+
+TOP_K = 10
 
 # -----------------------------
 # Positional Encoding (sin/cos)
@@ -189,9 +210,9 @@ class TranslatorModel(nn.Module):
         fmri_tokens_target: int,
         fmri_target_T: int,
         fmri_target_V: int,
-        d_model: int = 128,         # small
-        n_heads: int = 4,           # small
-        d_ff: int = 512,            # small
+        d_model: int = 128,
+        n_heads: int = 4,
+        d_ff: int = 512,
         dropout: float = 0.1,
         voxel_count: int = 424,
         debug: bool = False,
@@ -202,7 +223,6 @@ class TranslatorModel(nn.Module):
         self._fmri_n_layers = int(fmri_n_layers)
         self._fmri_hidden_size = int(fmri_hidden_size)
 
-        # Adapters
         self.adapter_eeg = ConvEEGInputAdapter(
             seq_len=eeg_patch_num, n_layers=eeg_n_layers,
             channels=eeg_channels, input_dim=eeg_input_dim, output_dim=d_model,
@@ -212,17 +232,14 @@ class TranslatorModel(nn.Module):
             input_dim=fmri_hidden_size, output_dim=d_model, target_seq_len=512,
         )
 
-        # Positional encodings
         self.pos_eeg  = PositionalEncoding(d_model)
         self.pos_fmri = PositionalEncoding(d_model)
 
-        # Encoders & fusion (shallower: 1 stack)
         self.eeg_encoder  = HierarchicalEncoder(d_model, n_heads, d_ff, dropout, n_layers_per_stack=1)
         self.fmri_encoder = HierarchicalEncoder(d_model, n_heads, d_ff, dropout, n_layers_per_stack=1)
         self.cross_attn   = CrossAttentionLayer(d_model, n_heads, dropout)
         self.compressor   = BidirectionalAdaptiveCompressor()
 
-        # Lite decoders
         self.eeg_decoder = EEGDecodingAdapterLite(
             channels=eeg_channels, patch_num=eeg_patch_num,
             patch_size=eeg_input_dim, d_model=d_model, rank=32,
@@ -239,17 +256,14 @@ class TranslatorModel(nn.Module):
         if int(fmri_target_V) != self._voxel_count:
             raise ValueError(f"TranslatorModel expects V={self._voxel_count}, got V={fmri_target_V}")
 
-        # Adapt + add PE
         eeg_adapt  = self.pos_eeg( self.adapter_eeg(eeg_latents) )
         fmri_adapt = self.pos_fmri(self.adapter_fmri(fmri_latents))
 
-        # Encode, compress, fuse
         _, eeg_hi = self.eeg_encoder(eeg_adapt, eeg_adapt)
         _, fmr_hi = self.fmri_encoder(fmri_adapt, fmri_adapt)
         eeg_c, fmr_c, _ = self.compressor(eeg_hi, fmr_hi)
         fused = self.cross_attn(eeg_c, fmr_c)
 
-        # Decode (Lite)
         eeg_signal = self.eeg_decoder(fused)                 # (B,C,Pe,S)
         fmri_flat  = self.fmri_decoder(fused)                # (B, T*V)
         fmri_signal = fmri_flat.view(-1, int(fmri_target_T), int(fmri_target_V))
@@ -258,7 +272,7 @@ class TranslatorModel(nn.Module):
         return eeg_signal, fmri_signal
 
 # -----------------------------
-# Helpers: EEG grouping & masks
+# Helpers: EEG grouping
 # -----------------------------
 def group_eeg_latents_seconds(eeg_latents: torch.Tensor, seconds_per_token: int) -> torch.Tensor:
     L, B, P, C, D = eeg_latents.shape
@@ -272,120 +286,8 @@ def group_eeg_signal_seconds(x_eeg_sig: torch.Tensor, seconds_per_token: int) ->
     P_grp = max(1, P // g)
     return x_eeg_sig[:, :, :P_grp*g, :].reshape(B, C, P_grp, g, S).mean(dim=3)
 
-def _rand_block_mask_time(B: int, L: int, vis_frac: float, device) -> torch.Tensor:
-    """Return (B,L) True=MASKED with a single visible contiguous block of length vis_frac*L."""
-    M = torch.ones(B, L, dtype=torch.bool, device=device)
-    vis = max(1, int(round(vis_frac * L))); vis = min(vis, L)
-    if L > vis:
-        starts = torch.randint(0, L - vis + 1, (B,), device=device)
-    else:
-        starts = torch.zeros(B, dtype=torch.long, device=device)
-    for i in range(B):
-        M[i, starts[i]:starts[i]+vis] = False
-    return M
-
 # -----------------------------
-# Viz utils
-# -----------------------------
-def _contiguous_true_segments(bool_arr: np.ndarray) -> List[Tuple[int,int]]:
-    idx = np.flatnonzero(bool_arr)
-    if idx.size == 0:
-        return []
-    splits = np.where(np.diff(idx) != 1)[0] + 1
-    segs = np.split(idx, splits)
-    return [(int(seg[0]), int(seg[-1])) for seg in segs]
-
-def plot_eeg_overlays(x_true: torch.Tensor, x_recon: torch.Tensor, out_dir: Path, channels: List[int] = [0,1,2,3], max_seconds: Optional[int]=None):
-    out_dir.mkdir(parents=True, exist_ok=True)
-    b = 0
-    C = x_true.shape[1]
-    chans = [c for c in channels if c < C]
-    true_flat = x_true[b].permute(0,1,2).reshape(C, -1).cpu().numpy()  # (C, Pe*S)
-    recon_flat = x_recon[b].permute(0,1,2).reshape(C, -1).cpu().numpy()
-    for c in chans:
-        T = true_flat.shape[1]
-        if max_seconds is not None:
-            T = min(T, max_seconds)
-        plt.figure(figsize=(10, 3))
-        plt.plot(true_flat[c, :T], label="EEG true")
-        plt.plot(recon_flat[c, :T], label="EEG recon", alpha=0.8)
-        plt.title(f"EEG Channel {c} — true vs recon")
-        plt.xlabel("Timepoints")
-        plt.ylabel("Amplitude (z-sc)")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(out_dir / f"eeg_overlay_ch{c:02d}.png", dpi=150)
-        plt.close()
-
-def plot_fmri_overlays(ts_true: torch.Tensor, ts_recon: torch.Tensor, out_dir: Path, rois: List[int] = [0,1,2,3,4],
-                       mask_bool_T: Optional[np.ndarray] = None, masked_only: bool = False, tr: float = 2.0):
-    out_dir.mkdir(parents=True, exist_ok=True)
-    b0_true = ts_true[0].detach().cpu().numpy()  # (T,V)
-    b0_reco = ts_recon[0].detach().cpu().numpy()
-    T, V = b0_true.shape
-    sel = [r for r in rois if 0 <= r < V]
-    t = np.arange(T) * tr
-    for r in sel:
-        plt.figure(figsize=(10,3))
-        plt.plot(t, b0_true[:, r], label='fMRI true')
-        if masked_only and mask_bool_T is not None:
-            recon_curve = b0_reco[:, r].copy()
-            recon_curve[~mask_bool_T] = np.nan
-            plt.plot(t, recon_curve, label='fMRI recon (masked only)', alpha=0.9)
-            idx = np.flatnonzero(mask_bool_T)
-            if idx.size:
-                splits = np.where(np.diff(idx) != 1)[0] + 1
-                for seg in np.split(idx, splits):
-                    plt.axvspan(t[seg[0]], t[seg[-1]] + tr, alpha=0.15)
-        else:
-            plt.plot(t, b0_reco[:, r], label='fMRI recon', alpha=0.8)
-        plt.title(f'fMRI ROI {r} — true vs recon')
-        plt.xlabel('Time (s)'); plt.ylabel('Z-scored signal')
-        plt.legend(); plt.tight_layout()
-        plt.savefig(out_dir / f'fmri_overlay_roi{r:03d}.png', dpi=150)
-        plt.close()
-
-def plot_fmri_heatmaps(ts_true: torch.Tensor, ts_recon: torch.Tensor, out_dir: Path):
-    out_dir.mkdir(parents=True, exist_ok=True)
-    b0_true = ts_true[0].detach().cpu().numpy()  # (T,V)
-    b0_reco = ts_recon[0].detach().cpu().numpy()
-    plt.figure(figsize=(12,4))
-    plt.imshow(b0_true.T, aspect='auto', origin='lower')
-    plt.colorbar(); plt.title('fMRI target (T x V)'); plt.xlabel('Time'); plt.ylabel('ROI')
-    plt.tight_layout(); plt.savefig(out_dir / 'fmri_target_heatmap.png', dpi=150); plt.close()
-    plt.figure(figsize=(12,4))
-    plt.imshow(b0_reco.T, aspect='auto', origin='lower')
-    plt.colorbar(); plt.title('fMRI recon (T x V)'); plt.xlabel('Time'); plt.ylabel('ROI')
-    plt.tight_layout(); plt.savefig(out_dir / 'fmri_recon_heatmap.png', dpi=150); plt.close()
-
-def plot_fmri_masked_segment_zooms(ts_true: torch.Tensor, ts_recon: torch.Tensor, out_dir: Path,
-                                   rois: List[int], mask_bool_T: np.ndarray, tr: float = 2.0):
-    out_dir.mkdir(parents=True, exist_ok=True)
-    b0_true = ts_true[0].detach().cpu().numpy()  # (T,V)
-    b0_reco = ts_recon[0].detach().cpu().numpy()
-    T, V = b0_true.shape
-    t = np.arange(T) * tr
-    idx = np.flatnonzero(mask_bool_T)
-    if idx.size == 0:
-        return
-    splits = np.where(np.diff(idx) != 1)[0] + 1
-    segments = np.split(idx, splits)
-    sel = [r for r in rois if 0 <= r < V]
-    for r in sel:
-        for si, seg in enumerate(segments):
-            s, e = int(seg[0]), int(seg[-1])
-            sl = slice(s, e + 1)
-            plt.figure(figsize=(9,3))
-            plt.plot(t[sl], b0_true[sl, r], label='fMRI true')
-            plt.plot(t[sl], b0_reco[sl, r], label='fMRI recon (masked seg)', alpha=0.9)
-            plt.title(f'ROI {r} — masked segment {si+1} [{s}:{e}]')
-            plt.xlabel('Time (s)'); plt.ylabel('Z-scored signal')
-            plt.legend(); plt.tight_layout()
-            plt.savefig(out_dir / f'fmri_masked_zoom_roi{r:03d}_seg{si+1:02d}.png', dpi=150)
-            plt.close()
-
-# -----------------------------
-# Config and main
+# Build frozen models & translator
 # -----------------------------
 @dataclass
 class VizConfig:
@@ -399,16 +301,15 @@ class VizConfig:
     device: str = "cuda"
     seed: int = 42
     fmri_norm: str = "zscore"
-    window_sec: int = 30
+    window_sec: int = 40
     original_fs: int = 1000
     target_fs: int = 200
-    stride_sec: Optional[int] = None
+    stride_sec: Optional[int] = 10
     channels_limit: int = 34
-    batch_size: int = 4
+    batch_size: int = 8
     num_workers: int = 0
-    eeg_seconds_per_token: int = 40
+    eeg_seconds_per_token: int = 1
     tr: float = 2.0
-    eeg_channels_to_plot: str = "0,1,2,3"
 
 def build_frozen_models(cfg: VizConfig, device: torch.device):
     seq_len_eeg = cfg.window_sec
@@ -438,15 +339,14 @@ def build_translator(
         eeg_input_dim=cfg.target_fs,
         fmri_n_layers=fmri_n_layers,
         fmri_hidden_size=fmri_hidden_size,
-        fmri_tokens_target=fmri_tokens_target,  # MUST be T * V (as in training)
+        fmri_tokens_target=fmri_tokens_target,
         fmri_target_T=fmri_target_T,
         fmri_target_V=fmri_target_V,
-        d_model=128, n_heads=4, d_ff=512, dropout=0.1,  # match training
+        d_model=128, n_heads=4, d_ff=512, dropout=0.1,
         voxel_count=fmri_target_V,
         debug=False,
     ).to(device)
 
-    # Load translator weights (filter unexpected/mismatched shapes)
     try:
         ckpt = torch.load(str(cfg.checkpoint), map_location=device, weights_only=False)
     except TypeError:
@@ -459,23 +359,66 @@ def build_translator(
     translator.eval()
     return translator
 
-def _load_fixed_subjects_from_json(run_dir: Path) -> Tuple[List[int], List[int], List[int]]:
-    p = Path(run_dir) / "subject_splits.json"
-    if not p.exists():
-        raise FileNotFoundError(
-            f"subject_splits.json not found at {p}. "
-            "Ensure you point CHECKPOINT to the training run folder that contains this file."
-        )
-    with open(p, "r") as f:
-        j = json.load(f)
-    tr = [int(s) for s in j.get("train_subjects", [])]
-    va = [int(s) for s in j.get("val_subjects", [])]
-    te = [int(s) for s in j.get("test_subjects", [])]
-    if not tr or not va or not te:
-        raise RuntimeError(f"Invalid subject_splits.json at {p} (empty list(s)).")
-    return tr, va, te
+# -----------------------------
+# Correlation utilities
+# -----------------------------
+def pearsonr_safe(a: np.ndarray, b: np.ndarray) -> float:
+    """NaN-safe Pearson r. Returns 0.0 if std==0 or insufficient data."""
+    a = np.asarray(a).ravel()
+    b = np.asarray(b).ravel()
+    m = np.isfinite(a) & np.isfinite(b)
+    if m.sum() < 3:
+        return 0.0
+    a = a[m]; b = b[m]
+    sa = np.std(a); sb = np.std(b)
+    if sa == 0.0 or sb == 0.0:
+        return 0.0
+    r = np.corrcoef(a, b)[0, 1]
+    if np.isfinite(r):
+        return float(r)
+    return 0.0
 
-def run_once(cfg: VizConfig, subset: str = "test", mode: str = "both", partial_visible_frac: float = 0.5):
+def downsample(x: np.ndarray, y: np.ndarray, max_points: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Keep at most max_points by stride sampling (1 keeps all)."""
+    n = x.shape[0]
+    if n <= max_points:
+        return x, y
+    step = int(math.ceil(n / max_points))
+    return x[::step], y[::step]
+
+# -----------------------------
+# Subject ID helpers & leakage checks
+# -----------------------------
+def norm_subj_id(s) -> str:
+    """Normalize subject identifiers like 'sub-03' -> '3', '03' -> '3', '3' -> '3'."""
+    ss = str(s)
+    if ss.startswith("sub-"):
+        ss = ss[4:]
+    ss = ss.lstrip("0")
+    return ss if ss else "0"
+
+def subjects_from_ds_index(ds_index: Iterable, limit: Optional[int] = None) -> List[str]:
+    """Best-effort extraction of subject IDs from PairedAlignedDataset.index entries."""
+    out: List[str] = []
+    if not ds_index:
+        return out
+    it = ds_index if limit is None else ds_index[:limit]
+    for entry in it:
+        try:
+            cand = entry[0]  # often (subject, run, ...) or subject
+            if isinstance(cand, (tuple, list)) and len(cand) >= 1:
+                subj = cand[0]
+            else:
+                subj = cand
+            out.append(norm_subj_id(subj))
+        except Exception:
+            continue
+    return out
+
+# -----------------------------
+# Main eval & plotting
+# -----------------------------
+def run_once(cfg: VizConfig, subset: str = "test", mode: str = "both"):
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
     torch.cuda.manual_seed_all(cfg.seed)
@@ -489,32 +432,52 @@ def run_once(cfg: VizConfig, subset: str = "test", mode: str = "both", partial_v
     device = torch.device(cfg.device)
     out_dir = cfg.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "plots").mkdir(parents=True, exist_ok=True)
+    (out_dir / "tables").mkdir(parents=True, exist_ok=True)
 
-    # ----- Subject-run split exactly like training (STRICT; no shuffle) -----
+    # Strict split from checkpoint folder
     inter_keys = collect_common_sr_keys(cfg.eeg_root, cfg.fmri_root)
     if len(inter_keys) == 0:
         raise RuntimeError("No aligned (subject, run) pairs found; check paths.")
 
-    # Load splits from the checkpoint's parent directory (training run folder)
     run_dir = Path(cfg.checkpoint).parent
-    train_subj, val_subj, test_subj = _load_fixed_subjects_from_json(run_dir)
-    train_keys, val_keys, test_keys = fixed_subject_keys(
-        cfg.eeg_root, cfg.fmri_root, train_subj, val_subj, test_subj
-    )
+    p_split = run_dir / "subject_splits.json"
+    if not p_split.exists():
+        raise FileNotFoundError(f"subject_splits.json not found at {p_split}")
+    with open(p_split, "r") as f:
+        j = json.load(f)
+    train_subj = [norm_subj_id(s) for s in j["train_subjects"]]
+    val_subj   = [norm_subj_id(s) for s in j["val_subjects"]]
+    test_subj  = [norm_subj_id(s) for s in j["test_subjects"]]
+    train_keys, val_keys, test_keys = fixed_subject_keys(cfg.eeg_root, cfg.fmri_root,
+                                                         [int(s) for s in train_subj],
+                                                         [int(s) for s in val_subj],
+                                                         [int(s) for s in test_subj])
 
     include_sr = None
-    if subset == 'train':
+    allowed_subjects = None
+    if subset == "train":
         include_sr = train_keys
-    elif subset == 'val':
+        allowed_subjects = set(train_subj)
+    elif subset == "val":
         include_sr = val_keys
-    elif subset == 'test':
+        allowed_subjects = set(val_subj)
+    elif subset == "test":
         include_sr = test_keys
-    elif subset == 'all':
+        allowed_subjects = set(test_subj)
+    elif subset == "all":
         include_sr = None
+        allowed_subjects = None
     else:
         raise ValueError(f"Unknown subset: {subset}")
 
-    # Dataset (+ chosen subset)
+    # Nice print of subjects in the subset
+    if include_sr is not None:
+        include_subjects_list = sorted({int(norm_subj_id(s)) for (s, _, _) in include_sr})
+        print(f"[INFO] Running subset='{subset}' with subjects: {include_subjects_list}")
+    else:
+        print(f"[INFO] Running subset='{subset}' with all intersecting subjects")
+
     ds = PairedAlignedDataset(
         eeg_root=cfg.eeg_root,
         fmri_root=cfg.fmri_root,
@@ -530,57 +493,65 @@ def run_once(cfg: VizConfig, subset: str = "test", mode: str = "both", partial_v
         include_sr_keys=include_sr,
     )
     if len(ds) == 0:
-        raise RuntimeError("No samples in dataset; check paths/splits.")
+        raise RuntimeError("Dataset is empty for chosen subset.")
 
-    dl = DataLoader(
-        ds, batch_size=cfg.batch_size, shuffle=False,
-        num_workers=cfg.num_workers, collate_fn=collate_paired, pin_memory=(device.type=='cuda')
-    )
+    # --- Data leakage check: ensure only the requested subset's subjects are present ---
+    ds_index = getattr(ds, 'index', [])
+    ds_subjects = set(subjects_from_ds_index(ds_index))
+    if allowed_subjects is not None and ds_subjects:
+        extras = sorted({int(s) for s in ds_subjects if s not in allowed_subjects})
+        if extras:
+            raise AssertionError(
+                f"[LEAKAGE] Subset='{subset}' contains unexpected subjects: {extras}. "
+                f"Allowed: {sorted(int(s) for s in allowed_subjects)} ; Present: {sorted(int(s) for s in ds_subjects)}"
+            )
+        print(f"[CHECK] Leakage check passed for subset='{subset}'. "
+              f"Subjects present: {sorted(int(s) for s in ds_subjects)}")
+
+    dl = DataLoader(ds, batch_size=cfg.batch_size, shuffle=False,
+                    num_workers=cfg.num_workers, collate_fn=collate_paired,
+                    pin_memory=(device.type == 'cuda'))
 
     frozen_eeg, frozen_fmri = build_frozen_models(cfg, device)
 
-    # Get one batch
+    # Take one batch (first batch => first N dataset items because shuffle=False)
     batch = next(iter(dl))
+
+    # Try to list subjects in this first batch (best-effort via dataset index)
+    first_batch_subjects = subjects_from_ds_index(ds_index, limit=min(cfg.batch_size, len(ds_index)))
+    if first_batch_subjects:
+        print(f"[BATCH] First batch subjects (best-effort): {first_batch_subjects}")
+
     x_eeg = batch['eeg_window'].to(device)   # (B,C,P,S)
     fmri_t = batch['fmri_window'].to(device) # (B,T,V)
     B, C, P, S = x_eeg.shape
     _, T, V = fmri_t.shape
 
-    # Observed inputs based on viz mode
+    # Observed (keep GT intact for correlation)
     x_eeg_obs = x_eeg.clone()
     fmri_obs  = fmri_t.clone()
-    M_eeg_time = None
-    M_t = None
     if mode == "both":
         pass
     elif mode == "eeg2fmri":
         fmri_obs[:] = 0.0
     elif mode == "fmri2eeg":
         x_eeg_obs[:] = 0.0
-    elif mode == "partial_eeg":
-        M_eeg_time = _rand_block_mask_time(B, P, partial_visible_frac, device)
-        for b in range(B):
-            x_eeg_obs[b, :, M_eeg_time[b], :] = 0.0
-    elif mode == "partial_fmri":
-        M_t = _rand_block_mask_time(B, T, partial_visible_frac, device)
-        M_fmri = M_t.unsqueeze(-1).expand(-1, T, V)
-        fmri_obs[M_fmri] = 0.0
     else:
-        raise ValueError(f"Unknown mode: {mode}")
+        raise ValueError("This script supports modes: 'both' | 'eeg2fmri' | 'fmri2eeg'")
 
-    # ---- BrainLM patching & coords ----
+    # BrainLM inputs
     patch = int(getattr(frozen_fmri.model.config, "timepoint_patching_size", 20))
     fmri_padded = pad_timepoints_for_brainlm_torch(fmri_obs, patch_size=patch)   # (B,Tp,V)
     signal_vectors = fmri_padded.permute(0,2,1).contiguous()                     # (B,V,Tp)
 
-    # Sync voxel count to current V (defensive)
+    # Sync voxel count with current V
     frozen_fmri.model.config.num_brain_voxels = int(V)
     if hasattr(frozen_fmri.model, "vit") and hasattr(frozen_fmri.model.vit, "embeddings"):
         frozen_fmri.model.vit.embeddings.num_brain_voxels = int(V)
     if hasattr(frozen_fmri.model, "decoder"):
         frozen_fmri.model.decoder.num_brain_voxels = int(V)
 
-    # xyz coords (normalized A424 if V==424 else zeros)
+    # XYZ coords
     try:
         cand = [
             THIS_DIR / 'BrainLM' / 'resources' / 'atlases' / 'A424_Coordinates.dat',
@@ -602,28 +573,26 @@ def run_once(cfg: VizConfig, subset: str = "test", mode: str = "both", partial_v
     except Exception:
         xyz = torch.zeros(B, V, 3, device=device)
 
-    # ---- Frozen latents ----
+    # Frozen latents
     with torch.no_grad():
         eeg_latents = frozen_eeg.extract_latents(x_eeg_obs)     # (L,B,P,C,D)
         fmri_latents = frozen_fmri.extract_latents(signal_vectors, xyz)  # (L,B,Ttok,H)
 
-    # Shapes to drive translator (derived from BrainLM config)
     fmri_n_layers = int(getattr(frozen_fmri.model.config, "num_hidden_layers", 4)) + 1
     fmri_hidden_size = int(getattr(frozen_fmri.model.config, "hidden_size", 256))
 
-    # ---- Translator (built AFTER we know T and V)
     translator = build_translator(
         cfg, device,
-        fmri_tokens_target=int(fmri_t.shape[1]) * int(fmri_t.shape[2]),  # T * V (same as training)
+        fmri_tokens_target=int(fmri_t.shape[1]) * int(fmri_t.shape[2]),  # T * V
         fmri_target_T=int(fmri_t.shape[1]),
         fmri_target_V=int(fmri_t.shape[2]),
         fmri_n_layers=fmri_n_layers,
         fmri_hidden_size=fmri_hidden_size
     )
 
-    # Group EEG to match decoder/grouping
+    # Group EEG for decoder
     eeg_latents_t = group_eeg_latents_seconds(eeg_latents, cfg.eeg_seconds_per_token)
-    x_eeg_grp     = group_eeg_signal_seconds(x_eeg, cfg.eeg_seconds_per_token)
+    x_eeg_grp     = group_eeg_signal_seconds(x_eeg, cfg.eeg_seconds_per_token)  # (B,C,Pe,S)
 
     with torch.no_grad():
         recon_eeg, recon_fmri = translator(
@@ -632,43 +601,138 @@ def run_once(cfg: VizConfig, subset: str = "test", mode: str = "both", partial_v
             fmri_target_V=int(fmri_t.shape[2]),
         )
 
-    # ---- DEBUG: fMRI stats
-    try:
-        def _summ(name: str, arr: np.ndarray) -> str:
-            return f"{name}: shape={arr.shape} min={np.nanmin(arr):.4f} max={np.nanmax(arr):.4f} mean={np.nanmean(arr):.4f} std={np.nanstd(arr):.4f}"
-        fmri_true_np = fmri_t[0].detach().cpu().numpy()
-        fmri_in_np   = fmri_obs[0].detach().cpu().numpy()
-        fmri_rec_np  = recon_fmri[0].detach().cpu().numpy()
-        print("[DEBUG] fMRI normalization check (first batch sample):")
-        print("  " + _summ("target_true", fmri_true_np))
-        print("  " + _summ("input_obs  ", fmri_in_np))
-        print("  " + _summ("reconstructed", fmri_rec_np))
-    except Exception as e:
-        print(f"[WARN] fMRI debug stats failed: {e}")
+    # Compute correlations on first item of batch (b=0)
+    b = 0
 
-    # ---- Save EEG overlays
-    chans = [int(c.strip()) for c in cfg.eeg_channels_to_plot.split(",") if c.strip().isdigit()]
-    plot_eeg_overlays(x_eeg_grp, recon_eeg, out_dir / "eeg_plots", channels=chans, max_seconds=None)
-    print(f"[OK] EEG overlays saved to {out_dir/'eeg_plots'}")
+    # EEG correlations (per channel)
+    x_true_eeg = x_eeg_grp[b].detach().cpu().numpy()       # (C, Pe, S)
+    x_rec_eeg  = recon_eeg[b].detach().cpu().numpy()       # (C, Pe, S)
+    C_, Pe, S_ = x_true_eeg.shape
+    eeg_rs = []
+    for c in range(C_):
+        gt = x_true_eeg[c].reshape(Pe * S_)
+        rc = x_rec_eeg[c].reshape(Pe * S_)
+        r = pearsonr_safe(gt, rc)
+        eeg_rs.append((c, r))
+    eeg_rs.sort(key=lambda t: t[1], reverse=True)
+    top_eeg = eeg_rs[:min(TOP_K, len(eeg_rs))]
 
-    # ---- fMRI plots
-    plot_fmri_overlays(fmri_t, recon_fmri, out_dir / 'fmri_plots', rois=FMRI_ROIS_TO_PLOT, tr=cfg.tr)
-    plot_fmri_heatmaps(fmri_t, recon_fmri, out_dir / 'fmri_plots')
-    print(f"[OK] Saved generic fMRI plots to {out_dir/'fmri_plots'}")
+    # fMRI correlations (per ROI)
+    x_true_fmri = fmri_t[b].detach().cpu().numpy()         # (T, V)
+    x_rec_fmri  = recon_fmri[b].detach().cpu().numpy()     # (T, V)
+    T_, V_ = x_true_fmri.shape
+    fmri_rs = []
+    for v in range(V_):
+        gt = x_true_fmri[:, v]
+        rc = x_rec_fmri[:, v]
+        r = pearsonr_safe(gt, rc)
+        fmri_rs.append((v, r))
+    fmri_rs.sort(key=lambda t: t[1], reverse=True)
+    top_fmri = fmri_rs[:min(TOP_K, len(fmri_rs))]
 
-    # ---- fMRI masked-only overlays + zoomed segments
-    if mode == "partial_fmri" and M_t is not None:
-        mask_bool_T = M_t[0].detach().cpu().numpy().astype(bool)
-        plot_fmri_overlays(
-            fmri_t, recon_fmri, out_dir / 'fmri_plots_masked_only',
-            rois=FMRI_ROIS_TO_PLOT, mask_bool_T=mask_bool_T, masked_only=True, tr=cfg.tr
-        )
-        plot_fmri_masked_segment_zooms(
-            fmri_t, recon_fmri, out_dir / 'fmri_plots_masked_zooms',
-            rois=FMRI_ROIS_TO_PLOT, mask_bool_T=mask_bool_T, tr=cfg.tr
-        )
-        print(f"[OK] Saved fMRI masked-only overlays to {out_dir/'fmri_plots_masked_only'}")
-        print(f"[OK] Saved fMRI per-segment zooms to {out_dir/'fmri_plots_masked_zooms'}")
+    # Save CSV tables
+    import csv
+    with open(out_dir / "tables" / "eeg_channel_pearson_r.csv", "w", newline="") as f:
+        w = csv.writer(f); w.writerow(["channel", "pearson_r"])
+        for ch, r in eeg_rs:
+            w.writerow([ch, r])
+    with open(out_dir / "tables" / "fmri_roi_pearson_r.csv", "w", newline="") as f:
+        w = csv.writer(f); w.writerow(["roi", "pearson_r"])
+        for roi, r in fmri_rs:
+            w.writerow([roi, r])
+
+    # ---------- Plotting: Top-10 EEG ----------
+    if len(top_eeg) > 0:
+        fig_eeg, axes_eeg = plt.subplots(nrows=len(top_eeg), ncols=1,
+                                         figsize=(12, 2.2*len(top_eeg)), sharex=False)
+        if len(top_eeg) == 1:
+            axes_eeg = [axes_eeg]
+        t_eeg = np.arange(Pe * S_) / float(TARGET_FS)  # seconds
+        for ax, (ch, r) in zip(axes_eeg, top_eeg):
+            gt = x_true_eeg[ch].reshape(Pe*S_)
+            rc = x_rec_eeg[ch].reshape(Pe*S_)
+            te, gt_d = downsample(t_eeg, gt, PLOT_MAX_POINTS_EEG)
+            _,  rc_d = downsample(t_eeg, rc, PLOT_MAX_POINTS_EEG)
+            ax.plot(te, gt_d, label="EEG GT")
+            ax.plot(te, rc_d, label="EEG Recon", alpha=0.85)
+            ax.set_title(f"EEG Channel {ch} — r={r:.3f}")
+            ax.set_xlabel("Time (s)"); ax.set_ylabel("Amplitude (z-sc)")
+            ax.legend(loc="upper right")
+        fig_eeg.tight_layout()
+        fig_eeg.savefig(out_dir / "plots" / "top10_eeg_corr.png", dpi=150)
+        plt.close(fig_eeg)
+
+    # ---------- Plotting: Top-10 fMRI ----------
+    if len(top_fmri) > 0:
+        fig_fmri, axes_fmri = plt.subplots(nrows=len(top_fmri), ncols=1,
+                                           figsize=(12, 2.2*len(top_fmri)), sharex=False)
+        if len(top_fmri) == 1:
+            axes_fmri = [axes_fmri]
+        t_fmri = np.arange(T_) * float(cfg.tr)
+        for ax, (roi, r) in zip(axes_fmri, top_fmri):
+            gt = x_true_fmri[:, roi]
+            rc = x_rec_fmri[:, roi]
+            tf, gt_d = downsample(t_fmri, gt, PLOT_MAX_POINTS_FMRI)
+            _,  rc_d = downsample(t_fmri, rc, PLOT_MAX_POINTS_FMRI)
+            ax.plot(tf, gt_d, label="fMRI GT")
+            ax.plot(tf, rc_d, label="fMRI Recon", alpha=0.85)
+            ax.set_title(f"fMRI ROI {roi} — r={r:.3f}")
+            ax.set_xlabel("Time (s)"); ax.set_ylabel("Z-scored signal")
+            ax.legend(loc="upper right")
+        fig_fmri.tight_layout()
+        fig_fmri.savefig(out_dir / "plots" / "top10_fmri_corr.png", dpi=150)
+        plt.close(fig_fmri)
+
+    # ---------- Bar charts across ALL channels/ROIs ----------
+    # EEG bars
+    all_ch = [ch for ch, _ in eeg_rs]
+    all_r  = [r for _, r in eeg_rs]
+    order = np.argsort(all_r)[::-1]
+    figw = max(12, 0.3 * len(all_ch) + 6)  # widen with more channels
+    plt.figure(figsize=(figw, 5))
+    plt.bar(np.arange(len(all_ch)), np.array(all_r)[order])
+    plt.ylim(-1.0, 1.0)
+    # X ticks: show some, not all (readability)
+    idxs = np.arange(len(all_ch))
+    step = max(1, len(all_ch) // 30)  # show ~30 ticks max
+    tick_positions = idxs[::step]
+    tick_labels = [str(all_ch[i]) for i in order[::step]]
+    plt.xticks(tick_positions, tick_labels, rotation=90)
+    plt.xlabel("EEG Channel (sorted by r)")
+    plt.ylabel("Pearson r")
+    plt.title("EEG: Pearson correlation per channel (all)")
+    plt.tight_layout()
+    plt.savefig(out_dir / "plots" / "corr_bars_eeg.png", dpi=150)
+    plt.close()
+
+    # fMRI bars
+    all_roi = [roi for roi, _ in fmri_rs]
+    all_rr  = [r for _, r in fmri_rs]
+    order_f = np.argsort(all_rr)[::-1]
+    figw = max(12, 0.03 * len(all_roi) + 10)  # many ROIs; scale width slowly
+    plt.figure(figsize=(figw, 5))
+    plt.bar(np.arange(len(all_roi)), np.array(all_rr)[order_f])
+    plt.ylim(-1.0, 1.0)
+    # Ticks: show sparse labels for readability
+    idxs = np.arange(len(all_roi))
+    step = max(1, len(all_roi) // 40)  # show ~40 ticks max
+    tick_positions = idxs[::step]
+    tick_labels = [str(all_roi[i]) for i in order_f[::step]]
+    plt.xticks(tick_positions, tick_labels, rotation=90)
+    plt.xlabel("fMRI ROI (sorted by r)")
+    plt.ylabel("Pearson r")
+    plt.title("fMRI: Pearson correlation per ROI (all)")
+    plt.tight_layout()
+    plt.savefig(out_dir / "plots" / "corr_bars_fmri.png", dpi=150)
+    plt.close()
+
+    # Console summary
+    print("\n=== Top EEG channels by Pearson r ===")
+    for ch, r in top_eeg:
+        print(f"  ch={ch:02d}  r={r:.4f}")
+    print("\n=== Top fMRI ROIs by Pearson r ===")
+    for roi, r in top_fmri:
+        print(f"  ROI={roi:03d} r={r:.4f}")
 
 def main():
     cfg = VizConfig(
@@ -691,12 +755,11 @@ def main():
         num_workers=NUM_WORKERS,
         eeg_seconds_per_token=EEG_SECONDS_PER_TOKEN,
         tr=TR,
-        eeg_channels_to_plot=EEG_CHANNELS_TO_PLOT,
     )
     for p in [cfg.eeg_root, cfg.fmri_root, cfg.a424_label_nii, cfg.cbramod_weights, cfg.brainlm_model_dir, cfg.checkpoint]:
         if p is None or not Path(p).exists():
             raise FileNotFoundError(f"Missing path: {p}")
-    run_once(cfg, subset=SUBSET, mode=MODE, partial_visible_frac=PARTIAL_VISIBLE_FRAC)
+    run_once(cfg, subset=SUBSET, mode=MODE)
 
 if __name__ == "__main__":
     main()
