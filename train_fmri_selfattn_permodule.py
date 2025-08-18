@@ -3,9 +3,16 @@
 Stage-wise training (fMRI-only, self-attention; no cross-attn, no EEG path),
 run **one stage at a time** with train/test modes and per-module checkpoints.
 
+Now with DEBUG instrumentation:
+  - --debug prints env, dataset sizes, shapes, memory, LR, etc.
+  - --profile_first_n N profiles the first N batches with sub-step timers
+  - --max_batches_per_epoch caps batches per epoch for quick sanity checks
+  - tqdm progress bar with fetch/compute timings and loss
+  - gradient norm & CUDA memory (allocated/reserved) every --log_every steps
+
 Usage examples:
   # Stage 1 train, then test on val:
-  python train_fmri_selfattn_permodule.py --config <cfg.yaml> --stage 1 --mode train
+  python train_fmri_selfattn_permodule.py --config <cfg.yaml> --stage 1 --mode train --debug --profile_first_n 2
   python train_fmri_selfattn_permodule.py --config <cfg.yaml> --stage 1 --mode test --eval_split val
 
   # Stage 2 (warm-starts from Stage 1 best):
@@ -18,7 +25,7 @@ Usage examples:
 """
 
 from __future__ import annotations
-import os, json, math, argparse
+import os, json, math, argparse, time, platform
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Iterable, List, Dict, Any, Tuple
@@ -40,6 +47,11 @@ import sys
 sys.path.insert(0, str(THIS_DIR))
 sys.path.insert(0, str(CBRAMOD_DIR))
 sys.path.insert(0, str(BRAINLM_DIR))
+
+try:
+    from tqdm import tqdm  # progress bar
+except Exception:
+    tqdm = None
 
 # -----------------------------
 # Local modules
@@ -65,6 +77,12 @@ from data_oddball import (  # type: ignore
 # -----------------------------
 def seed_all(seed:int):
     np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+def fmt_mem() -> str:
+    if not torch.cuda.is_available(): return "cuda:N/A"
+    a = torch.cuda.memory_allocated() / (1024**2)
+    r = torch.cuda.memory_reserved() / (1024**2)
+    return f"cuda: alloc={a:.1f}MB, reserv={r:.1f}MB"
 
 @dataclass
 class TrainCfg:
@@ -107,6 +125,12 @@ class TrainCfg:
     train_subjects: Optional[List[int]] = None
     val_subjects:   Optional[List[int]] = None
     test_subjects:  Optional[List[int]] = None
+
+    # debug controls
+    debug: bool = False
+    profile_first_n: int = 0     # profile first N batches in each epoch
+    max_batches_per_epoch: int = 0  # 0=all
+    log_every: int = 10
 
 # -----------------------------
 # Frozen BrainLM
@@ -165,14 +189,14 @@ class TranslatorFMRISelfAttn(nn.Module):
         # Positional enc (buffer)
         self.pos_fmri = self._pos_enc(cfg.d_model, 100_000)
 
-        # Self-attention encoder (lower/higher stacks are identical here; we use 'higher' output)
+        # Self-attention encoder (lower/higher stacks identical here; use 'higher')
         self.fmri_encoder = HierarchicalEncoder(cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.dropout, n_layers_per_stack=1)
 
         # Tiny decoder to (B, T*V)
         T = int(round(cfg.window_sec/cfg.tr))
         self.fmri_decoder = fMRIDecodingAdapterLite(target_T=T, target_V=cfg.fmri_voxels, d_model=cfg.d_model, rank=16)
 
-        # Output affine (usually keep frozen until stage 3 if you enable)
+        # Output affine (usually keep frozen until stage 3 if enabled)
         self.fmri_out_scale = nn.Parameter(torch.tensor(1.0))
         self.fmri_out_bias  = nn.Parameter(torch.tensor(0.0))
 
@@ -189,14 +213,9 @@ class TranslatorFMRISelfAttn(nn.Module):
         fmri_latents: (L,B,Ttok,Dh) from BrainLM
         returns: (B,T,V)
         """
-        # Adapt + add positions
         fmri_adapt = self.adapter_fmri(fmri_latents)  # (B, 512, D)
         fmri_adapt = fmri_adapt + self.pos_fmri[:fmri_adapt.size(1)].unsqueeze(0).to(fmri_adapt.device)
-
-        # Self-attention encoder (we use 'higher' stream as final)
         _, fmr_hi = self.fmri_encoder(fmri_adapt, fmri_adapt)  # (B, Tf, D)
-
-        # Decode to (B, T*V) -> (B, T, V)
         fmri_flat = self.fmri_decoder(fmr_hi)                  # (B, T*V)
         fmri_sig  = fmri_flat.view(fmri_adapt.size(0), int(fmri_T), int(fmri_V))
         fmri_sig  = torch.tanh(fmri_sig)
@@ -298,20 +317,25 @@ def make_dataloaders(cfg: TrainCfg, device: torch.device) -> Tuple[DataLoader, D
         val_keys   = tuple(k for k in inter_keys if k[0] in val_sub)
         test_keys  = tuple(k for k in inter_keys if k[0] in test_sub)
 
-    def _dl(keys):
+    def _dl(keys, name):
         ds = PairedAlignedDataset(
             eeg_root=cfg.eeg_root, fmri_root=cfg.fmri_root, a424_label_nii=cfg.a424_label_nii,
             window_sec=cfg.window_sec, original_fs=1000, target_fs=200, tr=cfg.tr,
             channels_limit=34, fmri_norm=cfg.fmri_norm, stride_sec=cfg.stride_sec,
             device='cpu', include_sr_keys=keys
         )
-        return DataLoader(
+        if cfg.debug:
+            print(f"[debug][dataset] {name}: samples={len(ds)} keys={len(keys)}")
+        dl = DataLoader(
             ds, batch_size=cfg.batch_size, shuffle=False,
             num_workers=cfg.num_workers, pin_memory=(device.type=='cuda'),
             collate_fn=collate_paired, drop_last=False
         )
+        if cfg.debug:
+            print(f"[debug][dataloader] {name}: batches={len(dl)} (bs={cfg.batch_size}, workers={cfg.num_workers}, pin={device.type=='cuda'})")
+        return dl
 
-    return _dl(train_keys), _dl(val_keys), (_dl(test_keys) if test_keys else None)
+    return _dl(train_keys, "train"), _dl(val_keys, "val"), (_dl(test_keys, "test") if test_keys else None)
 
 def cache_a424_xyz(device: torch.device) -> Optional[torch.Tensor]:
     candidates = [
@@ -331,40 +355,105 @@ def cache_a424_xyz(device: torch.device) -> Optional[torch.Tensor]:
                 pass
     return coords
 
+def _grad_norm(model: nn.Module) -> float:
+    tot = 0.0
+    for p in model.parameters():
+        if p.requires_grad and p.grad is not None:
+            param_norm = p.grad.data.norm(2).item()
+            tot += param_norm * param_norm
+    return float(math.sqrt(tot)) if tot > 0 else 0.0
+
 def run_epoch(mode:str, dl, model, brainlm, xyz_ref, cfg:TrainCfg, device, scaler, opt=None):
     is_train = (mode == 'train')
     model.train(is_train)
     loss_fn = nn.MSELoss()
     tot, steps = 0.0, 0
 
-    for batch in dl:
+    iterator = dl
+    if tqdm is not None:
+        iterator = tqdm(dl, total=len(dl), leave=False, desc=f"{mode}")
+
+    # To measure dataloader fetch time
+    prev_end = time.time()
+
+    for bidx, batch in enumerate(iterator):
+        t_fetch = time.time() - prev_end  # time spent waiting for this batch
+        t0 = time.time()
+
         fmri_t = batch['fmri_window'].to(device, non_blocking=True)  # (B,T,V)
         B,T,V = fmri_t.shape
 
         # Prepare BrainLM inputs
+        t_pad0 = time.time()
         fmri_pad = pad_timepoints_for_brainlm_torch(fmri_t, patch_size=20)  # (B,Tp,V)
         signal_vectors = fmri_pad.permute(0,2,1).contiguous()               # (B,V,Tp)
         if xyz_ref is not None and V == cfg.fmri_voxels:
             xyz = xyz_ref.unsqueeze(0).repeat(B,1,1)
         else:
             xyz = torch.zeros(B, V, 3, device=device)
+        t_pad = time.time() - t_pad0
 
         # BrainLM latents (frozen)
+        t_blm0 = time.time()
         with torch.no_grad():
             fmri_latents = brainlm.extract_latents(signal_vectors, xyz)     # (L,B,Ttok,Dh)
+        t_blm = time.time() - t_blm0
 
         if is_train:
             opt.zero_grad(set_to_none=True)
+
+        # Forward + loss
+        t_fwd0 = time.time()
         with torch.amp.autocast('cuda', enabled=(cfg.amp and device.type=='cuda')):
             recon = model(fmri_latents, fmri_T=T, fmri_V=V)                 # (B,T,V)
             loss = loss_fn(recon, fmri_t)
+        t_fwd = time.time() - t_fwd0
 
+        # Backward/step
+        t_bwd = t_step = gnorm = 0.0
         if is_train:
+            t_bwd0 = time.time()
             scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            gnorm = _grad_norm(model)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(opt); scaler.update()
+            t_bwd = time.time() - t_bwd0
 
-        tot += float(loss.detach().cpu()); steps += 1
+            t_step0 = time.time()
+            scaler.step(opt); scaler.update()
+            t_step = time.time() - t_step0
+
+        # aggregate
+        loss_val = float(loss.detach().cpu())
+        tot += loss_val; steps += 1
+
+        # logging
+        t_tot = time.time() - t0
+        if cfg.debug:
+            if bidx < max(1, cfg.profile_first_n):
+                # detailed first-N profile
+                mem = fmt_mem()
+                print(
+                    f"[{mode}] b{bidx:04d} "
+                    f"fetch={t_fetch:.3f}s | pad={t_pad:.3f}s | brainlm={t_blm:.3f}s | "
+                    f"fwd={t_fwd:.3f}s | bwd={t_bwd:.3f}s | step={t_step:.3f}s | total={t_tot:.3f}s | "
+                    f"loss={loss_val:.6f} | gnorm={gnorm:.3f} | {mem} | "
+                    f"shapes: fmri={tuple(fmri_t.shape)} latents={tuple(fmri_latents.shape)}"
+                )
+            elif (bidx+1) % max(1, cfg.log_every) == 0:
+                mem = fmt_mem()
+                lr = opt.param_groups[0]['lr'] if is_train else 0.0
+                if tqdm is not None:
+                    iterator.set_postfix_str(f"loss={loss_val:.4f} fetch={t_fetch:.2f}s fwd={t_fwd:.2f}s {mem}")
+                else:
+                    print(f"[{mode}] b{bidx+1}/{len(dl)} loss={loss_val:.5f} fetch={t_fetch:.3f}s fwd={t_fwd:.3f}s gnorm={gnorm:.2f} lr={lr:.2e} {mem}")
+
+        prev_end = time.time()
+
+        if cfg.max_batches_per_epoch and steps >= cfg.max_batches_per_epoch:
+            if cfg.debug:
+                print(f"[debug] Reached --max_batches_per_epoch={cfg.max_batches_per_epoch}, breaking early.")
+            break
 
     return tot / max(1, steps)
 
@@ -412,15 +501,16 @@ def _apply_config_defaults(parser: argparse.ArgumentParser) -> Dict[str, Any]:
                 if k not in raw: raw[k] = float(raw["lr"])
 
         # Normalize booleans/paths
-        for key in ("amp", "train_affine_stage3"):
+        for key in ("amp", "train_affine_stage3", "debug"):
             if key in raw: raw[key] = bool(raw[key])
 
-        # Set argparse defaults
+        # Pass-through keys we support
         pass_through_keys = [
             "eeg_root","fmri_root","a424_label_nii","brainlm_model_dir","out_dir",
             "device","seed","window_sec","stride_sec","batch_size","num_workers","amp",
             "stage1_epochs","stage2_epochs","stage3_epochs","lr1","lr2","lr3","weight_decay",
             "fmri_norm","train_subjects","val_subjects","test_subjects","train_affine_stage3",
+            "debug","profile_first_n","max_batches_per_epoch","log_every",
         ]
         cfg_defaults = {k: raw[k] for k in pass_through_keys if k in raw}
         parser.set_defaults(**cfg_defaults)
@@ -430,7 +520,7 @@ def _apply_config_defaults(parser: argparse.ArgumentParser) -> Dict[str, Any]:
 # Main
 # -----------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Stage-wise fMRI-only (self-attn) training/testing (per-module checkpoints) + YAML/JSON config")
+    ap = argparse.ArgumentParser(description="Stage-wise fMRI-only (self-attn) training/testing (per-module checkpoints) + YAML/JSON config + DEBUG")
     ap.add_argument("--config", type=str, default=None, help="YAML/JSON config; if YAML has sections, uses 'train'")
     ap.add_argument("--eeg_root", type=str)
     ap.add_argument("--fmri_root", type=str)
@@ -455,14 +545,20 @@ def main():
     ap.add_argument("--train_affine_stage3", action="store_true", help="Unfreeze fmri_out_scale/bias in Stage 3")
     ap.add_argument("--train_subjects", type=int, nargs="*", default=None)
     ap.add_argument("--val_subjects",   type=int, nargs="*", default=None)
-    ap.add_argument("--test_subjects",  type=int, nargs="*", default=None)
+    ap.add_argument("--test_subjects", type=int, nargs="*", default=None)
 
-    # New: run control
+    # Run control
     ap.add_argument("--stage", type=int, required=True, choices=[1,2,3], help="Which stage to run (1|2|3)")
     ap.add_argument("--mode", type=str, required=True, choices=["train","test"], help="Run mode: train or test")
     ap.add_argument("--eval_split", type=str, default="val", choices=["val","test"], help="Which split to evaluate in test mode")
     ap.add_argument("--load_tag", type=str, default=None,
                     help="Optional override for which checkpoint tag to load in test mode (default: stageX_best). Example: 'stage2_last'.")
+
+    # Debug knobs
+    ap.add_argument("--debug", action="store_true", help="Verbose debug output")
+    ap.add_argument("--profile_first_n", type=int, default=0, help="Profile/timestamp the first N batches in each epoch")
+    ap.add_argument("--max_batches_per_epoch", type=int, default=0, help="Cap number of batches per epoch (0 = all)")
+    ap.add_argument("--log_every", type=int, default=10, help="Print mem/grad every N batches when debug")
 
     # Apply config defaults if provided (CLI still overrides)
     _apply_config_defaults(ap)
@@ -493,6 +589,10 @@ def main():
         train_subjects=args.train_subjects,
         val_subjects=args.val_subjects,
         test_subjects=args.test_subjects,
+        debug=bool(args.debug),
+        profile_first_n=int(args.profile_first_n),
+        max_batches_per_epoch=int(args.max_batches_per_epoch),
+        log_every=int(args.log_every),
     )
 
     # Checks
@@ -508,6 +608,13 @@ def main():
     device = torch.device(cfg.device)
     os.makedirs(cfg.out_dir, exist_ok=True)
 
+    if cfg.debug:
+        print(f"[debug] torch {torch.__version__} | cuda available={torch.cuda.is_available()} | device={device}")
+        if torch.cuda.is_available():
+            print(f"[debug] GPU: {torch.cuda.get_device_name(0)}")
+        print(f"[debug] platform={platform.platform()} | python={sys.version.split()[0]}")
+        print(f"[debug] cfg={cfg}")
+
     # Data
     dl_train, dl_val, dl_test = make_dataloaders(cfg, device)
 
@@ -518,15 +625,12 @@ def main():
     scaler = torch.amp.GradScaler('cuda', enabled=(cfg.amp and device.type=='cuda'))
 
     # ---------- Warm-start policy per stage ----------
-    # In train mode, we load prior stage "best" modules as init (when applicable).
-    # In test mode, we load tag=stageX_best (or --load_tag if provided) and evaluate.
     out_dir = Path(cfg.out_dir)
     stage = int(args.stage)
     mode = str(args.mode)
 
     if mode == "train":
         if stage == 1:
-            # none
             pass
         elif stage == 2:
             load_modules_if_exist(out_dir, translator, tag="stage1_best", which=["adapter"], device=device)
@@ -538,7 +642,7 @@ def main():
         tag = args.load_tag or default_tag
         need = ["adapter"] if stage == 1 else (["adapter","encoder"] if stage == 2 else ["adapter","encoder","decoder","affine"])
         loaded = load_modules_if_exist(out_dir, translator, tag=tag, which=need, device=device)
-        missing = set(need) - set([n.split("_")[0] for n in loaded])  # rough check
+        missing = set(need) - set([n.split("_")[0] for n in loaded])
         if missing:
             print(f"[WARN] Some modules for '{tag}' were not found: {sorted(missing)}")
 
@@ -561,9 +665,11 @@ def main():
         best = float('inf')
 
         for ep in range(1, epochs+1):
+            t_ep0 = time.time()
             tr = run_epoch("train", dl_train, translator, brainlm, xyz_ref, cfg, device, scaler, opt)
             va = run_epoch("val", dl_val, translator, brainlm, xyz_ref, cfg, device, scaler, opt=None)
-            print(f"[Stage{stage}][{ep}/{epochs}] train={tr:.6f} val={va:.6f}")
+            t_ep = time.time() - t_ep0
+            print(f"[Stage{stage}][{ep}/{epochs}] train={tr:.6f} val={va:.6f} | epoch_time={t_ep:.1f}s | lr={opt.param_groups[0]['lr']:.2e} | {fmt_mem()}")
             save_modules(out_dir, translator, tag=f"stage{stage}_last")
             if va < best:
                 best = va
