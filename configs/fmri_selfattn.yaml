@@ -1,0 +1,33 @@
+train:
+  # --- data / models ---
+  eeg_root: D:/Neuroinformatics_research_2025/Oddball/ds116_eeg
+  fmri_root: D:/Neuroinformatics_research_2025/Oddball/ds000116
+  a424_label_nii: D:/Neuroinformatics_research_2025/BrainLM/A424_resampled_to_bold.nii.gz
+  brainlm_model_dir: D:/Neuroinformatics_research_2025/MNI_templates/BrainLM/pretrained_models/2023-06-06-22_15_00-checkpoint-1400
+
+  # where module checkpoints will be saved (adapter/encoder/decoder/affine)
+  out_dir: D:/Neuroinformatics_research_2025/Multi_modal_NTM/runs_fmri_selfattn
+
+  # --- runtime ---
+  device: cuda            # use your GPU
+  seed: 42
+  window_sec: 40          # matches your previous setup
+  stride_sec: 10
+  fmri_norm: zscore
+  batch_size: 16
+  num_workers: 0
+  amp: false              # set true to enable mixed precision on GPU
+
+  # --- stage schedules (you run one stage at a time, but we keep the defaults here) ---
+  stage1_epochs: 50
+  stage2_epochs: 100
+  stage3_epochs: 50
+  lr1: 1e-4
+  lr2: 8e-5
+  lr3: 5e-5
+  weight_decay: 1e-4
+
+  # --- fixed subject splits (optional, keeps your previous split) ---
+  train_subjects: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+  val_subjects:   [16]
+  test_subjects:  [17]
