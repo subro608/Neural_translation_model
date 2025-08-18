@@ -41,12 +41,33 @@ from torch.utils.data import DataLoader
 THIS_DIR = Path(__file__).parent
 REPO_ROOT = THIS_DIR.parent
 CBRAMOD_DIR = REPO_ROOT / "CBraMod"
-BRAINLM_DIR = REPO_ROOT / "BrainLM"
+BRAINLM_DIR = REPO_ROOT / "BrainLM"  # may or may not exist depending on your layout
 
 import sys
+# Always include the script dir
 sys.path.insert(0, str(THIS_DIR))
+# Try common locations for CBraMod
 sys.path.insert(0, str(CBRAMOD_DIR))
-sys.path.insert(0, str(BRAINLM_DIR))
+sys.path.insert(0, str(THIS_DIR / "CBraMod"))
+# Try common locations for BrainLM (robust across layouts)
+candidate_blm_roots = [
+    BRAINLM_DIR,                 # <repo-root>/BrainLM
+    THIS_DIR / "BrainLM",        # <this-script-dir>/BrainLM  (your current layout)
+    Path(os.environ.get("BRAINLM_DIR", "")),
+    Path(os.environ.get("BRAINLM_DIR", "")) / "brainlm_mae",
+]
+for p in candidate_blm_roots:
+    if not p:
+        continue
+    p = Path(p)
+    # If we were given the package dir itself, add its parent;
+    # if we were given the BrainLM repo root, add that.
+    if (p / "brainlm_mae").is_dir():
+        sys.path.insert(0, str(p))
+        break
+    if p.name == "brainlm_mae" and p.is_dir():
+        sys.path.insert(0, str(p.parent))
+        break
 
 try:
     from tqdm import tqdm  # progress bar
@@ -61,8 +82,12 @@ from module import (  # type: ignore
     HierarchicalEncoder,
     fMRIDecodingAdapterLite,
 )
+
+# BrainLM imports (now robust thanks to path setup above)
 from brainlm_mae.modeling_brainlm import BrainLMForPretraining  # type: ignore
 from brainlm_mae.configuration_brainlm import BrainLMConfig     # type: ignore
+
+# Data utilities
 from data_oddball import (  # type: ignore
     PairedAlignedDataset,
     collate_paired,
@@ -545,7 +570,7 @@ def main():
     ap.add_argument("--train_affine_stage3", action="store_true", help="Unfreeze fmri_out_scale/bias in Stage 3")
     ap.add_argument("--train_subjects", type=int, nargs="*", default=None)
     ap.add_argument("--val_subjects",   type=int, nargs="*", default=None)
-    ap.add_argument("--test_subjects", type=int, nargs="*", default=None)
+    ap.add_argument("--test_subjects",  type=int, nargs="*", default=None)
 
     # Run control
     ap.add_argument("--stage", type=int, required=True, choices=[1,2,3], help="Which stage to run (1|2|3)")
@@ -614,6 +639,14 @@ def main():
             print(f"[debug] GPU: {torch.cuda.get_device_name(0)}")
         print(f"[debug] platform={platform.platform()} | python={sys.version.split()[0]}")
         print(f"[debug] cfg={cfg}")
+        # Show where brainlm_mae is being imported from
+        try:
+            import brainlm_mae  # type: ignore
+            print(f"[debug] brainlm_mae -> {getattr(brainlm_mae, '__file__', '<pkg>')}")
+        except Exception as e:
+            print(f"[debug] brainlm_mae import check failed: {e}")
+        # and the front of sys.path (useful when debugging)
+        print(f"[debug] sys.path[:5] = {sys.path[:5]}")
 
     # Data
     dl_train, dl_val, dl_test = make_dataloaders(cfg, device)
