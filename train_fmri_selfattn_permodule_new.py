@@ -115,6 +115,36 @@ def fmt_mem() -> str:
     r = torch.cuda.memory_reserved() / (1024**2)
     return f"cuda: alloc={a:.1f}MB, reserv={r:.1f}MB"
 
+# --- Torch load compat for PyTorch >= 2.6 (and earlier) ---
+def _torch_load_compat(path: Path, map_location, *, allow_weights_only: bool = False):
+    """
+    Robust torch.load for:
+      - PyTorch >= 2.6 default (weights_only=True)
+      - Older versions (no weights_only kwarg)
+    For trainstate (optimizer/scaler/epoch), we need full pickle → weights_only=False.
+    For pure state_dicts, either is fine; we still use this helper for consistency.
+    """
+    # First try classic behavior (weights_only=False)
+    try:
+        return torch.load(str(path), map_location=map_location, weights_only=False)
+    except TypeError:
+        # Older torch without weights_only kwarg
+        return torch.load(str(path), map_location=map_location)
+    except Exception as e1:
+        # If the caller explicitly allows weights_only, try safe load with allowlist
+        if allow_weights_only:
+            try:
+                import torch.serialization as ts
+                try:
+                    from torch.torch_version import TorchVersion  # type: ignore
+                    ts.add_safe_globals([TorchVersion])
+                except Exception:
+                    pass
+                return torch.load(str(path), map_location=map_location, weights_only=True)
+            except Exception as e2:
+                raise RuntimeError(f"Failed to load {path.name} via classic and safe weights_only paths:\n{e1}\n{e2}") from e2
+        raise
+
 @dataclass
 class TrainCfg:
     # data / models
@@ -189,7 +219,7 @@ class FrozenBrainLM(nn.Module):
             cfg = BrainLMConfig(**json.load(f))
         self.model = BrainLMForPretraining(cfg)
         try:
-            ckpt = torch.load(str(w_path), map_location=device)
+            ckpt = _torch_load_compat(w_path, map_location=device, allow_weights_only=True)
             self.model.load_state_dict(ckpt, strict=False)
         except Exception as e:
             raise RuntimeError(f"Failed to load BrainLM: {e}")
@@ -239,7 +269,7 @@ class TranslatorFMRISelfAttn(nn.Module):
 
         # Tiny decoder to (B, T*V)
         T = int(round(cfg.window_sec/cfg.tr))
-        self.fmri_decoder = fMRIDecodingAdapterLite(target_T=T, target_V=cfg.fmri_voxels, d_model=cfg.d_model, rank=32) 
+        self.fmri_decoder = fMRIDecodingAdapterLite(target_T=T, target_V=cfg.fmri_voxels, d_model=cfg.d_model, rank=32)
 
         # Output affine (usually keep frozen until stage 3 if enabled)
         self.fmri_out_scale = nn.Parameter(torch.tensor(1.0))
@@ -321,16 +351,16 @@ def load_modules_if_exist(out_dir: Path, model: TranslatorFMRISelfAttn, tag: str
     which = set(which or ["adapter","encoder","decoder","affine"])
     loaded = []
     if "adapter" in which and paths["adapter"].exists():
-        sd = torch.load(paths["adapter"], map_location=device or "cpu")
+        sd = _torch_load_compat(paths["adapter"], map_location=device or "cpu", allow_weights_only=True)
         model.adapter_fmri.load_state_dict(sd, strict=False); loaded.append("adapter_fmri")
     if "encoder" in which and paths["encoder"].exists():
-        sd = torch.load(paths["encoder"], map_location=device or "cpu")
+        sd = _torch_load_compat(paths["encoder"], map_location=device or "cpu", allow_weights_only=True)
         model.fmri_encoder.load_state_dict(sd, strict=False); loaded.append("fmri_encoder")
     if "decoder" in which and paths["decoder"].exists():
-        sd = torch.load(paths["decoder"], map_location=device or "cpu")
+        sd = _torch_load_compat(paths["decoder"], map_location=device or "cpu", allow_weights_only=True)
         model.fmri_decoder.load_state_dict(sd, strict=False); loaded.append("fmri_decoder")
     if "affine" in which and paths["affine"].exists():
-        sd = torch.load(paths["affine"], map_location=device or "cpu")
+        sd = _torch_load_compat(paths["affine"], map_location=device or "cpu", allow_weights_only=True)
         if isinstance(sd, dict):
             with torch.no_grad():
                 if "scale" in sd: model.fmri_out_scale.copy_(sd["scale"].to(model.fmri_out_scale.device))
@@ -373,7 +403,7 @@ def load_trainstate_if_exist(out_dir: Path, stage: int, tag: str,
     if not p.exists():
         return 1, float('inf'), False
     try:
-        sd = torch.load(p, map_location=device)
+        sd = _torch_load_compat(p, map_location=device, allow_weights_only=False)
         if opt is not None and sd.get("optimizer_state") is not None:
             try: opt.load_state_dict(sd["optimizer_state"])
             except Exception as e: print(f"[resume] WARN optimizer state: {e}")
@@ -385,7 +415,7 @@ def load_trainstate_if_exist(out_dir: Path, stage: int, tag: str,
         print(f"[resume] Loaded trainstate from {p.name}: epoch={last_epoch}, best_val={best_val:.6f}")
         return max(1, last_epoch + 1), best_val, True
     except Exception as e:
-        print(f"[resume] WARN failed to load trainstate: {e}")
+        print(f"[resume] WARN failed to load trainstate ({p.name}): {e}")
         return 1, float('inf'), False
 
 # -----------------------------
@@ -815,10 +845,7 @@ def main():
         print(f"[resume] Detected existing stage{stage}_last modules. Resuming training...")
         load_modules_if_exist(out_dir, translator, tag=f"stage{stage}_last",
                               which=["adapter","encoder","decoder","affine"], device=device)
-        # Create a temp optimizer to load state; we'll replace later with actual lr
-        tmp_opt = torch.optim.AdamW([p for p in translator.parameters() if p.requires_grad], lr=1e-8)
-        start_epoch, best, _ = load_trainstate_if_exist(out_dir, stage, tag="last",
-                                                        opt=tmp_opt, scaler=scaler, device=device)
+        # Defer trainstate loading until optimizer/scaler are created
         resumed = True
     else:
         # Standard warm-start from previous stage's best (if training) or load requested tag in test mode
@@ -855,10 +882,9 @@ def main():
 
         opt = torch.optim.AdamW([p for p in translator.parameters() if p.requires_grad], lr=lr, weight_decay=cfg.weight_decay)
 
-        # If we resumed and had optimizer state, reload it into the new optimizer (matching param groups)
+        # Load trainstate ONCE now that optimizer/scaler exist
         if resumed:
-            _, _, loaded_state = load_trainstate_if_exist(out_dir, stage, tag="last", opt=opt, scaler=scaler, device=device)
-            # loaded_state bool tells if file existed; we already printed details above
+            start_epoch, best, _ = load_trainstate_if_exist(out_dir, stage, tag="last", opt=opt, scaler=scaler, device=device)
 
         if start_epoch > epochs:
             print(f"[resume] start_epoch ({start_epoch}) > total epochs ({epochs}); nothing to do.")
