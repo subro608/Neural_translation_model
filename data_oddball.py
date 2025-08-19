@@ -1,60 +1,102 @@
 #!/usr/bin/env python3
 """
-Oddball EEG/fMRI preprocessing and datasets.
+Oddball EEG/fMRI preprocessing and datasets — with automatic caching
+and paired-window materialization (NatView-style) for fast training.
 
-Provides:
-- EEG helpers: downsample, patchify, channel-wise z-score normalization
-- fMRI helpers: A424 extraction in native space, padding, per-parcel normalization
-- A424 coordinate loader (xyz centroids)
-- File discovery and splitting utilities
-- Datasets and collate fns for EEG and fMRI
+What’s cached automatically:
+- EEG downsampled arrays (C, Tds) per .mat  → ~/.cache/oddball_eegfmri/eeg_*.npz
+- fMRI A424 parcel time series (T, 424) per BOLD → ~/.cache/oddball_eegfmri/fmri_*.npz
+- Fully shaped, normalized paired windows (EEG (C,P,S), fMRI (T,V))
+  for a given dataset configuration & split of (subject, task, run)
+  → ~/.cache/oddball_eegfmri/paired/paired_<signature>.pkl
 
-UPDATED (task-aware):
-- Pairing is now keyed by (subject, task, run) instead of (subject, run)
-- Robust task normalization so EEG 'task001|task002' matches fMRI 'auditory|visual' BIDS tasks
-- Deterministic, fixed-subject intake and splits preserved
-
-Public API relied on elsewhere:
-- pad_timepoints_for_brainlm_torch
-- load_a424_coords
-- PairedAlignedDataset
+Public API preserved:
+- collect_common_sr_keys
+- fixed_subject_keys
+- PairedAlignedDataset (now auto-uses paired window caches)
 - collate_paired
-- collect_common_sr_keys     # now returns (sub, task, run) triples
-- fixed_subject_keys         # filters by subject, returns triples
+
+Diagnostics:
+- diagnose_one_pair(...) prints BEFORE/AFTER & first window stats
+- prewarm_cache(...) fills all caches for a given split
 """
 
 from __future__ import annotations
 
+import os
 import json
 import glob
+import hashlib
+import pickle
 from dataclasses import dataclass
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Iterable, Set
+from typing import Dict, List, Optional, Tuple, Iterable, Set, Any
 
 import numpy as np
 import torch
-import torch.nn as nn
 from torch.utils.data import Dataset
 
 import scipy.io as sio
 import scipy.signal
 import nibabel as nib
 from nilearn.image import resample_to_img
-import matplotlib.pyplot as plt
 import argparse
 
+# =============================
+# Cache utilities (automatic)
+# =============================
+CACHE_VERSION = "oddball_cache_2025-08-19a"
 
-# -----------------------------
+def _default_cache_dir() -> Path:
+    return Path(os.environ.get("ODDBALL_CACHE_DIR", "~/.cache/oddball_eegfmri")).expanduser()
+
+def _safe_mkdirs(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+def _file_sig(p: Path) -> str:
+    try:
+        st = p.stat()
+        return f"{str(p.resolve())}|{int(st.st_mtime)}|{st.st_size}"
+    except Exception:
+        return f"{str(p)}|0|0"
+
+def _hash_key(*parts: str) -> str:
+    h = hashlib.sha1()
+    for s in parts:
+        h.update(s.encode("utf-8"))
+    return h.hexdigest()
+
+# Small in-memory LRU to avoid repeat disk reads within a run
+class _LRU:
+    def __init__(self, k: int = 4):
+        from collections import OrderedDict
+        self.k = int(k)
+        self._od: "OrderedDict[str, Any]" = OrderedDict()
+
+    def get(self, key: str):
+        if key in self._od:
+            self._od.move_to_end(key)
+            return self._od[key]
+        return None
+
+    def put(self, key: str, val: Any):
+        self._od[key] = val
+        self._od.move_to_end(key)
+        while len(self._od) > self.k:
+            self._od.popitem(last=False)
+
+_MEM = _LRU(6)
+
+# =============================
 # EEG helpers
-# -----------------------------
+# =============================
 def downsample_eeg(eeg_data: np.ndarray, original_fs: int = 1000, target_fs: int = 200) -> np.ndarray:
     factor = original_fs // target_fs
     if factor < 1 or original_fs % target_fs != 0:
         raise ValueError(f"original_fs ({original_fs}) must be an integer multiple of target_fs ({target_fs})")
     x = scipy.signal.decimate(eeg_data, factor, axis=1, ftype='iir', zero_phase=True)
     return x.copy()
-
 
 def patchify_eeg(eeg: np.ndarray, patch_size: int = 200) -> Tuple[np.ndarray, int]:
     channels, total_time = eeg.shape
@@ -66,25 +108,23 @@ def patchify_eeg(eeg: np.ndarray, patch_size: int = 200) -> Tuple[np.ndarray, in
     patches = eeg_trim.reshape(channels, num_patches, patch_size)
     return patches, num_patches
 
-
 def zscore_eeg_channelwise(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """
-    Z-score per channel across the entire window (P*S).
+    Z-score per channel across the S dimension (kept identical to your pipeline).
     Accepts (C,P,S) or (B,C,P,S). Returns same dimensionality as input.
     """
     orig_dim = x.dim()
-    if orig_dim == 3:  # (C,P,S) -> (1,C,P,S)
-        x = x.unsqueeze(0)
-    assert x.dim() == 4, f"Expected 4D tensor (B,C,P,S), got {tuple(x.shape)}"
+    if orig_dim == 3:
+        x = x.unsqueeze(0)  # (1,C,P,S)
+    assert x.dim() == 4, f"Expected 4D (B,C,P,S), got {tuple(x.shape)}"
     mean = x.mean(dim=3, keepdim=True)
     std = x.std(dim=3, keepdim=True, unbiased=False).clamp(min=eps)
     x = (x - mean) / std
     return x.squeeze(0) if orig_dim == 3 else x
 
-
-# -----------------------------
+# =============================
 # fMRI helpers
-# -----------------------------
+# =============================
 def extract_a424_from_native(bold_path: str, atlas_path: str) -> Tuple[np.ndarray, nib.Nifti1Image, np.ndarray, np.ndarray]:
     """
     Returns:
@@ -97,16 +137,12 @@ def extract_a424_from_native(bold_path: str, atlas_path: str) -> Tuple[np.ndarra
     bold_data = bold_img.get_fdata()  # (X,Y,Z,T)
     atlas_img = nib.load(atlas_path)
     try:
-        atlas_resampled = resample_to_img(
-            atlas_img, bold_img, interpolation='nearest', force_resample=True, copy_header=True
-        )
+        atlas_resampled = resample_to_img(atlas_img, bold_img, interpolation='nearest', force_resample=True, copy_header=True)
     except TypeError:
-        # older nilearn
         atlas_resampled = resample_to_img(atlas_img, bold_img, interpolation='nearest')
 
     atlas_data = atlas_resampled.get_fdata()  # (X,Y,Z)
     T = bold_data.shape[-1]
-
     bold_2d = bold_data.reshape(-1, T)
     atlas_flat = atlas_data.reshape(-1)
 
@@ -118,18 +154,6 @@ def extract_a424_from_native(bold_path: str, atlas_path: str) -> Tuple[np.ndarra
             parcel_ts[:, i] = np.nanmean(bold_2d[idx, :], axis=0)
     parcel_ts = np.nan_to_num(parcel_ts, nan=0.0, posinf=0.0, neginf=0.0)
     return parcel_ts, bold_img, atlas_data, parcel_ids
-
-
-def pad_timepoints_for_brainlm(parcel_ts: np.ndarray, patch_size: int = 20) -> Tuple[np.ndarray, int]:
-    num_timepoints, _ = parcel_ts.shape
-    remainder = num_timepoints % patch_size
-    if remainder == 0:
-        return parcel_ts, num_timepoints
-    pad = patch_size - remainder
-    padded = np.zeros((num_timepoints + pad, parcel_ts.shape[1]))
-    padded[:num_timepoints] = parcel_ts
-    return padded, num_timepoints + pad
-
 
 def pad_timepoints_for_brainlm_torch(signal_vectors_btv: torch.Tensor, patch_size: int = 20) -> torch.Tensor:
     """
@@ -144,7 +168,6 @@ def pad_timepoints_for_brainlm_torch(signal_vectors_btv: torch.Tensor, patch_siz
     padded = torch.zeros((B, T + padding_needed, V), dtype=signal_vectors_btv.dtype, device=signal_vectors_btv.device)
     padded[:, :T, :] = signal_vectors_btv
     return padded
-
 
 def normalize_fmri_time_series(fmri_btv: torch.Tensor, mode: str = 'zscore', eps: float = 1e-8) -> torch.Tensor:
     if mode == 'none':
@@ -165,10 +188,9 @@ def normalize_fmri_time_series(fmri_btv: torch.Tensor, mode: str = 'zscore', eps
     else:
         raise ValueError(f"Unsupported fmri normalization mode: {mode}")
 
-
-# -----------------------------
+# =============================
 # A424 coordinate helpers
-# -----------------------------
+# =============================
 def load_a424_coords(dat_path: Path) -> np.ndarray:
     try:
         arr = np.loadtxt(str(dat_path)).astype(np.float32)
@@ -184,14 +206,83 @@ def load_a424_coords(dat_path: Path) -> np.ndarray:
             coords[idx] = 0.0
     return coords
 
+# =============================
+# Disk caches (EEG/FMRI arrays)
+# =============================
+def _eeg_cache_path(cache_dir: Path, mat_path: Path, original_fs: int, target_fs: int, channels_limit: int) -> Path:
+    key = _hash_key("EEG", CACHE_VERSION, _file_sig(mat_path), str(original_fs), str(target_fs), str(channels_limit))[:16]
+    return cache_dir / f"eeg_{mat_path.stem}_{key}.npz"
 
-# -----------------------------
-# File discovery and deterministic splits
-# -----------------------------
+def _fmri_cache_path(cache_dir: Path, bold_path: Path, atlas_path: Path) -> Path:
+    key = _hash_key("FMRI_A424", CACHE_VERSION, _file_sig(bold_path), _file_sig(Path(atlas_path)))[:16]
+    return cache_dir / f"fmri_{Path(bold_path).stem}_{key}.npz"
+
+def _eeg_mem_key(mat_path: Path, original_fs: int, target_fs: int, channels_limit: int) -> str:
+    return f"EEG|{str(mat_path)}|{original_fs}|{target_fs}|{channels_limit}|{CACHE_VERSION}"
+
+def _fmri_mem_key(bold_path: Path, atlas_path: Path) -> str:
+    return f"FMRI|{str(bold_path)}|{str(atlas_path)}|{CACHE_VERSION}"
+
+def load_eeg_ds_cached(mat_path: Path, *, original_fs: int, target_fs: int, channels_limit: int, cache_dir: Path) -> np.ndarray:
+    _safe_mkdirs(cache_dir)
+    mkey = _eeg_mem_key(mat_path, original_fs, target_fs, channels_limit)
+    arr = _MEM.get(mkey)
+    if arr is not None:
+        return arr
+
+    cpath = _eeg_cache_path(cache_dir, mat_path, original_fs, target_fs, channels_limit)
+    if cpath.exists():
+        with np.load(cpath) as npz:
+            ds = npz["arr"].astype(np.float32, copy=False)
+        _MEM.put(mkey, ds)
+        return ds
+
+    # Compute, save
+    mat = sio.loadmat(str(mat_path))
+    eeg_key = None
+    for k in ['data_reref', 'eeg', 'data', 'EEG', 'eegdata']:
+        if k in mat:
+            eeg_key = k
+            break
+    if eeg_key is None:
+        raise KeyError(f"No EEG array in {mat_path}")
+    data = mat[eeg_key]
+    if data.shape[0] > data.shape[1]:
+        data = data.T
+    # Limit channels BEFORE downsample to match pipeline
+    # (you did this order in dataset previously)
+    # If you ever want to change, bump CACHE_VERSION
+    if data.shape[0] > channels_limit:
+        data = data[:channels_limit]
+    ds = downsample_eeg(data, original_fs, target_fs).astype(np.float32, copy=False)
+    np.savez_compressed(cpath, arr=ds)
+    _MEM.put(mkey, ds)
+    return ds
+
+def load_fmri_parcels_cached(bold_path: Path, atlas_path: Path, *, cache_dir: Path) -> np.ndarray:
+    _safe_mkdirs(cache_dir)
+    mkey = _fmri_mem_key(bold_path, atlas_path)
+    arr = _MEM.get(mkey)
+    if arr is not None:
+        return arr
+
+    cpath = _fmri_cache_path(cache_dir, bold_path, atlas_path)
+    if cpath.exists():
+        with np.load(cpath) as npz:
+            ts = npz["arr"].astype(np.float32, copy=False)
+        _MEM.put(mkey, ts)
+        return ts
+
+    parcel_ts, _, _, _ = extract_a424_from_native(str(bold_path), str(atlas_path))
+    ts = parcel_ts.astype(np.float32, copy=False)
+    np.savez_compressed(cpath, arr=ts)
+    _MEM.put(mkey, ts)
+    return ts
+
+# =============================
+# File discovery + parsing
+# =============================
 def find_eeg_files(root: Path) -> List[Path]:
-    """
-    Finds EEG .mat files. Prefers 'EEG_rereferenced.mat' when present.
-    """
     patterns = [
         str(root / "**" / "EEG_rereferenced.mat"),
         str(root / "**" / "*.mat"),
@@ -199,10 +290,8 @@ def find_eeg_files(root: Path) -> List[Path]:
     files: List[Path] = []
     for pat in patterns:
         files.extend([Path(p) for p in glob.glob(pat, recursive=True)])
-    # Unique & deterministic; prioritize EEG_rereferenced.mat
     files = sorted(set(files), key=lambda p: ("EEG_rereferenced.mat" not in p.name, str(p).lower()))
     return files
-
 
 def find_bold_files(root: Path) -> List[Path]:
     patterns = [
@@ -212,83 +301,56 @@ def find_bold_files(root: Path) -> List[Path]:
     files: List[Path] = []
     for pat in patterns:
         files.extend([Path(p) for p in glob.glob(pat, recursive=True)])
-    files = sorted(set(files), key=lambda p: str(p).lower())
-    return files
+    return sorted(set(files), key=lambda p: str(p).lower())
 
-
-# -----------------------------
-# Regex + key parsing (subject, task, run)
-# -----------------------------
 _RE_SUB_GENERIC = re.compile(r"sub[-_]?0*([0-9]+)", re.IGNORECASE)
 _RE_TASK_GENERIC = re.compile(r"task[-_]?([A-Za-z0-9]+)", re.IGNORECASE)
-_RE_RUN_GENERIC = re.compile(r"run[-_]?0*([0-9]+)", re.IGNORECASE)
-
+_RE_RUN_GENERIC  = re.compile(r"run[-_]?0*([0-9]+)", re.IGNORECASE)
 
 def _parse_key_from_path(path: Path) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     s = str(path)
-    sub = _RE_SUB_GENERIC.search(s)
+    sub  = _RE_SUB_GENERIC.search(s)
     task = _RE_TASK_GENERIC.search(s)
-    run = _RE_RUN_GENERIC.search(s)
-    sub_id = str(int(sub.group(1))) if sub else None
+    run  = _RE_RUN_GENERIC.search(s)
+    sub_id  = str(int(sub.group(1))) if sub else None
     task_id = (task.group(1).lower() if task else None)
-    run_id = str(int(run.group(1))) if run else None
+    run_id  = str(int(run.group(1))) if run else None
     return sub_id, task_id, run_id
 
-
 def _canonical_task_token(raw_task: Optional[str], path: Path) -> Optional[str]:
-    """
-    Map task tokens from both trees to a common form so they intersect.
-
-    Returns 'task001', 'task002', ... when possible.
-    Heuristics:
-      - EEG: task001/task002 -> task001/task002
-      - fMRI: filenames that contain 'auditory' -> task001, 'visual' -> task002
-      - Any numeric token N -> taskNNN
-      - Fallback: lowercase raw token (prefixed as 'task_<token>')
-    """
     if raw_task is None:
         s = path.name.lower()
     else:
         s = raw_task.lower()
 
-    # direct hints from name
     whole = str(path).lower()
     if 'auditory' in s or 'auditory' in whole:
         return 'task001'
     if 'visual' in s or 'visual' in whole:
         return 'task002'
 
-    # EEG-style task001 / task002, or raw numeric
     if s.startswith('task') and len(s) > 4 and s[4:].isdigit():
         return f"task{int(s[4:]):03d}"
     if s.isdigit():
         return f"task{int(s):03d}"
 
-    # fallback: still separate tasks deterministically
     return f"task_{s}" if s else None
 
-
-# -----------------------------
-# Intersections & fixed subject splits (TASK-AWARE)
-# -----------------------------
+# =============================
+# Intersections & splits
+# =============================
 def collect_common_sr_keys(eeg_root: Path, fmri_root: Path) -> List[Tuple[str, str, str]]:
-    """
-    Return deterministic list of (subject, task, run) keys present in BOTH EEG and fMRI trees.
-    Sorted by (int(subject), task, int(run)).
-    """
     eeg_files = find_eeg_files(eeg_root)
     fmri_files = find_bold_files(fmri_root)
 
     key_to_eeg: Dict[Tuple[str, str, str], Path] = {}
     key_to_fmri: Dict[Tuple[str, str, str], Path] = {}
-
     for p in eeg_files:
         sub, task_raw, run = _parse_key_from_path(p)
         if sub and run:
             task = _canonical_task_token(task_raw, p)
             if task:
                 key_to_eeg[(sub, task, run)] = p
-
     for p in fmri_files:
         sub, task_raw, run = _parse_key_from_path(p)
         if sub and run:
@@ -299,7 +361,6 @@ def collect_common_sr_keys(eeg_root: Path, fmri_root: Path) -> List[Tuple[str, s
     inter = set(key_to_eeg.keys()) & set(key_to_fmri.keys())
     return sorted(inter, key=lambda t: (int(t[0]), str(t[1]), int(t[2])))
 
-
 def fixed_subject_keys(
     eeg_root: Path,
     fmri_root: Path,
@@ -307,12 +368,7 @@ def fixed_subject_keys(
     val_subjects: Iterable[int],
     test_subjects: Iterable[int],
 ) -> Tuple[Tuple[Tuple[str, str, str], ...], Tuple[Tuple[str, str, str], ...], Tuple[Tuple[str, str, str], ...]]:
-    """
-    Build (train_keys, val_keys, test_keys) using EXACT subject lists (no shuffling).
-    Each returned item is a tuple of (subject_str, task_token, run_str) triples, sorted deterministically.
-    """
-    inter_keys = collect_common_sr_keys(eeg_root, fmri_root)  # (sub, task, run)
-
+    inter_keys = collect_common_sr_keys(eeg_root, fmri_root)
     tr = {str(int(s)) for s in train_subjects}
     va = {str(int(s)) for s in val_subjects}
     te = {str(int(s)) for s in test_subjects}
@@ -335,157 +391,195 @@ def fixed_subject_keys(
 
     return train_keys, val_keys, test_keys
 
+# =============================
+# Window-level paired cache
+# =============================
+def _paired_cache_dir(base: Path) -> Path:
+    p = base / "paired"
+    _safe_mkdirs(p)
+    return p
 
-# -----------------------------
+def _paired_signature(
+    *,
+    eeg_root: Path,
+    fmri_root: Path,
+    a424_label_nii: Path,
+    include_sr_keys: Tuple[Tuple[str, str, str], ...],
+    window_sec: int,
+    stride_sec: int,
+    original_fs: int,
+    target_fs: int,
+    tr: float,
+    channels_limit: int,
+    fmri_norm: str,
+) -> str:
+    parts = [
+        CACHE_VERSION,
+        str(eeg_root.resolve()),
+        str(fmri_root.resolve()),
+        _file_sig(a424_label_nii),
+        f"w{window_sec}",
+        f"s{stride_sec}",
+        f"fs{original_fs}->{target_fs}",
+        f"tr{tr}",
+        f"ch{channels_limit}",
+        f"norm{fmri_norm}",
+    ]
+    # include file signatures for all included keys (robust invalidation)
+    for sub, task, run in include_sr_keys:
+        # attempt typical paths for deterministic signature
+        # (we’ll re-derive actual paths below anyway)
+        parts.append(f"{sub}-{task}-{run}")
+    return _hash_key(*parts)[:20]
+
+def _paired_cache_path(base: Path, sig: str) -> Path:
+    return _paired_cache_dir(base) / f"paired_{sig}.pkl"
+
+def _find_paths_for_keys(eeg_root: Path, fmri_root: Path, keys: Tuple[Tuple[str, str, str], ...]) -> List[Tuple[str, str, Path, Path]]:
+    eeg_files = find_eeg_files(eeg_root)
+    fmri_files = find_bold_files(fmri_root)
+    key_to_eeg: Dict[Tuple[str, str, str], Path] = {}
+    key_to_fmri: Dict[Tuple[str, str, str], Path] = {}
+
+    for p in eeg_files:
+        sub, task_raw, run = _parse_key_from_path(p)
+        if sub and run:
+            task = _canonical_task_token(task_raw, p)
+            if task:
+                key_to_eeg[(sub, task, run)] = p
+    for p in fmri_files:
+        sub, task_raw, run = _parse_key_from_path(p)
+        if sub and run:
+            task = _canonical_task_token(task_raw, p)
+            if task:
+                key_to_fmri[(sub, task, run)] = p
+
+    out: List[Tuple[str, str, Path, Path]] = []
+    for k in keys:
+        if k in key_to_eeg and k in key_to_fmri:
+            out.append((k[0], k[1], key_to_eeg[k], key_to_fmri[k]))
+    return out
+
+def _make_windows_for_pair(
+    eeg_ds: np.ndarray,
+    fmri_ts: np.ndarray,
+    *,
+    window_sec: int,
+    stride_sec: int,
+    target_fs: int,
+    tr: float,
+) -> List[Tuple[np.ndarray, np.ndarray]]:
+    eeg_duration = eeg_ds.shape[1] / float(target_fs)
+    fmri_duration = fmri_ts.shape[0] * float(tr)
+    max_duration = min(eeg_duration, fmri_duration)
+    max_start = max(0, int(max_duration) - int(window_sec))
+    windows: List[Tuple[np.ndarray, np.ndarray]] = []
+    for start_sec in range(0, max_start + 1, int(stride_sec)):
+        # EEG window
+        start_sample = int(start_sec * target_fs)
+        end_sample = start_sample + int(window_sec * target_fs)
+        eeg_window = eeg_ds[:, start_sample:end_sample]  # (C, W*fs)
+        if eeg_window.shape[1] != window_sec * target_fs:
+            continue
+        eeg_patches = eeg_window.reshape(eeg_window.shape[0], window_sec, target_fs)  # (C,P,S)
+
+        # fMRI window
+        start_vol = int(start_sec / tr)
+        end_vol = start_vol + int(window_sec / tr)
+        if end_vol > fmri_ts.shape[0]:
+            continue
+        fmri_window = fmri_ts[start_vol:end_vol, :]  # (T,V)
+
+        windows.append((eeg_patches, fmri_window))
+    return windows
+
+def build_paired_window_cache(
+    *,
+    eeg_root: Path,
+    fmri_root: Path,
+    a424_label_nii: Path,
+    include_sr_keys: Tuple[Tuple[str, str, str], ...],
+    window_sec: int,
+    stride_sec: Optional[int],
+    original_fs: int,
+    target_fs: int,
+    tr: float,
+    channels_limit: int,
+    fmri_norm: str,
+    cache_dir: Path,
+) -> Path:
+    stride = int(stride_sec) if stride_sec is not None else int(window_sec)
+    sig = _paired_signature(
+        eeg_root=eeg_root,
+        fmri_root=fmri_root,
+        a424_label_nii=a424_label_nii,
+        include_sr_keys=include_sr_keys,
+        window_sec=window_sec,
+        stride_sec=stride,
+        original_fs=original_fs,
+        target_fs=target_fs,
+        tr=tr,
+        channels_limit=channels_limit,
+        fmri_norm=fmri_norm,
+    )
+    out_path = _paired_cache_path(cache_dir, sig)
+    if out_path.exists():
+        return out_path
+
+    pairs = _find_paths_for_keys(eeg_root, fmri_root, include_sr_keys)
+    cached_list: List[Dict[str, Any]] = []
+    for sub, task, eeg_p, fmri_p in pairs:
+        # derive run from filenames
+        _, _, run = _parse_key_from_path(eeg_p)
+        # Load cached per-file arrays
+        eeg_ds = load_eeg_ds_cached(eeg_p, original_fs=original_fs, target_fs=target_fs, channels_limit=channels_limit, cache_dir=cache_dir)
+        fmri_ts = load_fmri_parcels_cached(fmri_p, str(a424_label_nii), cache_dir=cache_dir)
+        # Enumerate windows
+        windows = _make_windows_for_pair(
+            eeg_ds, fmri_ts,
+            window_sec=window_sec, stride_sec=stride, target_fs=target_fs, tr=tr,
+        )
+        for idx_win, (eeg_patch, fmri_win) in enumerate(windows):
+            # Normalize as in your pipeline
+            eeg_t = torch.from_numpy(eeg_patch).unsqueeze(0).float()
+            eeg_t = zscore_eeg_channelwise(eeg_t).squeeze(0)          # (C,P,S)
+            fmri_t = torch.from_numpy(fmri_win).unsqueeze(0).float()
+            fmri_t = normalize_fmri_time_series(fmri_t, mode=fmri_norm).squeeze(0)  # (T,V)
+            cached_list.append({
+                "eeg_window": eeg_t.numpy(),
+                "fmri_window": fmri_t.numpy(),
+                "meta": {
+                    "subject": sub, "task": task, "run": run or "",
+                    "eeg_path": str(eeg_p), "fmri_path": str(fmri_p),
+                    "window_idx": idx_win,
+                    "window_sec": window_sec, "stride_sec": stride,
+                }
+            })
+    _safe_mkdirs(_paired_cache_dir(cache_dir))
+    with open(out_path, "wb") as f:
+        pickle.dump(cached_list, f)
+    return out_path
+
+def load_paired_window_cache(path: Path) -> List[Dict[str, Any]]:
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+# =============================
 # Datasets
-# -----------------------------
-class EEGWindowsDataset(Dataset):
-    def __init__(
-        self,
-        eeg_mat_files: List[Path],
-        original_fs: int,
-        target_fs: int,
-        window_sec: int,
-        channels_limit: int = 34,
-        device: str = 'cpu',
-    ) -> None:
-        self.eeg_mat_files = eeg_mat_files
-        self.original_fs = original_fs
-        self.target_fs = target_fs
-        self.window_sec = window_sec
-        self.channels_limit = channels_limit
-        self.device = torch.device(device)
-        self.index: List[Tuple[int, int, int]] = []
-
-        # Deterministic enumeration of windows by file order and start_patch
-        for i, fpath in enumerate(self.eeg_mat_files):
-            try:
-                mat = sio.loadmat(str(fpath))
-                eeg_key = None
-                for key in ['data_reref', 'eeg', 'data', 'EEG', 'eegdata']:
-                    if key in mat:
-                        eeg_key = key
-                        break
-                if eeg_key is None:
-                    continue
-                data = mat[eeg_key]
-                if data.shape[0] > data.shape[1]:
-                    data = data.T
-                ds = downsample_eeg(data, self.original_fs, self.target_fs)
-                if ds.shape[0] > channels_limit:
-                    ds = ds[:channels_limit]
-                patches, num_patches = patchify_eeg(ds, patch_size=self.target_fs)
-                window_patches = window_sec
-                for start_patch in range(0, max(1, num_patches - window_patches + 1)):
-                    self.index.append((i, start_patch, window_patches))
-            except Exception:
-                continue
-
-    def __len__(self) -> int:
-        return len(self.index)
-
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        file_idx, start_patch, window_patches = self.index[idx]
-        fpath = self.eeg_mat_files[file_idx]
-        mat = sio.loadmat(str(fpath))
-        eeg_key = None
-        for key in ['data_reref', 'eeg', 'data', 'EEG', 'eegdata']:
-            if key in mat:
-                eeg_key = key
-                break
-        data = mat[eeg_key]
-        if data.shape[0] > data.shape[1]:
-            data = data.T
-        ds = downsample_eeg(data, self.original_fs, self.target_fs)
-        if ds.shape[0] > self.channels_limit:
-            ds = ds[:self.channels_limit]
-        patches, _ = patchify_eeg(ds, patch_size=self.target_fs)
-        window = patches[:, start_patch:start_patch + window_patches, :].copy()
-        x = torch.from_numpy(window).unsqueeze(0).float().to(self.device)  # (1,C,P,S)
-        x = zscore_eeg_channelwise(x).squeeze(0).cpu()
-        return {
-            'eeg_window': x,  # (C,P,S)
-            'meta_file': str(fpath),
-            'meta_start_patch': start_patch,
-        }
-
-
-class FMRIDataset(Dataset):
-    def __init__(
-        self,
-        bold_files: List[Path],
-        a424_label_nii: Path,
-        window_sec: int,
-        tr: float = 2.0,
-        fmri_norm: str = 'zscore',
-    ) -> None:
-        self.bold_files = bold_files
-        self.a424_label_nii = a424_label_nii
-        self.window_sec = window_sec
-        self.tr = tr
-        self.fmri_norm = fmri_norm
-        self.index: List[Tuple[int, int, int]] = []
-        # Deterministic enumeration by file order and start_t
-        for i, bpath in enumerate(self.bold_files):
-            try:
-                parcel_ts, _, _, _ = extract_a424_from_native(str(bpath), str(a424_label_nii))
-                T = parcel_ts.shape[0]
-                window_T = int(round(window_sec / tr))
-                if T < window_T:
-                    continue
-                for start_t in range(0, T - window_T + 1, window_T):
-                    self.index.append((i, start_t, window_T))
-            except Exception:
-                continue
-
-    def __len__(self) -> int:
-        return len(self.index)
-
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        file_idx, start_t, window_T = self.index[idx]
-        bpath = self.bold_files[file_idx]
-        parcel_ts, _, _, _ = extract_a424_from_native(str(bpath), str(self.a424_label_nii))
-        window = parcel_ts[start_t:start_t + window_T, :].astype(np.float32)  # (T,V)
-        fmri_t = torch.from_numpy(window)  # (T,V)
-        fmri_t = normalize_fmri_time_series(fmri_t.unsqueeze(0), mode=self.fmri_norm).squeeze(0)
-        return {
-            'fmri_window': fmri_t,
-            'meta_file': str(bpath),
-            'meta_start_t': start_t,
-        }
-
-
-# -----------------------------
-# Collate functions
-# -----------------------------
-def collate_eeg(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-    eeg_windows = torch.stack([b['eeg_window'] for b in batch], dim=0)
-    return {'eeg_window': eeg_windows}
-
-
-def collate_fmri(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-    fmri_windows = torch.stack([b['fmri_window'] for b in batch], dim=0)
-    return {'fmri_window': fmri_windows}
-
-
-# -----------------------------
-# Paired EEG–fMRI alignment (same subject/task/run/time)
-# -----------------------------
+# =============================
 class PairedAlignedDataset(Dataset):
     """
-    Builds aligned EEG–fMRI windows for the SAME subject, task, run and time interval.
+    Builds aligned EEG–fMRI windows for the SAME subject, task, run and time interval,
+    now with AUTOMATIC paired-window caching (NatView-style).
 
-    Optional filtering:
-      - include_sr_keys: explicit tuple of (subject, task, run) triples to include
-      - include_subjects: explicit list/iterable of subjects to include
-    Both options are deterministic and perform no shuffling.
+    If a cache exists for the exact configuration + included keys, it is used.
+    Otherwise, the cache is built once and then reused on subsequent runs.
 
-    Each item returns:
+    Returns items:
       - eeg_window: (C, P=window_sec, S=target_fs)  [z-scored per channel]
-      - fmri_window: (T=round(window_sec/TR), V)    [z-scored per voxel]
-      - meta dict: subject, task, run, start_sec, paths
+      - fmri_window: (T=round(window_sec/TR), V)    [normalized per voxel by fmri_norm]
+      - meta dict: subject, task, run, window_idx, paths
     """
-
     def __init__(
         self,
         eeg_root: Path,
@@ -502,123 +596,75 @@ class PairedAlignedDataset(Dataset):
         include_sr_keys: Optional[Tuple[Tuple[str, str, str], ...]] = None,
         include_subjects: Optional[Iterable[int]] = None,
     ) -> None:
-        self.eeg_root = eeg_root
-        self.fmri_root = fmri_root
-        self.a424_label_nii = a424_label_nii
+        self.eeg_root = Path(eeg_root)
+        self.fmri_root = Path(fmri_root)
+        self.a424_label_nii = Path(a424_label_nii)
         self.window_sec = int(window_sec)
-        self.original_fs = original_fs
-        self.target_fs = target_fs
-        self.tr = tr
-        self.channels_limit = channels_limit
-        self.fmri_norm = fmri_norm
+        self.original_fs = int(original_fs)
+        self.target_fs = int(target_fs)
+        self.tr = float(tr)
+        self.channels_limit = int(channels_limit)
+        self.fmri_norm = str(fmri_norm)
         self.stride_sec = int(stride_sec) if stride_sec is not None else int(window_sec)
         self.device = torch.device(device)
+        self.cache_dir = _default_cache_dir()
+        _safe_mkdirs(self.cache_dir)
 
-        eeg_files = find_eeg_files(eeg_root)
-        fmri_files = find_bold_files(fmri_root)
-
-        # Build maps by (sub, task, run)
-        key_to_eeg: Dict[Tuple[str, str, str], Path] = {}
-        key_to_fmri: Dict[Tuple[str, str, str], Path] = {}
-        for p in eeg_files:
-            sub, task_raw, run = _parse_key_from_path(p)
-            if sub and run:
-                task = _canonical_task_token(task_raw, p)
-                if task:
-                    key_to_eeg[(sub, task, run)] = p
-        for p in fmri_files:
-            sub, task_raw, run = _parse_key_from_path(p)
-            if sub and run:
-                task = _canonical_task_token(task_raw, p)
-                if task:
-                    key_to_fmri[(sub, task, run)] = p
-
-        inter_all = set(key_to_eeg.keys()) & set(key_to_fmri.keys())
-
-        # --- Fixed subject intake (no shuffling) ---
-        subj_whitelist: Optional[Set[str]] = None
-        if include_subjects is not None:
-            subj_whitelist = {str(int(s)) for s in include_subjects}
-
-        # Deterministic order by (subject_int, task_token, run_int)
-        def _key_sort(k: Tuple[str, str, str]) -> Tuple[int, str, int]:
-            return (int(k[0]), str(k[1]), int(k[2]))
-
+        # Determine included keys deterministically
+        all_keys = collect_common_sr_keys(self.eeg_root, self.fmri_root)  # [(sub,task,run), ...]
         if include_sr_keys is not None:
-            include_set = set(include_sr_keys)
-            inter_keys = sorted([k for k in inter_all if k in include_set], key=_key_sort)
+            inc = set(include_sr_keys)
+            keys = tuple(sorted([k for k in all_keys if k in inc], key=lambda t: (int(t[0]), t[1], int(t[2]))))
+        elif include_subjects is not None:
+            subj_whitelist = {str(int(s)) for s in include_subjects}
+            keys = tuple(sorted([k for k in all_keys if k[0] in subj_whitelist], key=lambda t: (int(t[0]), t[1], int(t[2]))))
         else:
-            if subj_whitelist is not None:
-                inter_keys = sorted([k for k in inter_all if k[0] in subj_whitelist], key=_key_sort)
-            else:
-                inter_keys = sorted(list(inter_all), key=_key_sort)
+            keys = tuple(all_keys)
 
-        # Enumerate windows in increasing time, deterministically
-        self.index: List[Tuple[Tuple[str, str, str], Path, Path, int]] = []
-        for key in inter_keys:
-            eeg_p = key_to_eeg[key]
-            fmri_p = key_to_fmri[key]
-            dur_eeg = _duration_eeg_seconds(eeg_p, original_fs)
-            dur_fmri = _duration_fmri_seconds(fmri_p, tr)
-            max_start = int(max(0, min(dur_eeg, dur_fmri) - window_sec))
-            for start_sec in range(0, max_start + 1, self.stride_sec):
-                self.index.append((key, eeg_p, fmri_p, start_sec))
-
-        if len(self.index) == 0:
-            print("[PairedAlignedDataset] No intersections.")
-            print("[PairedAlignedDataset] Example EEG keys (sub,task,run):", list(key_to_eeg.keys())[:5])
-            print("[PairedAlignedDataset] Example fMRI keys (sub,task,run):", list(key_to_fmri.keys())[:5])
+        # Build or load paired-window cache for this exact configuration
+        sig = _paired_signature(
+            eeg_root=self.eeg_root,
+            fmri_root=self.fmri_root,
+            a424_label_nii=self.a424_label_nii,
+            include_sr_keys=keys,
+            window_sec=self.window_sec,
+            stride_sec=self.stride_sec,
+            original_fs=self.original_fs,
+            target_fs=self.target_fs,
+            tr=self.tr,
+            channels_limit=self.channels_limit,
+            fmri_norm=self.fmri_norm,
+        )
+        cache_path = _paired_cache_path(self.cache_dir, sig)
+        if not cache_path.exists():
+            cache_path = build_paired_window_cache(
+                eeg_root=self.eeg_root,
+                fmri_root=self.fmri_root,
+                a424_label_nii=self.a424_label_nii,
+                include_sr_keys=keys,
+                window_sec=self.window_sec,
+                stride_sec=self.stride_sec,
+                original_fs=self.original_fs,
+                target_fs=self.target_fs,
+                tr=self.tr,
+                channels_limit=self.channels_limit,
+                fmri_norm=self.fmri_norm,
+                cache_dir=self.cache_dir,
+            )
+        self._cached_list = load_paired_window_cache(cache_path)
 
     def __len__(self) -> int:
-        return len(self.index)
+        return len(self._cached_list)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        (sub, task, run), eeg_path, fmri_path, start_sec = self.index[idx]
-
-        # EEG load -> downsample -> patchify -> slice aligned window
-        mat = sio.loadmat(str(eeg_path))
-        for key in ['data_reref', 'eeg', 'data', 'EEG', 'eegdata']:
-            if key in mat:
-                eeg_arr = mat[key]
-                break
-        else:
-            raise KeyError(f"No EEG array in {eeg_path}")
-        if eeg_arr.shape[0] > eeg_arr.shape[1]:
-            eeg_arr = eeg_arr.T
-        eeg_ds = downsample_eeg(eeg_arr, self.original_fs, self.target_fs)
-        if eeg_ds.shape[0] > self.channels_limit:
-            eeg_ds = eeg_ds[:self.channels_limit]
-        start_patch = int(round(start_sec))
-        end_patch = start_patch + self.window_sec
-        total_patches = eeg_ds.shape[1] // self.target_fs
-        if end_patch > total_patches:
-            start_patch = max(0, total_patches - self.window_sec)
-            end_patch = start_patch + self.window_sec
-        eeg_window = eeg_ds[:, start_patch * self.target_fs:end_patch * self.target_fs]
-        eeg_patches = eeg_window.reshape(eeg_window.shape[0], self.window_sec, self.target_fs)
-        x_eeg = torch.from_numpy(eeg_patches).unsqueeze(0).float().to(self.device)
-        x_eeg = zscore_eeg_channelwise(x_eeg).squeeze(0).cpu()  # (C,P,S)
-
-        # fMRI load -> A424 time series -> slice aligned window -> normalize
-        parcel_ts, _, _, _ = extract_a424_from_native(str(fmri_path), str(self.a424_label_nii))
-        start_vol = int(round(start_sec / self.tr))
-        win_T = int(round(self.window_sec / self.tr))
-        if start_vol + win_T > parcel_ts.shape[0]:
-            start_vol = max(0, parcel_ts.shape[0] - win_T)
-        fmri_window = parcel_ts[start_vol:start_vol + win_T, :].astype(np.float32)
-        x_fmri = torch.from_numpy(fmri_window)
-        x_fmri = normalize_fmri_time_series(x_fmri.unsqueeze(0), mode=self.fmri_norm).squeeze(0).cpu()
-
+        item = self._cached_list[idx]
+        eeg = torch.from_numpy(item["eeg_window"]).to(self.device)   # already z-scored (C,P,S)
+        fmri = torch.from_numpy(item["fmri_window"]).to(self.device) # already normalized (T,V)
         return {
-            'eeg_window': x_eeg,           # (C,P,S) z-scored per channel
-            'fmri_window': x_fmri,         # (T,V)   z-scored per voxel
-            'meta': {
-                'subject': sub, 'task': task, 'run': run,
-                'start_sec': start_sec,
-                'eeg_path': str(eeg_path), 'fmri_path': str(fmri_path),
-            }
+            "eeg_window": eeg,
+            "fmri_window": fmri,
+            "meta": item["meta"],
         }
-
 
 def collate_paired(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     eeg = torch.stack([b['eeg_window'] for b in batch], dim=0)
@@ -626,10 +672,9 @@ def collate_paired(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tens
     metas = [b['meta'] for b in batch]
     return {'eeg_window': eeg, 'fmri_window': fmri, 'meta': metas}
 
-
-# -----------------------------
-# Internal helpers for durations
-# -----------------------------
+# =============================
+# CLI sanity check & diagnostics
+# =============================
 def _duration_eeg_seconds(mat_path: Path, original_fs: int) -> float:
     mat = sio.loadmat(str(mat_path))
     for key in ['data_reref', 'eeg', 'data', 'EEG', 'eegdata']:
@@ -642,17 +687,109 @@ def _duration_eeg_seconds(mat_path: Path, original_fs: int) -> float:
         arr = arr.T
     return float(arr.shape[1]) / float(original_fs)
 
-
 def _duration_fmri_seconds(bold_path: Path, tr: float) -> float:
     img = nib.load(str(bold_path))
     shape = img.shape
     T = shape[-1] if len(shape) >= 4 else 0
     return float(T) * float(tr)
 
+def _summ(name: str, arr: np.ndarray):
+    try:
+        mn, mx = np.nanmin(arr), np.nanmax(arr)
+        mu, sd = np.nanmean(arr), np.nanstd(arr)
+        print(f"{name:20s} shape={arr.shape} min/max={mn:.4f}/{mx:.4f} mean/std={mu:.4f}/{sd:.4f}")
+    except Exception as e:
+        print(f"{name:20s} shape={arr.shape} (stats err: {e})")
 
-# -----------------------------
-# CLI sanity check
-# -----------------------------
+def diagnose_one_pair(
+    eeg_root: Path,
+    fmri_root: Path,
+    a424_label_nii: Path,
+    original_fs: int = 1000,
+    target_fs: int = 200,
+    tr: float = 2.0,
+    channels_limit: int = 34,
+    window_sec: int = 40,
+):
+    keys = collect_common_sr_keys(eeg_root, fmri_root)
+    if not keys:
+        print("No intersecting (subject, task, run) found.")
+        return
+    # find paths for first key
+    (sub, task, run) = keys[0]
+    eeg_p = None
+    fmri_p = None
+    for p in find_eeg_files(eeg_root):
+        s, t, r = _parse_key_from_path(p)
+        if (s, _canonical_task_token(t, p), r) == (sub, task, run):
+            eeg_p = p; break
+    for p in find_bold_files(fmri_root):
+        s, t, r = _parse_key_from_path(p)
+        if (s, _canonical_task_token(t, p), r) == (sub, task, run):
+            fmri_p = p; break
+    if eeg_p is None or fmri_p is None:
+        print("Could not resolve file paths for first key.")
+        return
+    print(f"[diagnostics] sub={sub} task={task} run={run}")
+    cache_dir = _default_cache_dir()
+
+    eeg_ds = load_eeg_ds_cached(eeg_p, original_fs=original_fs, target_fs=target_fs, channels_limit=channels_limit, cache_dir=cache_dir)
+    fmri_ts = load_fmri_parcels_cached(fmri_p, str(a424_label_nii), cache_dir=cache_dir)
+    _summ("EEG downsampled", eeg_ds)
+    _summ("fMRI parcels", fmri_ts)
+
+    # one window
+    start_sec = 0
+    start_samp = start_sec * target_fs
+    eeg_win = eeg_ds[:, start_samp:start_samp + window_sec * target_fs]
+    eeg_patch = eeg_win.reshape(eeg_ds.shape[0], window_sec, target_fs)
+    eeg_t = torch.from_numpy(eeg_patch).unsqueeze(0).float()
+    eeg_t = zscore_eeg_channelwise(eeg_t).squeeze(0).numpy()
+    _summ("EEG window (C,P,S)", eeg_t)
+
+    start_vol = int(start_sec / tr)
+    fmri_win = fmri_ts[start_vol:start_vol + int(window_sec / tr), :]
+    fmri_t = torch.from_numpy(fmri_win).unsqueeze(0).float()
+    fmri_t = normalize_fmri_time_series(fmri_t, mode='zscore').squeeze(0).numpy()
+    _summ("fMRI window (T,V)", fmri_t)
+
+def prewarm_cache(
+    *,
+    eeg_root: Path,
+    fmri_root: Path,
+    a424_label_nii: Path,
+    include_sr_keys: Tuple[Tuple[str, str, str], ...],
+    window_sec: int,
+    stride_sec: Optional[int],
+    original_fs: int = 1000,
+    target_fs: int = 200,
+    tr: float = 2.0,
+    channels_limit: int = 34,
+    fmri_norm: str = 'zscore',
+) -> Path:
+    """
+    Precompute paired-window cache for a given split (call once; then dataset loads instantly).
+    """
+    path = build_paired_window_cache(
+        eeg_root=Path(eeg_root),
+        fmri_root=Path(fmri_root),
+        a424_label_nii=Path(a424_label_nii),
+        include_sr_keys=include_sr_keys,
+        window_sec=int(window_sec),
+        stride_sec=int(stride_sec) if stride_sec is not None else None,
+        original_fs=int(original_fs),
+        target_fs=int(target_fs),
+        tr=float(tr),
+        channels_limit=int(channels_limit),
+        fmri_norm=str(fmri_norm),
+        cache_dir=_default_cache_dir(),
+    )
+    print(f"[prewarm_cache] built → {path}")
+    return path
+
+# =============================
+# Minimal CLI (unchanged args)
+# =============================
 def _normalize_subject_list(x) -> Optional[List[int]]:
     if x is None:
         return None
@@ -663,27 +800,52 @@ def _normalize_subject_list(x) -> Optional[List[int]]:
         return [int(s) for s in x]
     return None
 
-
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser(
-        description='Quick sanity check: load aligned EEG/fMRI and plot small sample '
-                    '(deterministic, fixed subjects optional; TASK-AWARE pairing).')
-    parser.add_argument('--eeg_root', type=str, required=True, help='Path to Oddball EEG root (e.g., Oddball/ds116_eeg)')
-    parser.add_argument('--fmri_root', type=str, required=True, help='Path to Oddball fMRI root (e.g., Oddball/ds000116)')
-    parser.add_argument('--a424_label_nii', type=str, required=True, help='Path to A424 atlas NIfTI in BOLD native space')
+        description="Sanity check + instant paired-window caching (automatic)."
+    )
+    parser.add_argument('--eeg_root', type=str, required=True)
+    parser.add_argument('--fmri_root', type=str, required=True)
+    parser.add_argument('--a424_label_nii', type=str, required=True)
     parser.add_argument('--window_sec', type=int, default=40)
     parser.add_argument('--original_fs', type=int, default=1000)
     parser.add_argument('--target_fs', type=int, default=200)
     parser.add_argument('--tr', type=float, default=2.0)
-    parser.add_argument('--fmri_norm', type=str, default='zscore', choices=['zscore','psc','mad','none'])
+    parser.add_argument('--fmri_norm', type=str, default='zscore', choices=['zscore', 'psc', 'mad', 'none'])
     parser.add_argument('--channels_limit', type=int, default=34)
     parser.add_argument('--stride_sec', type=int, default=None)
-    # Optional fixed subject filter for this sanity check
     parser.add_argument('--subjects', type=str, default=None,
-                        help='Comma/space-separated subject IDs to include (e.g. "1,2,5"). If omitted, uses all intersecting subjects.')
+                        help='Comma/space-separated subject IDs for quick demo split (optional).')
     args = parser.parse_args()
 
+    # Diagnostics on first pair (quick)
+    diagnose_one_pair(Path(args.eeg_root), Path(args.fmri_root), Path(args.a424_label_nii),
+                      original_fs=args.original_fs, target_fs=args.target_fs, tr=args.tr,
+                      channels_limit=args.channels_limit, window_sec=args.window_sec)
+
+    # Build a tiny demo dataset (auto-cache)
     subj_list = _normalize_subject_list(args.subjects)
+    if subj_list:
+        # build include keys from those subjects
+        all_keys = collect_common_sr_keys(Path(args.eeg_root), Path(args.fmri_root))
+        include = tuple([k for k in all_keys if int(k[0]) in set(subj_list)])
+    else:
+        include = tuple(collect_common_sr_keys(Path(args.eeg_root), Path(args.fmri_root))[:6])  # small demo
+
+    # Prewarm (optional; dataset would also build on first use)
+    prewarm_cache(
+        eeg_root=Path(args.eeg_root),
+        fmri_root=Path(args.fmri_root),
+        a424_label_nii=Path(args.a424_label_nii),
+        include_sr_keys=include,
+        window_sec=args.window_sec,
+        stride_sec=args.stride_sec if args.stride_sec is not None else args.window_sec,
+        original_fs=args.original_fs,
+        target_fs=args.target_fs,
+        tr=args.tr,
+        channels_limit=args.channels_limit,
+        fmri_norm=args.fmri_norm,
+    )
 
     ds = PairedAlignedDataset(
         eeg_root=Path(args.eeg_root),
@@ -697,60 +859,11 @@ def main() -> None:
         fmri_norm=args.fmri_norm,
         stride_sec=args.stride_sec,
         device='cpu',
-        include_subjects=subj_list,
+        include_sr_keys=include,
     )
+    print(f"[dataset] cached windows: {len(ds)}")
 
-    if len(ds) == 0:
-        print('No aligned samples found.')
-        keys = collect_common_sr_keys(Path(args.eeg_root), Path(args.fmri_root))
-        print('Intersecting (subject, task, run) keys found:', keys[:20])
-        return
-
-    sample = ds[0]
-    eeg = sample['eeg_window']  # normalized (C,P,S)
-    fmri = sample['fmri_window']  # normalized (T,V)
-    meta = sample['meta']
-    print("Sample meta:", meta)
-
-    # Show quick overlay of a few EEG channels and fMRI ROIs
-    num_eeg = min(10, eeg.shape[0])
-    num_fmri = min(10, fmri.shape[1])
-
-    # EEG time axis in seconds (show first 10 seconds)
-    eeg_total_pts = eeg.shape[1] * eeg.shape[2]
-    eeg_pts_10s = min(int(10 * args.target_fs), eeg_total_pts)
-    eeg_time = torch.arange(eeg_pts_10s).float() / float(args.target_fs)
-    eeg_series = eeg[:num_eeg].reshape(num_eeg, -1)[:, :eeg_pts_10s]
-
-    # fMRI time axis in seconds (show first 10 seconds)
-    fmri_pts_10s = min(int(round(10.0 / float(args.tr))), fmri.shape[0])
-    fmri_time = (torch.arange(fmri_pts_10s).float() * float(args.tr))
-    fmri_series = fmri[:fmri_pts_10s, :num_fmri].transpose(0, 1)  # (num_fmri, T10)
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5), constrained_layout=True)
-
-    for i in range(num_eeg):
-        axes[0].plot(eeg_time.numpy(), eeg_series[i].numpy(), label=f'ch{i+1}', linewidth=0.8)
-    axes[0].set_title(f'EEG (first {num_eeg} channels, z-score per channel)')
-    axes[0].set_xlabel('Time (s)')
-    axes[0].set_ylabel('Z-scored amplitude')
-    axes[0].grid(alpha=0.3)
-    if num_eeg <= 10:
-        axes[0].legend(loc='upper right', fontsize=8)
-
-    for i in range(num_fmri):
-        axes[1].plot(fmri_time.numpy(), fmri_series[i].numpy(), label=f'ROI{i+1}', linewidth=0.8)
-    axes[1].set_title(f'fMRI (first {num_fmri} ROIs, z-score per voxel)')
-    axes[1].set_xlabel('Time (s)')
-    axes[1].set_ylabel('Z-scored signal')
-    axes[1].grid(alpha=0.3)
-    if num_fmri <= 10:
-        axes[1].legend(loc='upper right', fontsize=8)
-
-    plt.show()
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
 
 # Example:
@@ -760,4 +873,4 @@ if __name__ == '__main__':
 #   --a424_label_nii D:\Neuroinformatics_research_2025\BrainLM\A424_resampled_to_bold.nii.gz \
 #   --window_sec 40 --original_fs 1000 --target_fs 200 --tr 2.0 \
 #   --fmri_norm zscore --channels_limit 34 --stride_sec 10 \
-#   --subjects "7 11 12 15 16"
+#   --subjects "7 11 12"
