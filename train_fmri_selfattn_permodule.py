@@ -239,7 +239,7 @@ class TranslatorFMRISelfAttn(nn.Module):
 
         # Tiny decoder to (B, T*V)
         T = int(round(cfg.window_sec/cfg.tr))
-        self.fmri_decoder = fMRIDecodingAdapterLite(target_T=T, target_V=cfg.fmri_voxels, d_model=cfg.d_model, rank=16)
+        self.fmri_decoder = fMRIDecodingAdapterLite(target_T=T, target_V=cfg.fmri_voxels, d_model=cfg.d_model, rank=32) 
 
         # Output affine (usually keep frozen until stage 3 if enabled)
         self.fmri_out_scale = nn.Parameter(torch.tensor(1.0))
