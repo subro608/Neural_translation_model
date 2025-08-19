@@ -9,25 +9,44 @@ train:
   out_dir: D:/Neuroinformatics_research_2025/Multi_modal_NTM/runs_fmri_selfattn
 
   # --- runtime ---
-  device: cuda            # use your GPU
+  device: cuda
   seed: 42
-  window_sec: 40          # matches your previous setup
+  window_sec: 40
   stride_sec: 10
   fmri_norm: zscore
   batch_size: 16
   num_workers: 0
-  amp: false              # set true to enable mixed precision on GPU
+  amp: false
 
-  # --- stage schedules (you run one stage at a time, but we keep the defaults here) ---
+  # --- stage schedules ---
   stage1_epochs: 50
   stage2_epochs: 100
   stage3_epochs: 50
-  lr1: 1e-4
-  lr2: 8e-5
-  lr3: 5e-5
-  weight_decay: 1e-4
+  lr1: 1.0e-4
+  lr2: 8.0e-5
+  lr3: 5.0e-5
+  weight_decay: 1.0e-4
 
-  # --- fixed subject splits (optional, keeps your previous split) ---
+  # --- fixed subject splits ---
   train_subjects: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
   val_subjects:   [16]
   test_subjects:  [17]
+
+  # --- debug knobs ---
+  debug: true
+  profile_first_n: 2
+  max_batches_per_epoch: 0
+  log_every: 25
+
+  # --- resume ---
+  auto_resume: true   # set to false or use --no_resume to disable
+
+  # --- W&B ---
+  wandb_mode: online           # online | offline | disabled
+  wandb_project: fmri-oddball
+  wandb_entity: your-team-or-user
+  wandb_run_name: null
+  wandb_group: fmri-selfattn
+  wandb_job_type: null         # defaults to "stage{stage}"
+  wandb_tags: ["oddball", "fmri-only", "self-attn"]
+  wandb_notes: "Stage-wise self-attn with per-module checkpoints and auto-resume"

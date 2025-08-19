@@ -3,29 +3,32 @@
 Stage-wise training (fMRI-only, self-attention; no cross-attn, no EEG path),
 run **one stage at a time** with train/test modes and per-module checkpoints.
 
-Now with DEBUG instrumentation:
+DEBUG + W&B + AUTO-RESUME:
   - --debug prints env, dataset sizes, shapes, memory, LR, etc.
   - --profile_first_n N profiles the first N batches with sub-step timers
   - --max_batches_per_epoch caps batches per epoch for quick sanity checks
   - tqdm progress bar with fetch/compute timings and loss
   - gradient norm & CUDA memory (allocated/reserved) every --log_every steps
+  - Optional Weights & Biases logging (epoch + per-batch) and model artifacts
+  - **Auto-resume**: if stage{X}_last modules (and optional trainstate) exist, training resumes automatically.
+    Disable with --no_resume or auto_resume:false in YAML.
 
 Usage examples:
   # Stage 1 train, then test on val:
   python train_fmri_selfattn_permodule.py --config <cfg.yaml> --stage 1 --mode train --debug --profile_first_n 2
   python train_fmri_selfattn_permodule.py --config <cfg.yaml> --stage 1 --mode test --eval_split val
 
-  # Stage 2 (warm-starts from Stage 1 best):
+  # Stage 2 (warm-starts from Stage 1 best unless resuming last):
   python train_fmri_selfattn_permodule.py --config <cfg.yaml> --stage 2 --mode train
   python train_fmri_selfattn_permodule.py --config <cfg.yaml> --stage 2 --mode test --eval_split test
 
-  # Stage 3 (warm-starts from Stage 2 best):
+  # Stage 3 (warm-starts from Stage 2 best unless resuming last):
   python train_fmri_selfattn_permodule.py --config <cfg.yaml> --stage 3 --mode train --train_affine_stage3
   python train_fmri_selfattn_permodule.py --config <cfg.yaml> --stage 3 --mode test --eval_split test
 """
 
 from __future__ import annotations
-import os, json, math, argparse, time, platform
+import os, json, math, argparse, time, platform, sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Iterable, List, Dict, Any, Tuple
@@ -35,6 +38,17 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+try:
+    from tqdm import tqdm  # progress bar
+except Exception:
+    tqdm = None
+
+# --- Weights & Biases (optional) ---
+try:
+    import wandb
+except Exception:
+    wandb = None
+
 # -----------------------------
 # Repo paths
 # -----------------------------
@@ -43,7 +57,6 @@ REPO_ROOT = THIS_DIR.parent
 CBRAMOD_DIR = REPO_ROOT / "CBraMod"
 BRAINLM_DIR = REPO_ROOT / "BrainLM"  # may or may not exist depending on your layout
 
-import sys
 # Always include the script dir
 sys.path.insert(0, str(THIS_DIR))
 # Try common locations for CBraMod
@@ -52,7 +65,7 @@ sys.path.insert(0, str(THIS_DIR / "CBraMod"))
 # Try common locations for BrainLM (robust across layouts)
 candidate_blm_roots = [
     BRAINLM_DIR,                 # <repo-root>/BrainLM
-    THIS_DIR / "BrainLM",        # <this-script-dir>/BrainLM  (your current layout)
+    THIS_DIR / "BrainLM",        # <this-script-dir>/BrainLM
     Path(os.environ.get("BRAINLM_DIR", "")),
     Path(os.environ.get("BRAINLM_DIR", "")) / "brainlm_mae",
 ]
@@ -60,19 +73,12 @@ for p in candidate_blm_roots:
     if not p:
         continue
     p = Path(p)
-    # If we were given the package dir itself, add its parent;
-    # if we were given the BrainLM repo root, add that.
     if (p / "brainlm_mae").is_dir():
         sys.path.insert(0, str(p))
         break
     if p.name == "brainlm_mae" and p.is_dir():
         sys.path.insert(0, str(p.parent))
         break
-
-try:
-    from tqdm import tqdm  # progress bar
-except Exception:
-    tqdm = None
 
 # -----------------------------
 # Local modules
@@ -83,7 +89,7 @@ from module import (  # type: ignore
     fMRIDecodingAdapterLite,
 )
 
-# BrainLM imports (now robust thanks to path setup above)
+# BrainLM imports
 from brainlm_mae.modeling_brainlm import BrainLMForPretraining  # type: ignore
 from brainlm_mae.configuration_brainlm import BrainLMConfig     # type: ignore
 
@@ -156,6 +162,20 @@ class TrainCfg:
     profile_first_n: int = 0     # profile first N batches in each epoch
     max_batches_per_epoch: int = 0  # 0=all
     log_every: int = 10
+
+    # resume
+    auto_resume: bool = True
+
+    # --- Weights & Biases (from config or CLI) ---
+    wandb_project: Optional[str] = None
+    wandb_entity: Optional[str] = None
+    wandb_run_name: Optional[str] = None
+    wandb_group: Optional[str] = None
+    wandb_job_type: Optional[str] = None
+    wandb_tags: Optional[List[str]] = None
+    wandb_notes: Optional[str] = None
+    # "online" | "offline" | "disabled"
+    wandb_mode: str = "online"
 
 # -----------------------------
 # Frozen BrainLM
@@ -293,6 +313,7 @@ def save_modules(out_dir: Path, model: TranslatorFMRISelfAttn, tag: str):
     torch.save({"scale": model.fmri_out_scale.detach().cpu(),
                 "bias":  model.fmri_out_bias.detach().cpu()}, paths["affine"])
     print(f"[save] modules -> {', '.join(p.name for p in paths.values())}")
+    return paths  # return for W&B artifact logging
 
 def load_modules_if_exist(out_dir: Path, model: TranslatorFMRISelfAttn, tag: str,
                           which: Optional[Iterable[str]] = None, device: Optional[torch.device] = None):
@@ -318,6 +339,54 @@ def load_modules_if_exist(out_dir: Path, model: TranslatorFMRISelfAttn, tag: str
     if loaded:
         print(f"[load] modules restored for tag '{tag}': {', '.join(loaded)}")
     return loaded
+
+# -----------------------------
+# Trainstate save/load (optimizer, scaler, epoch, best)
+# -----------------------------
+def _trainstate_path(out_dir: Path, stage: int, tag: str) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir / f"trainstate_stage{stage}_{tag}.pt"
+
+def save_trainstate(out_dir: Path, stage: int, tag: str, epoch: int, best_val: float,
+                    opt: Optional[torch.optim.Optimizer], scaler: Optional[torch.amp.GradScaler]) -> Path:
+    state = {
+        "epoch": int(epoch),
+        "best_val": float(best_val),
+        "optimizer_state": (opt.state_dict() if opt is not None else None),
+        "scaler_state": (scaler.state_dict() if scaler is not None else None),
+        "timestamp": time.time(),
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda if torch.cuda.is_available() else None,
+    }
+    p = _trainstate_path(out_dir, stage, tag)
+    torch.save(state, p)
+    return p
+
+def load_trainstate_if_exist(out_dir: Path, stage: int, tag: str,
+                             opt: Optional[torch.optim.Optimizer],
+                             scaler: Optional[torch.amp.GradScaler],
+                             device: torch.device) -> Tuple[int, float, bool]:
+    """
+    Returns: (start_epoch, best_val, loaded)
+    """
+    p = _trainstate_path(out_dir, stage, tag)
+    if not p.exists():
+        return 1, float('inf'), False
+    try:
+        sd = torch.load(p, map_location=device)
+        if opt is not None and sd.get("optimizer_state") is not None:
+            try: opt.load_state_dict(sd["optimizer_state"])
+            except Exception as e: print(f"[resume] WARN optimizer state: {e}")
+        if scaler is not None and sd.get("scaler_state") is not None:
+            try: scaler.load_state_dict(sd["scaler_state"])
+            except Exception as e: print(f"[resume] WARN scaler state: {e}")
+        last_epoch = int(sd.get("epoch", 0))
+        best_val = float(sd.get("best_val", float('inf')))
+        print(f"[resume] Loaded trainstate from {p.name}: epoch={last_epoch}, best_val={best_val:.6f}")
+        return max(1, last_epoch + 1), best_val, True
+    except Exception as e:
+        print(f"[resume] WARN failed to load trainstate: {e}")
+        return 1, float('inf'), False
 
 # -----------------------------
 # Data & helpers
@@ -456,7 +525,6 @@ def run_epoch(mode:str, dl, model, brainlm, xyz_ref, cfg:TrainCfg, device, scale
         t_tot = time.time() - t0
         if cfg.debug:
             if bidx < max(1, cfg.profile_first_n):
-                # detailed first-N profile
                 mem = fmt_mem()
                 print(
                     f"[{mode}] b{bidx:04d} "
@@ -472,6 +540,22 @@ def run_epoch(mode:str, dl, model, brainlm, xyz_ref, cfg:TrainCfg, device, scale
                     iterator.set_postfix_str(f"loss={loss_val:.4f} fetch={t_fetch:.2f}s fwd={t_fwd:.2f}s {mem}")
                 else:
                     print(f"[{mode}] b{bidx+1}/{len(dl)} loss={loss_val:.5f} fetch={t_fetch:.3f}s fwd={t_fwd:.3f}s gnorm={gnorm:.2f} lr={lr:.2e} {mem}")
+
+        # Optional per-batch W&B logs (train only)
+        if cfg.debug and (wandb is not None) and (cfg.wandb_mode != "disabled") and is_train:
+            if ((bidx + 1) % max(1, cfg.log_every)) == 0:
+                alloc = torch.cuda.memory_allocated()/(1024**2) if torch.cuda.is_available() else 0.0
+                reserv = torch.cuda.memory_reserved()/(1024**2) if torch.cuda.is_available() else 0.0
+                wandb.log({
+                    "batch/loss": loss_val,
+                    "batch/fetch_s": t_fetch,
+                    "batch/fwd_s": t_fwd,
+                    "batch/bwd_s": t_bwd,
+                    "batch/step_s": t_step,
+                    "batch/total_s": t_tot,
+                    "cuda/alloc_mb": alloc,
+                    "cuda/reserved_mb": reserv,
+                })
 
         prev_end = time.time()
 
@@ -525,8 +609,8 @@ def _apply_config_defaults(parser: argparse.ArgumentParser) -> Dict[str, Any]:
             for k in ("lr1","lr2","lr3"):
                 if k not in raw: raw[k] = float(raw["lr"])
 
-        # Normalize booleans/paths
-        for key in ("amp", "train_affine_stage3", "debug"):
+        # Normalize booleans
+        for key in ("amp", "train_affine_stage3", "debug", "auto_resume"):
             if key in raw: raw[key] = bool(raw[key])
 
         # Pass-through keys we support
@@ -536,6 +620,10 @@ def _apply_config_defaults(parser: argparse.ArgumentParser) -> Dict[str, Any]:
             "stage1_epochs","stage2_epochs","stage3_epochs","lr1","lr2","lr3","weight_decay",
             "fmri_norm","train_subjects","val_subjects","test_subjects","train_affine_stage3",
             "debug","profile_first_n","max_batches_per_epoch","log_every",
+            "auto_resume",
+            # --- W&B keys ---
+            "wandb_project","wandb_entity","wandb_run_name","wandb_group","wandb_job_type",
+            "wandb_tags","wandb_notes","wandb_mode",
         ]
         cfg_defaults = {k: raw[k] for k in pass_through_keys if k in raw}
         parser.set_defaults(**cfg_defaults)
@@ -545,7 +633,7 @@ def _apply_config_defaults(parser: argparse.ArgumentParser) -> Dict[str, Any]:
 # Main
 # -----------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Stage-wise fMRI-only (self-attn) training/testing (per-module checkpoints) + YAML/JSON config + DEBUG")
+    ap = argparse.ArgumentParser(description="Stage-wise fMRI-only (self-attn) training/testing (per-module checkpoints) + YAML/JSON config + DEBUG + W&B + Auto-Resume")
     ap.add_argument("--config", type=str, default=None, help="YAML/JSON config; if YAML has sections, uses 'train'")
     ap.add_argument("--eeg_root", type=str)
     ap.add_argument("--fmri_root", type=str)
@@ -585,6 +673,19 @@ def main():
     ap.add_argument("--max_batches_per_epoch", type=int, default=0, help="Cap number of batches per epoch (0 = all)")
     ap.add_argument("--log_every", type=int, default=10, help="Print mem/grad every N batches when debug")
 
+    # Resume
+    ap.add_argument("--no_resume", action="store_true", help="Disable auto-resume even if last checkpoints exist")
+
+    # --- W&B args (override config) ---
+    ap.add_argument("--wandb_project", type=str, default=None)
+    ap.add_argument("--wandb_entity", type=str, default=None)
+    ap.add_argument("--wandb_run_name", type=str, default=None)
+    ap.add_argument("--wandb_group", type=str, default=None)
+    ap.add_argument("--wandb_job_type", type=str, default=None)
+    ap.add_argument("--wandb_tags", type=str, nargs="*", default=None)
+    ap.add_argument("--wandb_notes", type=str, default=None)
+    ap.add_argument("--wandb_mode", type=str, default="online", choices=["online","offline","disabled"])
+
     # Apply config defaults if provided (CLI still overrides)
     _apply_config_defaults(ap)
     args = ap.parse_args()
@@ -618,6 +719,16 @@ def main():
         profile_first_n=int(args.profile_first_n),
         max_batches_per_epoch=int(args.max_batches_per_epoch),
         log_every=int(args.log_every),
+        auto_resume=not bool(args.no_resume),
+        # W&B
+        wandb_project=args.wandb_project,
+        wandb_entity=args.wandb_entity,
+        wandb_run_name=args.wandb_run_name,
+        wandb_group=args.wandb_group,
+        wandb_job_type=args.wandb_job_type,
+        wandb_tags=args.wandb_tags,
+        wandb_notes=args.wandb_notes,
+        wandb_mode=args.wandb_mode,
     )
 
     # Checks
@@ -645,7 +756,6 @@ def main():
             print(f"[debug] brainlm_mae -> {getattr(brainlm_mae, '__file__', '<pkg>')}")
         except Exception as e:
             print(f"[debug] brainlm_mae import check failed: {e}")
-        # and the front of sys.path (useful when debugging)
         print(f"[debug] sys.path[:5] = {sys.path[:5]}")
 
     # Data
@@ -657,27 +767,76 @@ def main():
     xyz_ref = cache_a424_xyz(device)
     scaler = torch.amp.GradScaler('cuda', enabled=(cfg.amp and device.type=='cuda'))
 
-    # ---------- Warm-start policy per stage ----------
-    out_dir = Path(cfg.out_dir)
+    # ---------- Stage + Mode ----------
     stage = int(args.stage)
     mode = str(args.mode)
 
-    if mode == "train":
-        if stage == 1:
+    # ---------- W&B init ----------
+    def _wandb_enabled() -> bool:
+        return (wandb is not None) and (cfg.wandb_mode != "disabled")
+
+    run = None
+    if _wandb_enabled():
+        run_name = cfg.wandb_run_name or f"fmri-selfattn-s{stage}-{mode}"
+        tags = (cfg.wandb_tags or []) + [f"stage:{stage}", f"mode:{mode}"]
+        run = wandb.init(
+            project=cfg.wandb_project,
+            entity=cfg.wandb_entity,
+            name=run_name,
+            group=cfg.wandb_group,
+            job_type=cfg.wandb_job_type or f"stage{stage}",
+            notes=cfg.wandb_notes,
+            tags=tags,
+            mode=("disabled" if cfg.wandb_mode == "disabled" else cfg.wandb_mode),
+            config={**vars(cfg), "stage": stage, "mode": mode},
+        )
+        try:
+            wandb.watch(translator, log="gradients", log_freq=max(1, cfg.log_every))
+        except Exception:
             pass
-        elif stage == 2:
-            load_modules_if_exist(out_dir, translator, tag="stage1_best", which=["adapter"], device=device)
-        elif stage == 3:
-            load_modules_if_exist(out_dir, translator, tag="stage2_best", which=["adapter","encoder"], device=device)
+
+    # For per-batch stage logging without changing signatures
+    os.environ["STAGE_ENV"] = str(stage)
+
+    # ---------- Warm-start / Resume policy per stage ----------
+    out_dir = Path(cfg.out_dir)
+
+    # Helper to check if any stageX_last module exists
+    def _any_last_modules_exist(s: int) -> bool:
+        tag = f"stage{s}_last"
+        paths = _module_paths(out_dir, tag)
+        return any(p.exists() for p in paths.values())
+
+    start_epoch = 1
+    best = float('inf')
+    resumed = False
+
+    if mode == "train" and cfg.auto_resume and _any_last_modules_exist(stage):
+        print(f"[resume] Detected existing stage{stage}_last modules. Resuming training...")
+        load_modules_if_exist(out_dir, translator, tag=f"stage{stage}_last",
+                              which=["adapter","encoder","decoder","affine"], device=device)
+        # Create a temp optimizer to load state; we'll replace later with actual lr
+        tmp_opt = torch.optim.AdamW([p for p in translator.parameters() if p.requires_grad], lr=1e-8)
+        start_epoch, best, _ = load_trainstate_if_exist(out_dir, stage, tag="last",
+                                                        opt=tmp_opt, scaler=scaler, device=device)
+        resumed = True
     else:
-        # test mode
-        default_tag = f"stage{stage}_best"
-        tag = args.load_tag or default_tag
-        need = ["adapter"] if stage == 1 else (["adapter","encoder"] if stage == 2 else ["adapter","encoder","decoder","affine"])
-        loaded = load_modules_if_exist(out_dir, translator, tag=tag, which=need, device=device)
-        missing = set(need) - set([n.split("_")[0] for n in loaded])
-        if missing:
-            print(f"[WARN] Some modules for '{tag}' were not found: {sorted(missing)}")
+        # Standard warm-start from previous stage's best (if training) or load requested tag in test mode
+        if mode == "train":
+            if stage == 1:
+                pass
+            elif stage == 2:
+                load_modules_if_exist(out_dir, translator, tag="stage1_best", which=["adapter"], device=device)
+            elif stage == 3:
+                load_modules_if_exist(out_dir, translator, tag="stage2_best", which=["adapter","encoder"], device=device)
+        else:
+            default_tag = f"stage{stage}_best"
+            tag = args.load_tag or default_tag
+            need = ["adapter"] if stage == 1 else (["adapter","encoder"] if stage == 2 else ["adapter","encoder","decoder","affine"])
+            loaded = load_modules_if_exist(out_dir, translator, tag=tag, which=need, device=device)
+            missing = set(need) - set([n.split("_")[0] for n in loaded])
+            if missing:
+                print(f"[WARN] Some modules for '{tag}' were not found: {sorted(missing)}")
 
     # ---------- Set trainable modules ----------
     set_stage(translator, stage, train_affine_stage3=cfg.train_fmri_affine_stage3)
@@ -695,26 +854,89 @@ def main():
             epochs, lr = cfg.stage3_epochs, cfg.lr_stage3
 
         opt = torch.optim.AdamW([p for p in translator.parameters() if p.requires_grad], lr=lr, weight_decay=cfg.weight_decay)
-        best = float('inf')
 
-        for ep in range(1, epochs+1):
+        # If we resumed and had optimizer state, reload it into the new optimizer (matching param groups)
+        if resumed:
+            _, _, loaded_state = load_trainstate_if_exist(out_dir, stage, tag="last", opt=opt, scaler=scaler, device=device)
+            # loaded_state bool tells if file existed; we already printed details above
+
+        if start_epoch > epochs:
+            print(f"[resume] start_epoch ({start_epoch}) > total epochs ({epochs}); nothing to do.")
+            if run is not None:
+                wandb.log({"resume/nothing_to_do": 1, "stage": stage})
+            if run is not None:
+                try: run.finish()
+                except Exception: pass
+            return
+
+        for ep in range(start_epoch, epochs+1):
             t_ep0 = time.time()
             tr = run_epoch("train", dl_train, translator, brainlm, xyz_ref, cfg, device, scaler, opt)
-            va = run_epoch("val", dl_val, translator, brainlm, xyz_ref, cfg, device, scaler, opt=None)
+            va = run_epoch("val",   dl_val,   translator, brainlm, xyz_ref, cfg, device, scaler, opt=None)
             t_ep = time.time() - t_ep0
             print(f"[Stage{stage}][{ep}/{epochs}] train={tr:.6f} val={va:.6f} | epoch_time={t_ep:.1f}s | lr={opt.param_groups[0]['lr']:.2e} | {fmt_mem()}")
-            save_modules(out_dir, translator, tag=f"stage{stage}_last")
+
+            # Epoch-level W&B logs
+            if run is not None:
+                alloc = torch.cuda.memory_allocated()/(1024**2) if torch.cuda.is_available() else 0.0
+                reserv = torch.cuda.memory_reserved()/(1024**2) if torch.cuda.is_available() else 0.0
+                wandb.log({
+                    "stage": stage, "epoch": ep,
+                    "train/loss": tr, "val/loss": va,
+                    "lr": float(opt.param_groups[0]['lr']),
+                    "time/epoch_s": t_ep,
+                    "cuda/alloc_mb": alloc,
+                    "cuda/reserved_mb": reserv,
+                    "resume/start_epoch": start_epoch if ep == start_epoch else None,
+                }, step=ep)
+
+            # always save "last"
+            last_paths = save_modules(out_dir, translator, tag=f"stage{stage}_last")
+            ts_last = save_trainstate(out_dir, stage, tag="last", epoch=ep, best_val=best, opt=opt, scaler=scaler)
+            if run is not None:
+                try:
+                    art_last = wandb.Artifact(f"fmri_selfattn_stage{stage}_last", type="model")
+                    for p in last_paths.values():
+                        art_last.add_file(str(p))
+                    art_last.add_file(str(ts_last))
+                    run.log_artifact(art_last)
+                except Exception:
+                    pass
+
+            # update "best"
             if va < best:
                 best = va
-                save_modules(out_dir, translator, tag=f"stage{stage}_best")
+                best_paths = save_modules(out_dir, translator, tag=f"stage{stage}_best")
+                ts_best = save_trainstate(out_dir, stage, tag="best", epoch=ep, best_val=best, opt=opt, scaler=scaler)
+                print(f"[Stage{stage}] ✅ new best {best:.6f}")
+                if run is not None:
+                    wandb.summary[f"stage{stage}/best_val"] = float(best)
+                    try:
+                        art_best = wandb.Artifact(f"fmri_selfattn_stage{stage}_best", type="model")
+                        for p in best_paths.values():
+                            art_best.add_file(str(p))
+                        art_best.add_file(str(ts_best))
+                        run.log_artifact(art_best)
+                    except Exception:
+                        pass
 
     else:  # test mode
         if args.eval_split == "test" and dl_test is not None:
             loss = run_epoch("test", dl_test, translator, brainlm, xyz_ref, cfg, device, scaler, opt=None)
             print(f"[TEST][stage {stage}] test_loss={loss:.6f}")
+            if run is not None:
+                wandb.log({"test/loss": float(loss), "stage": stage})
         else:
             loss = run_epoch("val", dl_val, translator, brainlm, xyz_ref, cfg, device, scaler, opt=None)
             print(f"[TEST][stage {stage}] val_loss={loss:.6f}")
+            if run is not None:
+                wandb.log({"val/loss": float(loss), "stage": stage})
+
+    if run is not None:
+        try:
+            run.finish()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
