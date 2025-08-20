@@ -1,0 +1,59 @@
+train:
+  # ---------- data / paths ----------
+  eeg_root: "../Oddball/ds116_eeg"
+  fmri_root: "../Oddball/ds000116"
+  a424_label_nii: "../MNI_templates/BrainLM/A424_resampled_to_bold.nii.gz"
+  brainlm_model_dir: "../MNI_templates/BrainLM/pretrained_models/2023-06-06-22_15_00-checkpoint-1400"
+  out_dir: "runs_fmri_selfattn_s1_huber_lr5e-5_full"
+
+  # ---------- runtime ----------
+  device: "cuda"
+  seed: 42
+  window_sec: 40
+  stride_sec: 10
+  batch_size: 16
+  num_workers: 0
+  fmri_norm: "zscore"
+  amp: false
+
+  # ---------- model ----------
+  d_model: 128
+  n_heads: 4
+  d_ff: 512
+  dropout: 0.1
+  fmri_voxels: 424
+
+  # ---------- training schedule ----------
+  stage1_epochs: 100
+  stage2_epochs: 100
+  stage3_epochs: 100
+  lr1: 5e-5      # ← winner
+  lr2: 5e-5
+  lr3: 5e-5
+  weight_decay: 1e-4
+
+  # ---------- loss ----------
+  loss_type: "huber"   # ← winner
+  huber_delta: 0.5
+  recon_loss_w: 1.0
+  corr_loss_w: 0.0
+  tv_loss_w: 0.0
+  charbonnier_eps: 1e-3
+
+  # ---------- logging / debug ----------
+  debug: true
+  log_every: 25
+  profile_first_n: 2
+  max_batches_per_epoch: 0
+
+  # ---------- resume / sweep ----------
+  auto_resume: false   # start clean
+  auto_sweep: false    # lock config; no sweep
+  sweep_epochs: 0
+  no_final_full: false
+
+  # ---------- W&B (optional) ----------
+  wandb_mode: "online"
+  wandb_project: "fmri-oddball-aug20"
+  wandb_group: "fmri-selfattn"
+  wandb_run_name: "s1-huber-lr5e-5-full"
