@@ -298,33 +298,35 @@ def freeze_all(m: nn.Module):
 
 def set_stage_rev(m: TranslatorFMRISelfAttn, stage: int, *, train_affine_stage3: bool = False):
     """
-    Reversed (decoder-first) stages:
+    Reversed (decoder-first) stages (affine ALWAYS trainable):
       - 1: decoder
       - 2: decoder + encoder
-      - 3: adapter + encoder + decoder (+ optional affine)
+      - 3: adapter + encoder + decoder
     """
+    # freeze everything first
     freeze_all(m)
+
     if stage == 1:
-        for n,p in m.named_parameters():
-            if n.startswith("fmri_decoder."): p.requires_grad = True
-        m.fmri_out_scale.requires_grad = False
-        m.fmri_out_bias.requires_grad  = False
+        for n, p in m.named_parameters():
+            if n.startswith("fmri_decoder."):
+                p.requires_grad = True
     elif stage == 2:
-        for n,p in m.named_parameters():
+        for n, p in m.named_parameters():
             if n.startswith("fmri_decoder.") or n.startswith("fmri_encoder."):
                 p.requires_grad = True
-        m.fmri_out_scale.requires_grad = False
-        m.fmri_out_bias.requires_grad  = False
     elif stage == 3:
-        for n,p in m.named_parameters():
-            if (n.startswith("adapter_fmri.")
-                or n.startswith("fmri_encoder.")
-                or n.startswith("fmri_decoder.")):
+        for n, p in m.named_parameters():
+            if (n.startswith("adapter_fmri.") or
+                n.startswith("fmri_encoder.") or
+                n.startswith("fmri_decoder.")):
                 p.requires_grad = True
-        m.fmri_out_scale.requires_grad = bool(train_affine_stage3)
-        m.fmri_out_bias.requires_grad  = bool(train_affine_stage3)
     else:
         raise ValueError(f"Unknown reversed stage {stage}")
+
+    # Affine params ALWAYS learnable (ignore train_affine_stage3)
+    m.fmri_out_scale.requires_grad = True
+    m.fmri_out_bias.requires_grad  = True
+
 
 # -----------------------------
 # Per-module save/load helpers
@@ -448,10 +450,15 @@ def make_dataloaders(cfg: TrainCfg, device: torch.device) -> Tuple[DataLoader, D
         if cfg.debug:
             print(f"[debug][dataset] {name}: samples={len(ds)} keys={len(keys)}")
         dl = DataLoader(
-            ds, batch_size=cfg.batch_size, shuffle=False,
-            num_workers=cfg.num_workers, pin_memory=(device.type=='cuda'),
-            collate_fn=collate_paired, drop_last=False
+            ds,
+            batch_size=cfg.batch_size,
+            shuffle=(name == "train"),        # ← shuffle only for train
+            num_workers=cfg.num_workers,
+            pin_memory=(device.type == 'cuda'),
+            collate_fn=collate_paired,
+            drop_last=False
         )
+
         if cfg.debug:
             print(f"[debug][dataloader] {name}: batches={len(dl)} (bs={cfg.batch_size}, workers={cfg.num_workers}, pin={device.type=='cuda'})")
         return dl

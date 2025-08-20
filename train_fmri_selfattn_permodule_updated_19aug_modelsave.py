@@ -325,24 +325,34 @@ def freeze_all(m: nn.Module):
     for p in m.parameters(): p.requires_grad = False
 
 def set_stage(m: TranslatorFMRISelfAttn, stage: int, *, train_affine_stage3: bool = False):
+    """
+    NOTE: affine params (fmri_out_scale/bias) are now ALWAYS trainable in every stage.
+    The 'train_affine_stage3' flag is kept for backward-compat but ignored.
+    """
     freeze_all(m)
+
     if stage == 1:
-        for n,p in m.named_parameters():
-            if n.startswith("adapter_fmri."): p.requires_grad = True
+        for n, p in m.named_parameters():
+            if n.startswith("adapter_fmri."):
+                p.requires_grad = True
+
     elif stage == 2:
-        for n,p in m.named_parameters():
+        for n, p in m.named_parameters():
             if n.startswith("adapter_fmri.") or n.startswith("fmri_encoder."):
                 p.requires_grad = True
+
     elif stage == 3:
-        for n,p in m.named_parameters():
+        for n, p in m.named_parameters():
             if (n.startswith("adapter_fmri.") or
                 n.startswith("fmri_encoder.") or
                 n.startswith("fmri_decoder.")):
                 p.requires_grad = True
-        m.fmri_out_scale.requires_grad = bool(train_affine_stage3)
-        m.fmri_out_bias.requires_grad  = bool(train_affine_stage3)
     else:
         raise ValueError(f"Unknown stage {stage}")
+
+    # NEW: always learn global affine in ALL stages
+    m.fmri_out_scale.requires_grad = True
+    m.fmri_out_bias.requires_grad  = True
 
 # -----------------------------
 # Per-module save/load helpers
@@ -472,9 +482,13 @@ def make_dataloaders(cfg: TrainCfg, device: torch.device) -> Tuple[DataLoader, D
         if cfg.debug:
             print(f"[debug][dataset] {name}: samples={len(ds)} keys={len(keys)}")
         dl = DataLoader(
-            ds, batch_size=cfg.batch_size, shuffle=False,
-            num_workers=cfg.num_workers, pin_memory=(device.type=='cuda'),
-            collate_fn=collate_paired, drop_last=False
+            ds,
+            batch_size=cfg.batch_size,
+            shuffle=(name == "train"),        # ← shuffle only for train
+            num_workers=cfg.num_workers,
+            pin_memory=(device.type == 'cuda'),
+            collate_fn=collate_paired,
+            drop_last=False
         )
         if cfg.debug:
             print(f"[debug][dataloader] {name}: batches={len(dl)} (bs={cfg.batch_size}, workers={cfg.num_workers}, pin={device.type=='cuda'})")
