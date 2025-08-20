@@ -1242,7 +1242,7 @@ def main():
         print(f"[debug] sys.path[:5] = {sys.path[:5]}")
 
     # ---------- AUTO-SWEEP (before main W&B run) ----------
-    if cfg.auto_sweep && args.mode == "train":
+    if cfg.auto_sweep and args.mode == "train":
         # NOTE: Python doesn't support '&&'; keep it as 'and' in actual code!
         pass
     # (Fixing the above typo properly:)
