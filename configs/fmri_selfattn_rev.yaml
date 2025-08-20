@@ -6,7 +6,7 @@ train:
   brainlm_model_dir: ../MNI_templates/BrainLM/pretrained_models/2023-06-06-22_15_00-checkpoint-1400
 
   # where module checkpoints will be saved (adapter/encoder/decoder/affine)
-  out_dir: runs_fmri_selfattn_20aug_run_autosweep_agressive_lr_new
+  out_dir: runs_fmri_selfattn_20aug_run_autosweep_agressive_lr_rev_new
 
   # --- runtime ---
   device: cuda
@@ -44,7 +44,7 @@ train:
   # --- W&B ---
   wandb_mode: online           # online | offline | disabled
   wandb_project: fmri-oddball-aug20
-  wandb_run_name: 20aug_train_all_exp_loss_Lr_data_cacheing_run1_autosweep_new
+  wandb_run_name: 20aug_train_all_exp_loss_Lr_data_cacheing_run1_autosweep_rev_new
   wandb_group: fmri-selfattn
   wandb_job_type: null         # defaults to "stage{stage}"
   wandb_tags: ["oddball", "fmri-only", "self-attn"]
