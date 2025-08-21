@@ -1611,3 +1611,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# /vast/sd5963/multimodal_fm/Neural_translation_model/train_fmri_selfattn_permodule_updated_19aug_reverse_modelsave.py --config configs/fmri_selfattn_rev.yaml --stage 1 --mode train --auto_sweep --sweep_epochs 100 --sweep_loss_list huber charbonnier mse mae --sweep_lr1 5e-4 5e-5 1e-4 5e-2 --num_workers 16
