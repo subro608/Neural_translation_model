@@ -23,10 +23,21 @@ Loss experimentation (per run or via sweep):
   - --recon_loss_w, --corr_loss_w, --tv_loss_w, --huber_delta, --charbonnier_eps
   - Pearson correlation loss over time (1 - mean r), averaged across ROIs & batch
   - Optional temporal TV loss along time to encourage smooth dynamics
+
+NEW (this version):
+  - On every **NEW BEST**: generate diagnostics under out_dir:
+      plots/topK_fmri_corr.png
+      plots/topK_fmri_corr_calib.png
+      plots/corr_bars_fmri.png
+      plots/heatmap_gt.png
+      plots/heatmap_recon.png
+      plots/heatmap_absdiff.png
+      tables/fmri_roi_diagnostics.csv
+  - Diagnostics also run in TEST mode after evaluation.
 """
 
 from __future__ import annotations
-import os, json, math, argparse, time, platform, sys
+import os, json, math, argparse, time, platform, sys, csv
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Iterable, List, Dict, Any, Tuple
@@ -36,6 +47,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+
+# ---- Matplotlib (headless) ----
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 try:
     from tqdm import tqdm  # progress bar
@@ -123,14 +139,11 @@ def _torch_load_compat(path: Path, map_location, *, allow_weights_only: bool = F
     For trainstate (optimizer/scaler/epoch), we need full pickle → weights_only=False.
     For pure state_dicts, either is fine; we still use this helper for consistency.
     """
-    # First try classic behavior (weights_only=False)
     try:
         return torch.load(str(path), map_location=map_location, weights_only=False)
     except TypeError:
-        # Older torch without weights_only kwarg
         return torch.load(str(path), map_location=map_location)
     except Exception as e1:
-        # If the caller explicitly allows weights_only, try safe load with allowlist
         if allow_weights_only:
             try:
                 import torch.serialization as ts
@@ -181,7 +194,7 @@ class TrainCfg:
     amp: bool = False
     train_fmri_affine_stage3: bool = False  # unfreeze fmri_out_scale/bias in stage 3
 
-    # fixed subjects (optional; if set, used for deterministic splits)
+    # fixed subjects (optional)
     train_subjects: Optional[List[int]] = None
     val_subjects:   Optional[List[int]] = None
     test_subjects:  Optional[List[int]] = None
@@ -326,8 +339,11 @@ def freeze_all(m: nn.Module):
 
 def set_stage(m: TranslatorFMRISelfAttn, stage: int, *, train_affine_stage3: bool = False):
     """
-    NOTE: affine params (fmri_out_scale/bias) are now ALWAYS trainable in every stage.
-    The 'train_affine_stage3' flag is kept for backward-compat but ignored.
+    Stage-wise (forward chain):
+      - 1: adapter
+      - 2: adapter + encoder
+      - 3: adapter + encoder + decoder
+    NOTE: affine params (fmri_out_scale/bias) are ALWAYS trainable in every stage.
     """
     freeze_all(m)
 
@@ -350,7 +366,7 @@ def set_stage(m: TranslatorFMRISelfAttn, stage: int, *, train_affine_stage3: boo
     else:
         raise ValueError(f"Unknown stage {stage}")
 
-    # NEW: always learn global affine in ALL stages
+    # Always learn global affine
     m.fmri_out_scale.requires_grad = True
     m.fmri_out_bias.requires_grad  = True
 
@@ -670,6 +686,224 @@ def run_epoch(mode:str, dl, model, brainlm, xyz_ref, cfg:TrainCfg, device, scale
     return avg
 
 # -----------------------------
+# Diagnostics (plots + CSV)
+# -----------------------------
+def _ensure_dirs(out_dir: Path):
+    (out_dir / "plots").mkdir(parents=True, exist_ok=True)
+    (out_dir / "tables").mkdir(parents=True, exist_ok=True)
+
+def _pearsonr_safe(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a).ravel(); b = np.asarray(b).ravel()
+    m = np.isfinite(a) & np.isfinite(b)
+    if m.sum() < 3: return 0.0
+    a = a[m]; b = b[m]
+    sa = a.std(); sb = b.std()
+    if sa == 0.0 or sb == 0.0: return 0.0
+    r = np.corrcoef(a, b)[0,1]
+    return float(r) if np.isfinite(r) else 0.0
+
+def _lagged_corr(gt: np.ndarray, rc: np.ndarray, max_lag:int) -> Tuple[int, float]:
+    lags = range(-max_lag, max_lag+1)
+    best_r = -2.0; best_l = 0
+    for l in lags:
+        if l < 0:
+            r = _pearsonr_safe(gt[:l], rc[-l:])
+        elif l > 0:
+            r = _pearsonr_safe(gt[l:], rc[:-l])
+        else:
+            r = _pearsonr_safe(gt, rc)
+        if np.isfinite(r) and r > best_r:
+            best_r, best_l = r, l
+    return best_l, best_r
+
+def _lin_calibrate(rc: np.ndarray, gt: np.ndarray) -> Tuple[float, float, np.ndarray, float, float]:
+    A = np.vstack([rc, np.ones_like(rc)]).T
+    a, b = np.linalg.lstsq(A, gt, rcond=None)[0]
+    rc_lin = a*rc + b
+    SSE = np.sum((gt - rc_lin)**2)
+    SST = np.sum((gt - gt.mean())**2)
+    R2  = 1.0 - SSE/(SST + 1e-8)
+    NRMSE = np.sqrt(SSE/len(gt)) / (gt.std() + 1e-8)
+    return float(a), float(b), rc_lin, float(R2), float(NRMSE)
+
+def _downsample(x: np.ndarray, y: np.ndarray, max_points: int) -> Tuple[np.ndarray, np.ndarray]:
+    n = int(x.shape[0])
+    if n <= max_points: return x, y
+    step = int(math.ceil(n / max_points))
+    return x[::step], y[::step]
+
+def _plot_heatmap(arr: np.ndarray, title: str, out_path: Path, xlabel="ROI", ylabel="Time (TR)", cmap="viridis"):
+    plt.figure(figsize=(12, 6))
+    # arr: (T,V). Display V (ROI) on X-axis, time on Y (transpose for imshow).
+    plt.imshow(arr.T, aspect="auto", interpolation="nearest", origin="upper", cmap=cmap)
+    plt.colorbar()
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+
+def _plot_topk_and_bars(t: np.ndarray, x_true: np.ndarray, x_rec: np.ndarray,
+                        out_dir: Path, TR: float, top_k: int = 12, make_calib: bool = True,
+                        plot_max_points: int = 1000):
+    T, V = x_true.shape
+    # r per ROI
+    rs: List[Tuple[int,float]] = []
+    for roi in range(V):
+        rs.append((roi, _pearsonr_safe(x_true[:, roi], x_rec[:, roi])))
+    rs.sort(key=lambda t_: t_[1], reverse=True)
+    top = rs[:min(top_k, len(rs))]
+
+    # Top-K time series (raw)
+    if len(top) > 0:
+        fig, axes = plt.subplots(nrows=len(top), ncols=1, figsize=(12, 2.2*len(top)), sharex=False)
+        if len(top) == 1: axes = [axes]
+        for ax, (roi, r) in zip(axes, top):
+            gt = x_true[:, roi]; rc = x_rec[:, roi]
+            tt = np.arange(T) * float(TR)
+            tt_d, gtd = _downsample(tt, gt, plot_max_points)
+            _,    rcd = _downsample(tt, rc, plot_max_points)
+            ax.plot(tt_d, gtd, label="GT")
+            ax.plot(tt_d, rcd, label="Recon", alpha=0.9)
+            ax.set_title(f"ROI {roi} — r={r:.3f}")
+            ax.set_xlabel("Time (s)"); ax.set_ylabel("Z-score")
+            ax.legend(loc="upper right")
+        fig.tight_layout()
+        fig.savefig(out_dir / "plots" / "topK_fmri_corr.png", dpi=150)
+        plt.close(fig)
+
+    # Calibrated plots
+    if make_calib and len(top) > 0:
+        fig, axes = plt.subplots(nrows=len(top), ncols=1, figsize=(12, 2.2*len(top)), sharex=False)
+        if len(top) == 1: axes = [axes]
+        for ax, (roi, r) in zip(axes, top):
+            gt = x_true[:, roi]; rc = x_rec[:, roi]
+            a, b, rc_lin, R2, nrmse = _lin_calibrate(rc, gt)
+            tt = np.arange(T) * float(TR)
+            tt_d, gtd = _downsample(tt, gt, plot_max_points)
+            _,    rcd = _downsample(tt, rc_lin, plot_max_points)
+            ax.plot(tt_d, gtd, label="GT")
+            ax.plot(tt_d, rcd, label=f"Recon (calib) a={a:.2f}, b={b:.2f}, R²={R2:.2f}", alpha=0.9)
+            ax.set_title(f"ROI {roi} — raw r={r:.3f}")
+            ax.set_xlabel("Time (s)"); ax.set_ylabel("Z-score")
+            ax.legend(loc="upper right")
+        fig.tight_layout()
+        fig.savefig(out_dir / "plots" / "topK_fmri_corr_calib.png", dpi=150)
+        plt.close(fig)
+
+    # Bar chart (all ROIs)
+    all_roi = [roi for roi,_ in rs]
+    all_r   = [r for _,r in rs]
+    order = np.argsort(all_r)[::-1]
+    figw = max(12, 0.03 * len(all_roi) + 10)
+    plt.figure(figsize=(figw, 5))
+    plt.bar(np.arange(len(all_roi)), np.array(all_r)[order])
+    plt.ylim(-1.0, 1.0)
+    step = max(1, len(all_roi)//40)
+    plt.xticks(np.arange(0,len(all_roi),step), [str(all_roi[i]) for i in order[::step]], rotation=90)
+    plt.xlabel("fMRI ROI (sorted by r)")
+    plt.ylabel("Pearson r")
+    plt.title("fMRI: Pearson correlation per ROI")
+    plt.tight_layout()
+    plt.savefig(out_dir / "plots" / "corr_bars_fmri.png", dpi=150)
+    plt.close()
+
+    return rs
+
+@torch.no_grad()
+def generate_fmri_diagnostics(
+    cfg: TrainCfg,
+    out_dir: Path,
+    stage: int,
+    model: TranslatorFMRISelfAttn,
+    brainlm: FrozenBrainLM,
+    dl_eval: DataLoader,
+    device: torch.device,
+    xyz_ref: Optional[torch.Tensor],
+    *,
+    top_k: int = 12,
+    max_lag_tr: int = 3,
+    make_calib_plots: bool = True,
+    plot_max_points: int = 1000,
+    wandb_run=None,
+    tag_for_logging: Optional[str] = None,
+):
+    """Use first batch from dl_eval; write plots and CSV under out_dir/plots & out_dir/tables."""
+    _ensure_dirs(out_dir)
+    model.eval()
+
+    try:
+        batch = next(iter(dl_eval))
+    except StopIteration:
+        print("[diag] WARNING: empty eval dataloader; skipping diagnostics.")
+        return
+
+    fmri_t = batch['fmri_window'].to(device)  # (B,T,V)
+    B, T, V = map(int, fmri_t.shape)
+
+    # BrainLM inputs
+    fmri_pad = pad_timepoints_for_brainlm_torch(fmri_t, patch_size=20)  # (B,Tp,V)
+    signal_vectors = fmri_pad.permute(0,2,1).contiguous()               # (B,V,Tp)
+    if xyz_ref is not None and V == cfg.fmri_voxels:
+        xyz = xyz_ref.unsqueeze(0).repeat(B,1,1)
+    else:
+        xyz = torch.zeros(B, V, 3, device=device)
+
+    fmri_latents = brainlm.extract_latents(signal_vectors, xyz)  # (L,B,Ttok,Dh)
+    recon = model(fmri_latents, fmri_T=T, fmri_V=V)              # (B,T,V)
+
+    # Work on first item
+    b = 0
+    x_true = fmri_t[b].detach().cpu().numpy()    # (T,V)
+    x_rec  = recon[b].detach().cpu().numpy()     # (T,V)
+
+    # Save heatmaps
+    _plot_heatmap(x_true, "GT (T×V)", out_dir / "plots" / "heatmap_gt.png")
+    _plot_heatmap(x_rec,  "Recon (T×V)", out_dir / "plots" / "heatmap_recon.png")
+    _plot_heatmap(np.abs(x_true - x_rec), "|GT - Recon| (T×V)", out_dir / "plots" / "heatmap_absdiff.png", cmap="magma")
+
+    # Top-K + bars; metrics per ROI (CSV)
+    rs = _plot_topk_and_bars(
+        t=np.arange(T)*float(cfg.tr),
+        x_true=x_true, x_rec=x_rec,
+        out_dir=out_dir, TR=cfg.tr, top_k=top_k,
+        make_calib=make_calib_plots, plot_max_points=plot_max_points
+    )
+
+    # Extended diagnostics CSV
+    rows: List[List[float]] = []
+    for roi in range(V):
+        gt = x_true[:, roi]
+        rc = x_rec[:, roi]
+        r0 = _pearsonr_safe(gt, rc)
+        a, bb, rc_lin, R2, NRMSE = _lin_calibrate(rc, gt)
+        best_lag, r_best = _lagged_corr(gt, rc, max_lag_tr)
+        rows.append([roi, r0, float(gt.std()), float(rc.std()), a, bb, R2, NRMSE, best_lag, r_best])
+    csv_path = out_dir / "tables" / "fmri_roi_diagnostics.csv"
+    with open(csv_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["roi","r0","std_gt","std_rec","slope","intercept","R2","NRMSE","best_lag_TR","r_at_best_lag"])
+        for row in rows:
+            w.writerow(row)
+    print(f"[diag] wrote diagnostics -> {csv_path}")
+
+    # W&B: log images
+    if wandb_run is not None:
+        try:
+            wandb_run.log({
+                "diag/stage": stage,
+                "diag/tag": tag_for_logging or "",
+            })
+            for name in ["heatmap_gt.png", "heatmap_recon.png", "heatmap_absdiff.png",
+                         "topK_fmri_corr.png", "corr_bars_fmri.png", "topK_fmri_corr_calib.png"]:
+                p = out_dir / "plots" / name
+                if p.exists():
+                    wandb_run.log({f"plots/{name}": wandb.Image(str(p))})
+        except Exception:
+            pass
+
+# -----------------------------
 # Auto-sweep helpers
 # -----------------------------
 def dataclass_replace(obj, **updates):
@@ -736,13 +970,15 @@ def _train_once_for_cfg(base_cfg: TrainCfg, stage: int, *, trial_name: str,
     Uses warm-start-from-previous-stage-best policy, but NO resume from stageX_last.
     Saves into 'out_dir'. Reads prev-stage best from prev_stage_dir.
     Creates its own W&B run if enabled.
+    On NEW BEST: generate diagnostics (val split) under the trial's out_dir.
     """
     cfg = dataclass_replace(base_cfg, out_dir=out_dir)  # shallow clone with new out_dir
     device = torch.device(cfg.device)
     os.makedirs(cfg.out_dir, exist_ok=True)
+    _ensure_dirs(cfg.out_dir)
 
     # Data
-    dl_train, dl_val, dl_test = make_dataloaders(cfg, device)
+    dl_train, dl_val, _ = make_dataloaders(cfg, device)
 
     # Models
     brainlm = FrozenBrainLM(cfg.brainlm_model_dir, device)
@@ -811,8 +1047,45 @@ def _train_once_for_cfg(base_cfg: TrainCfg, stage: int, *, trial_name: str,
             }, step=ep)
         if va["total"] < best:
             best = va["total"]
-            save_modules(cfg.out_dir, translator, tag=f"stage{stage}_best")
-            save_trainstate(cfg.out_dir, stage, tag="best", epoch=ep, best_val=best, opt=opt, scaler=scaler)
+            best_paths = save_modules(cfg.out_dir, translator, tag=f"stage{stage}_best")
+            ts_best = save_trainstate(cfg.out_dir, stage, tag="best", epoch=ep, best_val=best, opt=opt, scaler=scaler)
+            print(f"[Stage{stage}][trial] ✅ new best {best:.6f}")
+
+            # diagnostics on BEST (val)
+            try:
+                generate_fmri_diagnostics(
+                    cfg=cfg, out_dir=cfg.out_dir, stage=stage,
+                    model=translator, brainlm=brainlm, dl_eval=dl_val,
+                    device=device, xyz_ref=xyz_ref, top_k=12,
+                    make_calib_plots=True, wandb_run=run,
+                    tag_for_logging=f"trial_best_ep{ep}"
+                )
+            except Exception as e:
+                print(f"[diag] WARN trial diagnostics failed: {e}")
+
+            if run is not None:
+                wandb.summary[f"stage{stage}/best_val_total"] = float(best)
+                try:
+                    art_best = wandb.Artifact(f"fmri_selfattn_stage{stage}_best_trial", type="model")
+                    for p in best_paths.values():
+                        art_best.add_file(str(p))
+                    art_best.add_file(str(ts_best))
+                    run.log_artifact(art_best)
+                except Exception:
+                    pass
+
+        # always save "last"
+        last_paths = save_modules(cfg.out_dir, translator, tag=f"stage{stage}_last")
+        ts_last = save_trainstate(cfg.out_dir, stage, tag="last", epoch=ep, best_val=best, opt=opt, scaler=scaler)
+        if run is not None:
+            try:
+                art_last = wandb.Artifact(f"fmri_selfattn_stage{stage}_last_trial", type="model")
+                for p in last_paths.values():
+                    art_last.add_file(str(p))
+                art_last.add_file(str(ts_last))
+                run.log_artifact(art_last)
+            except Exception:
+                pass
 
     if run is not None:
         try: run.finish()
@@ -893,7 +1166,7 @@ def _apply_config_defaults(parser: argparse.ArgumentParser) -> Dict[str, Any]:
 # Main
 # -----------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Stage-wise fMRI-only (self-attn) training/testing (per-module checkpoints) + YAML/JSON config + DEBUG + W&B + Auto-Resume + Auto-Sweep")
+    ap = argparse.ArgumentParser(description="Stage-wise fMRI-only (self-attn) training/testing (per-module checkpoints) + YAML/JSON config + DEBUG + W&B + Auto-Resume + Auto-Sweep + Diagnostics")
     ap.add_argument("--config", type=str, default=None, help="YAML/JSON config; if YAML has sections, uses 'train'")
     ap.add_argument("--eeg_root", type=str)
     ap.add_argument("--fmri_root", type=str)
@@ -1056,6 +1329,7 @@ def main():
     seed_all(cfg.seed)
     device = torch.device(cfg.device)
     os.makedirs(cfg.out_dir, exist_ok=True)
+    _ensure_dirs(cfg.out_dir)
 
     if cfg.debug:
         print(f"[debug] torch {torch.__version__} | cuda available={torch.cuda.is_available()} | device={device}")
@@ -1088,7 +1362,7 @@ def main():
             # isolate outputs per trial
             trial_out = sweep_dir / f"trial_{i:03d}_{trial['loss_type']}_lr{trial['lr']:.1e}_cw{trial['corr_w']}_tv{trial['tv_w']}"
             trial_name = f"s{stage}-trial{i}-{trial['loss_type']}-lr{trial['lr']:.1e}-cw{trial['corr_w']}-tv{trial['tv_w']}"
-            # train a short run for selection
+            # train a short run for selection (with diagnostics on best)
             best_val = _train_once_for_cfg(
                 dataclass_replace(trial_cfg, auto_resume=False),  # do not resume 'last' in trials
                 stage=stage, trial_name=trial_name,
@@ -1265,12 +1539,25 @@ def main():
                 except Exception:
                     pass
 
-            # update "best"
+            # update "best" + DIAGNOSTICS
             if va["total"] < best:
                 best = va["total"]
                 best_paths = save_modules(out_dir, translator, tag=f"stage{stage}_best")
                 ts_best = save_trainstate(out_dir, stage, tag="best", epoch=ep, best_val=best, opt=opt, scaler=scaler)
                 print(f"[Stage{stage}] ✅ new best {best:.6f}")
+
+                # diagnostics on BEST (val)
+                try:
+                    generate_fmri_diagnostics(
+                        cfg=cfg, out_dir=out_dir, stage=stage,
+                        model=translator, brainlm=brainlm, dl_eval=dl_val,
+                        device=device, xyz_ref=xyz_ref, top_k=12,
+                        make_calib_plots=True, wandb_run=run,
+                        tag_for_logging=f"main_best_ep{ep}"
+                    )
+                except Exception as e:
+                    print(f"[diag] WARN diagnostics failed: {e}")
+
                 if run is not None:
                     wandb.summary[f"stage{stage}/best_val_total"] = float(best)
                     try:
@@ -1288,11 +1575,33 @@ def main():
             print(f"[TEST][stage {stage}] test_total_loss={res['total']:.6f}")
             if run is not None:
                 wandb.log({"test/total_loss": float(res["total"]), "stage": stage})
+            # Diagnostics on test split
+            try:
+                generate_fmri_diagnostics(
+                    cfg=cfg, out_dir=out_dir, stage=stage,
+                    model=translator, brainlm=brainlm, dl_eval=dl_test,
+                    device=device, xyz_ref=xyz_ref, top_k=12,
+                    make_calib_plots=True, wandb_run=run,
+                    tag_for_logging="test_eval"
+                )
+            except Exception as e:
+                print(f"[diag] WARN test diagnostics failed: {e}")
         else:
             res = run_epoch("val", dl_val, translator, brainlm, xyz_ref, cfg, device, scaler, opt=None)
             print(f"[TEST][stage {stage}] val_total_loss={res['total']:.6f}")
             if run is not None:
                 wandb.log({"val/total_loss": float(res["total"]), "stage": stage})
+            # Diagnostics on val split
+            try:
+                generate_fmri_diagnostics(
+                    cfg=cfg, out_dir=out_dir, stage=stage,
+                    model=translator, brainlm=brainlm, dl_eval=dl_val,
+                    device=device, xyz_ref=xyz_ref, top_k=12,
+                    make_calib_plots=True, wandb_run=run,
+                    tag_for_logging="val_eval"
+                )
+            except Exception as e:
+                print(f"[diag] WARN val diagnostics failed: {e}")
 
     if run is not None:
         try:
