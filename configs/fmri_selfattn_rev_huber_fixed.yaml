@@ -1,0 +1,70 @@
+# configs/fmri_selfattn_rev_huber_fixed.yaml
+train:
+  # --- data / models ---
+  eeg_root: ../Oddball/ds116_eeg
+  fmri_root: ../Oddball/ds000116
+  a424_label_nii: ../MNI_templates/BrainLM/A424_resampled_to_bold.nii.gz
+  brainlm_model_dir: ../MNI_templates/BrainLM/pretrained_models/2023-06-06-22_15_00-checkpoint-1400
+
+  # where module checkpoints will be saved (adapter/encoder/decoder/affine)
+  out_dir: runs_fmri_selfattn_rev_huber_fixed_21aug
+
+  # --- runtime ---
+  device: cuda
+  seed: 42
+  window_sec: 40
+  stride_sec: 10
+  fmri_norm: zscore
+  batch_size: 16
+  num_workers: 16
+  amp: false
+
+  # --- model dims (explicit, from the best run)
+  d_model: 128
+  n_heads: 4
+  d_ff: 512
+  dropout: 0.1
+  fmri_voxels: 424
+
+  # --- stage schedules ---
+  stage1_epochs: 100
+  stage2_epochs: 100
+  stage3_epochs: 100
+  lr1: 5.0e-4     # from best Stage-1 run (rev-s1-trial2-huber-lr5e-4)
+  lr2: 8.0e-5
+  lr3: 5.0e-5
+  weight_decay: 1.0e-4
+
+  # --- loss (from the best run) ---
+  loss_type: huber
+  huber_delta: 1.0
+  recon_loss_w: 1.0
+  corr_loss_w: 0.0
+  tv_loss_w: 0.0
+
+  # --- fixed subject splits ---
+  train_subjects: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+  val_subjects:   [16]
+  test_subjects:  [17]
+
+  # --- debug knobs ---
+  debug: true
+  profile_first_n: 2
+  max_batches_per_epoch: 0
+  log_every: 25
+
+  # --- resume ---
+  auto_resume: false   # matched the sweep trial; set true if you prefer resuming
+
+  # --- NO SWEEP ---
+  auto_sweep: false
+  no_final_full: false
+
+  # --- W&B ---
+  wandb_mode: online           # online | offline | disabled
+  wandb_project: fmri-oddball-aug21
+  wandb_run_name: rev_huber_s1best_fixed_21aug
+  wandb_group: fmri-selfattn
+  wandb_job_type: null         # defaults to "stage{stage}"
+  wandb_tags: ["oddball", "fmri-only", "self-attn", "best-s1-huber"]
+  wandb_notes: "Fixed-config run reproducing best Stage-1 huber setup (no sweep)"
