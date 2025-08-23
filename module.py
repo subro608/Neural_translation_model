@@ -22,7 +22,25 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.nn.functional as F
 
+def _time_resize_safe_BVT(x_BVT: torch.Tensor, target_T: int) -> torch.Tensor:
+    """
+    Resize along time for a (B, V, T) tensor.
+    - Uses linear interpolation for upsampling.
+    - Uses 'area' (mean-preserving) for downsampling via a 2D trick (add a dummy H=1).
+    """
+    B, V, T = x_BVT.shape
+    if T == target_T:
+        return x_BVT
+    if T > target_T:
+        # downsample: approximate average pooling semantics
+        x4 = x_BVT.unsqueeze(2)  # (B, V, 1, T)
+        x4 = F.interpolate(x4, size=(1, target_T), mode="area")
+        return x4.squeeze(2)     # (B, V, target_T)
+    else:
+        # upsample: linear 1D interpolation
+        return F.interpolate(x_BVT, size=target_T, mode="linear", align_corners=False)
 # -------------------------------
 # EEG (unchanged)
 # -------------------------------
@@ -64,40 +82,6 @@ class EEGDecodingAdapterLite(nn.Module):
         return z
 
 # -------------------------------
-# (Deprecated) fMRI Lite decoder
-# -------------------------------
-class fMRIDecodingAdapterLite(nn.Module):
-    """
-    DEPRECATED for fMRI: rank-1 across voxels (kept for backwards-compat).
-    """
-    def __init__(self, target_T: int, target_V: int, d_model: int = 128, rank: int = 16):
-        super().__init__()
-        self.target_tokens = int(target_T) * int(target_V)
-        self.d_model = int(d_model)
-        self.rank = int(rank)
-
-        self.seq_adjust = nn.Sequential(
-            nn.Linear(self.d_model, self.d_model, bias=True),
-            nn.GELU(),
-            nn.LayerNorm(self.d_model),
-        )
-        self.to_rank   = nn.Linear(self.d_model, self.rank, bias=False)
-        self.from_rank = nn.Linear(self.rank, 1, bias=True)
-
-    def forward(self, fused: torch.Tensor) -> torch.Tensor:
-        B, T, D = fused.shape
-        x = self.seq_adjust(fused)
-        z = self.from_rank(self.to_rank(x))  # (B,T,1)
-        z = z.transpose(1, 2)                # (B,1,T)
-        if T != self.target_tokens:
-            if T < self.target_tokens:
-                z = F.interpolate(z, size=self.target_tokens, mode="linear", align_corners=False)
-            else:
-                z = F.adaptive_avg_pool1d(z, self.target_tokens)
-        z = z.squeeze(1)                     # (B, target_tokens)
-        return z
-
-# -------------------------------
 # fMRI 2-D decoder (FIXED)
 # -------------------------------
 class fMRIDecodingAdapter2D(nn.Module):
@@ -132,11 +116,7 @@ class fMRIDecodingAdapter2D(nn.Module):
         z = self.to_voxels(self.to_rank(x))  # (B,Tf,V)
         z = z.transpose(1, 2)                # (B,V,Tf)
         if Tf != self.target_T:
-            # time-only resize
-            if Tf < self.target_T:
-                z = F.interpolate(z, size=self.target_T, mode="linear", align_corners=False)
-            else:
-                z = F.adaptive_avg_pool1d(z, self.target_T)
+            z = _time_resize_safe_BVT(z, self.target_T)
         z = z.transpose(1, 2)                # (B,T,V)
         return z
 
@@ -169,10 +149,14 @@ class fMRIInputAdapterConv1d(nn.Module):
         x = x.view(B, T, L * Din)                      # (B,T,L*D)
         xt = x.transpose(1, 2)                         # (B,L*D,T)
         if self.target_seq_len is not None and T != self.target_seq_len:
-            if T < self.target_seq_len:
-                xt = F.interpolate(xt, size=self.target_seq_len, mode="linear", align_corners=False)
+            if T > self.target_seq_len:
+                # downsample (N,C,L) -> use 2D 'area' trick
+                xt4 = xt.unsqueeze(2)  # (B, C, 1, L)
+                xt4 = F.interpolate(xt4, size=(1, self.target_seq_len), mode="area")
+                xt  = xt4.squeeze(2)
             else:
-                xt = F.adaptive_avg_pool1d(xt, self.target_seq_len)
+                # upsample
+                xt = F.interpolate(xt, size=self.target_seq_len, mode="linear", align_corners=False)
         x = xt.transpose(1, 2)                         # (B,S',L*D)
         x = self.proj(x)                               # (B,S',out)
         return self.norm(x)
