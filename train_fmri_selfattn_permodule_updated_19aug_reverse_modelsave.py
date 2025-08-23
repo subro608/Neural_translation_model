@@ -3,9 +3,9 @@
 Reversed stage-wise training (decoder-first) for fMRI-only self-attention model.
 
 Order:
-  - Rev Stage 1:    train **decoder only**  (affine frozen)
-  - Rev Stage 2:    train **decoder + encoder** (warm-start from Rev Stage 1 best; affine frozen)
-  - Rev Stage 3:    train **adapter + encoder + decoder** (+ optional affine via --train_affine_stage3)
+  - Rev Stage 1:    train **decoder only**  (**affine trainable**)
+  - Rev Stage 2:    train **decoder + encoder** (warm-start from Rev Stage 1 best; **affine trainable**)
+  - Rev Stage 3:    train **adapter + encoder + decoder** (**affine trainable**)
 
 What this script adds / fixes (updated):
 - Uses fMRIDecodingAdapter2D (predicts V channels first; time-only resize) to remove rank-1-over-voxels bug.
@@ -173,8 +173,8 @@ class TrainCfg:
     weight_decay: float = 1e-4
     amp: bool = False
 
-    # affine policy for reversed staging
-    train_affine_stage3: bool = False  # unfreeze fmri_out_scale/bias only in Rev Stage 3 when True
+    # affine policy (IGNORED – affine is always trainable in all stages)
+    train_affine_stage3: bool = True  # kept for backward-compat; has no effect
 
     # fixed subjects
     train_subjects: Optional[List[int]] = None
@@ -293,7 +293,7 @@ class TranslatorFMRISelfAttn(nn.Module):
             target_T=T, target_V=V, d_model=cfg.d_model, rank=32
         )
 
-        # Output affine (per-run learnable; may remain frozen until stage 3)
+        # Output affine (per-run learnable; **trainable in all stages**)
         self.fmri_out_scale = nn.Parameter(torch.tensor(1.0))
         self.fmri_out_bias  = nn.Parameter(torch.tensor(0.0))
 
@@ -325,9 +325,11 @@ def freeze_all(m: nn.Module):
 def set_stage_rev(m: TranslatorFMRISelfAttn, stage: int, *, train_affine_stage3: bool = False):
     """
     Reversed (decoder-first) stages:
-      - 1: decoder (affine frozen)
-      - 2: decoder + encoder (affine frozen)
-      - 3: adapter + encoder + decoder (+ optional affine if train_affine_stage3)
+      - 1: decoder (**affine trainable**)
+      - 2: decoder + encoder (**affine trainable**)
+      - 3: adapter + encoder + decoder (**affine trainable**)
+
+    NOTE: `train_affine_stage3` is ignored; affine is always trainable in all stages.
     """
     # freeze everything first
     freeze_all(m)
@@ -349,9 +351,9 @@ def set_stage_rev(m: TranslatorFMRISelfAttn, stage: int, *, train_affine_stage3:
     else:
         raise ValueError(f"Unknown reversed stage {stage}")
 
-    # Affine learnable only in stage 3 when requested
-    m.fmri_out_scale.requires_grad = bool(train_affine_stage3 and stage == 3)
-    m.fmri_out_bias.requires_grad  = bool(train_affine_stage3 and stage == 3)
+    # Affine ALWAYS learnable in ALL stages
+    m.fmri_out_scale.requires_grad = True
+    m.fmri_out_bias.requires_grad  = True
 
 # -----------------------------
 # Per-module save/load helpers
@@ -751,7 +753,7 @@ def _plot_topk_and_bars(t: np.ndarray, x_true: np.ndarray, x_rec: np.ndarray,
             ax.plot(tt_d, gtd, label="GT")
             ax.plot(tt_d, rcd, label=f"Recon (calib) a={a:.2f}, b={b:.2f}, R²={R2:.2f}", alpha=0.9)
             ax.set_title(f"ROI {roi} — raw r={r:.3f}")
-            ax.set_xlabel("Time (s)"); ax.set_ylabel("Z-score")
+            ax.set.xlabel("Time (s)"); ax.set_ylabel("Z-score")
             ax.legend(loc="upper right")
         fig.tight_layout()
         fig.savefig(out_dir / "plots" / "topK_fmri_corr_calib.png", dpi=150)
@@ -940,7 +942,8 @@ def _train_once_for_cfg(base_cfg: TrainCfg, stage: int, *, trial_name: str,
     elif stage == 3:
         load_modules_if_exist(prev_stage_dir, translator, tag="revstage2_best", which=["encoder","decoder"], device=device)
 
-    set_stage_rev(translator, stage, train_affine_stage3=cfg.train_fmri_affine_stage3)
+    # Affine is always trainable; no flag needed
+    set_stage_rev(translator, stage)
 
     # Epochs & LR
     if stage == 1:   epochs, lr = cfg.stage1_epochs, cfg.lr_stage1
@@ -1117,7 +1120,7 @@ def main():
     ap.add_argument("--lr3", type=float, default=5e-5)
     ap.add_argument("--weight_decay", type=float, default=1e-4)
     ap.add_argument("--train_affine_stage3", action="store_true",
-                    help="Unfreeze fmri_out_scale/bias in **Rev Stage 3** (all three).")
+                    help="(ignored) Backward-compat only — affine is always trainable in ALL stages.")
     ap.add_argument("--train_subjects", type=int, nargs="*", default=None)
     ap.add_argument("--val_subjects",   type=int, nargs="*", default=None)
     ap.add_argument("--test_subjects",  type=int, nargs="*", default=None)
@@ -1195,7 +1198,7 @@ def main():
         lr_stage2=args.lr2,
         lr_stage3=args.lr3,
         weight_decay=args.weight_decay,
-        train_affine_stage3=bool(args.train_affine_stage3),
+        train_affine_stage3=True,  # ignored
         train_subjects=args.train_subjects,
         val_subjects=args.val_subjects,
         test_subjects=args.test_subjects,
@@ -1379,7 +1382,7 @@ def main():
                 print(f"[WARN] Some modules for '{tag}' were not found: {sorted(missing)}")
 
     # ---------- Set trainable ----------
-    set_stage_rev(translator, stage, train_affine_stage3=cfg.train_affine_stage3)
+    set_stage_rev(translator, stage)  # affine always trainable
     trainable = [n for n,p in translator.named_parameters() if p.requires_grad]
     print(f"[rev stage {stage}][{mode}] trainable: {len(trainable)} tensors")
     for n in trainable: print("  -", n)
