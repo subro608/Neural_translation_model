@@ -15,7 +15,13 @@ CBraMod/pretrained_weights/
 wandb/
 translator_runs/
 oddball_eeg_fmri_august8_run7_overlap11_weights/
-
+translator_sweep_runs_viz_20aug_normal/
+translator_sweep_runs_viz_20aug_normal_100epochs_sweep/
+translator_sweep_runs_viz_20aug_normal_100epochs_sweep_stage1/
+translator_sweep_runs_viz_20aug_reverse/
+translator_sweep_runs_viz_20aug_reverse_100epoch_sweep/
+translator_sweep_runs_viz_20aug_reverse_100epoch_sweep_stage1/
+All_visualizations/
 ## Python/OS
 __pycache__/
 *.pyc

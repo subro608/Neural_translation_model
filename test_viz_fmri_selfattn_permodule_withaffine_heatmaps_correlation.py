@@ -2,18 +2,34 @@
 """
 Diagnostics for fMRI-only (self-attn) per-module translator — static config (no CLI args)
 
-What’s new vs your original:
+What's included:
+- ALWAYS attempts to load adapter, encoder, decoder, **and affine** weights for the chosen tag.
 - FIX: canonical module-load check (no false "missing" warnings).
 - DIAGNOSTICS: per-ROI stats written to CSV:
     roi, r0, std_gt, std_rec, slope, intercept, R2, NRMSE, best_lag_TR, r_at_best_lag
 - PRINTS: overall summaries + affine values.
-- PLOTS: top-K GT vs Recon; optional GT vs Linear-Calibrated Recon to visualize amplitude mismatch.
+- PLOTS:
+    * top-K GT vs Recon
+    * optional GT vs Linear-Calibrated Recon to visualize amplitude mismatch
+    * heatmaps of target and reconstructed fMRI (T × V)
+    * **NEW** correlation matrices (fMRI-only):
+        - Corr(ROI×ROI) for GT
+        - Corr(ROI×ROI) for Recon
+        - Cross-corr GT vs Recon (ROI×ROI)
 
 Outputs:
-  plots/topK_fmri_corr.png
-  plots/topK_fmri_corr_calibrated.png   (toggle via MAKE_CALIB_PLOTS)
-  plots/corr_bars_fmri.png
-  tables/fmri_roi_diagnostics.csv
+  <RUN_DIR>/viz_diagnostics/plots/topK_fmri_corr.png
+  <RUN_DIR>/viz_diagnostics/plots/topK_fmri_corr_calibrated.png   (toggle via MAKE_CALIB_PLOTS)
+  <RUN_DIR>/viz_diagnostics/plots/corr_bars_fmri.png
+  <RUN_DIR>/viz_diagnostics/plots/fmri_target_heatmap.png
+  <RUN_DIR>/viz_diagnostics/plots/fmri_recon_heatmap.png
+  <RUN_DIR>/viz_diagnostics/plots/corrmat_fmri_gt.png
+  <RUN_DIR>/viz_diagnostics/plots/corrmat_fmri_recon.png
+  <RUN_DIR>/viz_diagnostics/plots/corrmat_fmri_gt_vs_recon.png
+  <RUN_DIR>/viz_diagnostics/tables/fmri_roi_diagnostics.csv
+  <RUN_DIR>/viz_diagnostics/tables/corrmat_fmri_gt.csv
+  <RUN_DIR>/viz_diagnostics/tables/corrmat_fmri_recon.csv
+  <RUN_DIR>/viz_diagnostics/tables/corrmat_fmri_gt_vs_recon.csv
 """
 
 from __future__ import annotations
@@ -27,6 +43,10 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
+try:
+    import yaml  # type: ignore
+except Exception:
+    yaml = None  # optional
 
 # =========================
 # PATHS & CONFIG
@@ -36,20 +56,23 @@ FMRI_ROOT         = Path(r"D:\Neuroinformatics_research_2025\Oddball\ds000116")
 A424_LABEL_NII    = Path(r"D:\Neuroinformatics_research_2025\BrainLM\A424_resampled_to_bold.nii.gz")
 BRAINLM_MODEL_DIR = Path(r"D:\Neuroinformatics_research_2025\MNI_templates\BrainLM\pretrained_models\2023-06-06-22_15_00-checkpoint-1400")
 
-RUN_DIR           = Path(r"D:\Neuroinformatics_research_2025\Multi_modal_NTM\translator_runs_fmri_selfattn_aug19_stage1")
-OUT_DIR           = Path(r"D:\Neuroinformatics_research_2025\Multi_modal_NTM\viz_fmri_selfattn_permodule_stage1_best_19aug_diag_train")
+RUN_DIR           = Path(r"D:\Neuroinformatics_research_2025\Multi_modal_NTM\translator_sweep_runs_viz_20aug_normal_100epochs_sweep\sweeps_stage3\trial_005_mse_lr5.0e-05_cw0.0_tv0.0")
+# Keep outputs tidy but colocated with the run:
+SUBSET= "val"   # "train" | "val" | "test"
 
-SUBSET              = "train"   # "train" | "val" | "test"
-STAGE               = 1        # 1 | 2 | 3
-TAG                 = "stage1_best"  # e.g., "stage3_best"; None -> uses f"stage{STAGE}_best"
+OUT_DIR= RUN_DIR / f"viz_diagnostics_{SUBSET}"
+
+# SUBSET              = "train"   # "train" | "val" | "test"
+STAGE               = 3        # 1 | 2 | 3 (only used for default tag name)
+TAG                 = "stage3_best"  # e.g., "stage3_best"; None -> uses f"stage{STAGE}_best"
 TOP_K               = 12
 PLOT_MAX_POINTS     = 1000
-MAX_LAG_TR          = 3        # search Pearson r over [-MAX_LAG_TR..+MAX_LAG_TR]
-MAKE_CALIB_PLOTS    = True     # plot GT vs linearly-calibrated Recon (per ROI)
+MAX_LAG_TR          = 3         # search Pearson r over [-MAX_LAG_TR..+MAX_LAG_TR]
+MAKE_CALIB_PLOTS    = True      # plot GT vs linearly-calibrated Recon (per ROI)
 
 DEVICE              = "cuda"
 SEED                = 42
-WINDOW_SEC          = 30
+WINDOW_SEC          = 40
 TR                  = 2.0
 FMRI_NORM           = "zscore"   # "zscore" | "psc" | "mad" | "none"
 BATCH_SIZE          = 1
@@ -166,6 +189,88 @@ def lin_calibrate(rc: np.ndarray, gt: np.ndarray) -> Tuple[float, float, np.ndar
     NRMSE = np.sqrt(SSE/len(gt)) / (gt.std() + 1e-8)
     return float(a), float(b), rc_lin, float(R2), float(NRMSE)
 
+def save_heatmap(arr_TxV: np.ndarray, out_path: Path, title: str, tr: float,
+                 cmap: str = "viridis", vlim: Optional[Tuple[float, float]] = None):
+    """
+    Save a heatmap for a (T,V) array with Time on X and ROI on Y.
+    - arr_TxV: numpy array shaped (T, V)
+    - tr: seconds per timepoint (for x-axis scaling)
+    - vlim: optional (vmin, vmax) to share a color scale across plots
+    """
+    T, V = arr_TxV.shape
+    plt.figure(figsize=(18, 6))
+    im = plt.imshow(
+        arr_TxV.T,                # (V, T) so Y=ROI, X=Time
+        aspect="auto",
+        origin="lower",
+        cmap=cmap,
+        extent=[0, T * tr, 0, V], # X in seconds, Y in ROI index
+        vmin=(vlim[0] if vlim else None),
+        vmax=(vlim[1] if vlim else None),
+        interpolation="nearest",
+    )
+    plt.xlabel("Time (s)")
+    plt.ylabel("ROI")
+    plt.title(title)
+    plt.colorbar(im)
+    plt.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+
+# ---------- NEW: correlation-matrix helpers (fMRI-only) ----------
+def corr_matrix(time_by_feat: np.ndarray) -> np.ndarray:
+    """
+    time_by_feat: (T, D) -> Pearson correlation matrix (D x D).
+    Robust to constant columns (returns 0s instead of NaNs).
+    """
+    X = np.asarray(time_by_feat, dtype=np.float64)
+    X = X - X.mean(axis=0, keepdims=True)
+    std = X.std(axis=0, keepdims=True) + 1e-12
+    Xn = X / std
+    C = np.nan_to_num((Xn.T @ Xn) / max(1, Xn.shape[0] - 1),
+                      nan=0.0, posinf=0.0, neginf=0.0)
+    return np.clip(C, -1.0, 1.0)
+
+def cross_corr_matrix(X: np.ndarray, Y: np.ndarray) -> np.ndarray:
+    """
+    X: (T, D1), Y: (T, D2) -> Corr[X_i, Y_j] (D1 x D2)
+    Used here for fMRI GT vs Recon (still fMRI-only).
+    """
+    X = np.asarray(X, dtype=np.float64); Y = np.asarray(Y, dtype=np.float64)
+    X = X - X.mean(axis=0, keepdims=True)
+    Y = Y - Y.mean(axis=0, keepdims=True)
+    Xs = X.std(axis=0, keepdims=True) + 1e-12
+    Ys = Y.std(axis=0, keepdims=True) + 1e-12
+    Xn = X / Xs; Yn = Y / Ys
+    C = np.nan_to_num((Xn.T @ Yn) / max(1, Xn.shape[0] - 1),
+                      nan=0.0, posinf=0.0, neginf=0.0)
+    return np.clip(C, -1.0, 1.0)
+
+def plot_corrmat(C: np.ndarray, out_path: Path, title: str,
+                 xlabel: str, ylabel: str):
+    plt.figure(figsize=(10, 8))
+    im = plt.imshow(C, aspect="auto", origin="lower",
+                    vmin=-1.0, vmax=1.0, cmap="coolwarm")
+    plt.colorbar(im, fraction=0.046, pad=0.04)
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+
+def save_corr_csv(C: np.ndarray, out_path: Path,
+                  row_prefix: str, col_prefix: str):
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([""] + [f"{col_prefix}{j}" for j in range(C.shape[1])])
+        for i in range(C.shape[0]):
+            w.writerow([f"{row_prefix}{i}"] +
+                       [f"{float(v):.6f}" for v in C[i]])
+
 # =========================
 # Frozen BrainLM
 # =========================
@@ -196,7 +301,8 @@ class FrozenBrainLM(nn.Module):
         embeddings, mask, ids_restore = self.model.vit.embeddings(
             signal_vectors=signal_vectors, xyz_vectors=xyz_vectors, noise=None
         )
-        enc = self.model.vit.encoder(hidden_states=embeddings, output_hidden_states=True, return_dict=True)
+        enc = self.model.vit.encoder(hidden_states=embeddings,
+                                     output_hidden_states=True, return_dict=True)
         return torch.stack(list(enc.hidden_states), dim=0)  # (L,B,Ttok,Dh)
 
 # =========================
@@ -224,21 +330,26 @@ class TranslatorFMRISelfAttn(nn.Module):
         # sinusoidal PE
         pe = torch.zeros(100_000, d_model)
         pos = torch.arange(0, 100_000, dtype=torch.float32).unsqueeze(1)
-        div = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32)*(-_m.log(10000.0)/d_model))
+        div = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) *
+                        (-_m.log(10000.0)/d_model))
         pe[:,0::2]=torch.sin(pos*div); pe[:,1::2]=torch.cos(pos*div)
         self.pos_fmri = nn.Parameter(pe, requires_grad=False)
 
-        self.fmri_encoder = HierarchicalEncoder(d_model, n_heads, d_ff, dropout, n_layers_per_stack=1)
+        self.fmri_encoder = HierarchicalEncoder(d_model, n_heads, d_ff,
+                                                dropout, n_layers_per_stack=1)
 
         T = int(round(self.window_sec/self.tr))
-        self.fmri_decoder = fMRIDecodingAdapterLite(target_T=T, target_V=self.fmri_voxels, d_model=d_model, rank=16)
+        self.fmri_decoder = fMRIDecodingAdapterLite(target_T=T,
+                                                    target_V=self.fmri_voxels,
+                                                    d_model=d_model, rank=32)
 
         self.fmri_out_scale = nn.Parameter(torch.tensor(1.0))
         self.fmri_out_bias  = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, fmri_latents: torch.Tensor, fmri_T:int, fmri_V:int) -> torch.Tensor:
         fmri_adapt = self.adapter_fmri(fmri_latents)  # (B, 512, D)
-        fmri_adapt = fmri_adapt + self.pos_fmri[:fmri_adapt.size(1)].unsqueeze(0).to(fmri_adapt.device)
+        fmri_adapt = fmri_adapt + self.pos_fmri[:fmri_adapt.size(1)] \
+                                    .unsqueeze(0).to(fmri_adapt.device)
         _, fmr_hi = self.fmri_encoder(fmri_adapt, fmri_adapt)  # (B, Tf, D)
         fmri_flat = self.fmri_decoder(fmr_hi)                  # (B, T*V)
         fmri_sig  = fmri_flat.view(fmri_adapt.size(0), int(fmri_T), int(fmri_V))
@@ -247,7 +358,7 @@ class TranslatorFMRISelfAttn(nn.Module):
         return fmri_sig
 
 # =========================
-# Per-module load helpers (FIXED)
+# Per-module load helpers (AFFINE-AWARE)
 # =========================
 def _module_paths(run_dir: Path, tag: str) -> Dict[str, Path]:
     run_dir = Path(run_dir); run_dir.mkdir(parents=True, exist_ok=True)
@@ -260,7 +371,18 @@ def _module_paths(run_dir: Path, tag: str) -> Dict[str, Path]:
 
 def load_modules_if_exist(run_dir: Path, model: TranslatorFMRISelfAttn, tag: str,
                           which: Iterable[str], device: torch.device) -> set:
+    """
+    Loads any of {adapter, encoder, decoder, affine} found for `tag`.
+    - For 'affine', supports dict {"scale":..., "bias":...} and copies into parameters.
+    Returns a set of loaded component names.
+    """
     paths = _module_paths(run_dir, tag)
+    try:
+        print(f"[load] searching module files for tag='{tag}': "
+              f"adapter={paths['adapter'].name}, encoder={paths['encoder'].name}, "
+              f"decoder={paths['decoder'].name}, affine={paths['affine'].name}")
+    except Exception:
+        pass
     loaded = set()
 
     if "adapter" in which and paths["adapter"].exists():
@@ -280,13 +402,12 @@ def load_modules_if_exist(run_dir: Path, model: TranslatorFMRISelfAttn, tag: str
 
     if "affine" in which and paths["affine"].exists():
         sd = torch.load(paths["affine"], map_location=device)
-        # support dict {"scale":..., "bias":...} or full state_dict
         if isinstance(sd, dict) and "scale" in sd and "bias" in sd:
             with torch.no_grad():
                 model.fmri_out_scale.copy_(sd["scale"].to(model.fmri_out_scale.device))
                 model.fmri_out_bias.copy_(sd["bias"].to(model.fmri_out_bias.device))
         else:
-            # fallback: try strict=False state_dict-style
+            # best-effort fallback if someone saved a state_dict
             try:
                 model.load_state_dict(sd, strict=False)
             except Exception:
@@ -301,6 +422,11 @@ def load_modules_if_exist(run_dir: Path, model: TranslatorFMRISelfAttn, tag: str
 def load_or_make_split(eeg_root: Path, fmri_root: Path, run_dir: Path):
     p_split = Path(run_dir) / "subject_splits.json"
     inter_keys = collect_common_sr_keys(eeg_root, fmri_root)
+    try:
+        uniq_subs = sorted({int(k[0]) for k in inter_keys})
+        print(f"[split] intersecting (subject,task,run) keys = {len(inter_keys)} | subjects={uniq_subs}")
+    except Exception:
+        print(f"[split] intersecting keys = {len(inter_keys)}")
     if not inter_keys:
         raise RuntimeError("No (subject,task,run) intersections between EEG and fMRI trees.")
     if p_split.exists():
@@ -309,15 +435,52 @@ def load_or_make_split(eeg_root: Path, fmri_root: Path, run_dir: Path):
         tr = [int(norm_subj_id(s)) for s in js.get("train_subjects", [])]
         va = [int(norm_subj_id(s)) for s in js.get("val_subjects", [])]
         te = [int(norm_subj_id(s)) for s in js.get("test_subjects", [])]
+        print(f"[split] loaded subject_splits.json → train={tr} | val={va} | test={te}")
         train_keys, val_keys, test_keys = fixed_subject_keys(eeg_root, fmri_root, tr, va, te)
     else:
         subs = sorted({k[0] for k in inter_keys}, key=int)
         n = len(subs); nt = max(1, int(0.8*n)); nv = max(1, int(0.1*n))
         train_sub = set(subs[:nt]); val_sub = set(subs[nt:nt+nv]); test_sub = set(subs[nt+nv:])
+        print(f"[split] creating default split: Nsub={n} → train={len(train_sub)}, val={len(val_sub)}, test={len(test_sub)}")
         train_keys = tuple(k for k in inter_keys if k[0] in train_sub)
         val_keys   = tuple(k for k in inter_keys if k[0] in val_sub)
         test_keys  = tuple(k for k in inter_keys if k[0] in test_sub)
+    try:
+        tr_sub = sorted({int(k[0]) for k in train_keys}); va_sub = sorted({int(k[0]) for k in val_keys}); te_sub = sorted({int(k[0]) for k in test_keys})
+        print(f"[split] train: keys={len(train_keys)} subjects={tr_sub}")
+        print(f"[split] val  : keys={len(val_keys)} subjects={va_sub}")
+        print(f"[split] test : keys={len(test_keys)} subjects={te_sub}")
+    except Exception:
+        print(f"[split] train|val|test key counts: {len(train_keys)} | {len(val_keys)} | {len(test_keys)}")
     return train_keys, val_keys, test_keys
+
+# =========================
+# Optional: load fixed split from YAML
+# =========================
+def try_load_fixed_split_from_yaml(cfg_path: Path) -> Optional[Tuple[List[int], List[int], List[int]]]:
+    try:
+        if not cfg_path.exists():
+            print(f"[cfg] YAML not found: {cfg_path}")
+            return None
+        if yaml is None:
+            print(f"[cfg] PyYAML not available; skipping YAML split load.")
+            return None
+        with open(cfg_path, 'r') as f:
+            cfg = yaml.safe_load(f)
+        train_list = cfg.get('train', {}).get('train_subjects')
+        val_list   = cfg.get('train', {}).get('val_subjects')
+        test_list  = cfg.get('train', {}).get('test_subjects')
+        if train_list and val_list and test_list:
+            tr = [int(s) for s in train_list]
+            va = [int(s) for s in val_list]
+            te = [int(s) for s in test_list]
+            print(f"[cfg] loaded fixed split from YAML: train={tr} | val={va} | test={te}")
+            return tr, va, te
+        print(f"[cfg] YAML present but missing split keys; ignoring: {cfg_path}")
+        return None
+    except Exception as e:
+        print(f"[cfg] failed to load YAML split: {e}")
+        return None
 
 # =========================
 # Main run
@@ -335,6 +498,7 @@ def main():
     (out_dir / "plots").mkdir(parents=True, exist_ok=True)
     (out_dir / "tables").mkdir(parents=True, exist_ok=True)
 
+    print(f"[note] Writing diagnostics under: {out_dir}")
     print(f"[debug] torch {torch.__version__} | cuda={torch.cuda.is_available()} | device={device}")
     if torch.cuda.is_available():
         print(f"[debug] GPU: {torch.cuda.get_device_name(0)}")
@@ -346,8 +510,23 @@ def main():
         print(f"[debug] brainlm_mae import check failed: {e}")
 
     # Subject split & dataset
-    train_keys, val_keys, test_keys = load_or_make_split(Path(EEG_ROOT), Path(FMRI_ROOT), Path(RUN_DIR))
+    print(f"[cfg] RUN_DIR={RUN_DIR}")
+    print(f"[cfg] OUT_DIR={OUT_DIR}")
+    print(f"[cfg] SUBSET={SUBSET} | STAGE={STAGE} | TAG={TAG}")
+    print(f"[cfg] EEG_ROOT={EEG_ROOT}")
+    print(f"[cfg] FMRI_ROOT={FMRI_ROOT}")
+    # Try to load fixed split from YAML; otherwise fallback to on-disk split or default 80/10/10
+    yaml_split = try_load_fixed_split_from_yaml(REPO_ROOT / 'Multi_modal_NTM' / 'configs' / 'fmri_selfattn.yaml')
+    if yaml_split is not None:
+        tr, va, te = yaml_split
+        train_keys, val_keys, test_keys = fixed_subject_keys(Path(EEG_ROOT), Path(FMRI_ROOT), tr, va, te)
+    else:
+        train_keys, val_keys, test_keys = load_or_make_split(Path(EEG_ROOT), Path(FMRI_ROOT), Path(RUN_DIR))
     include_sr = {"train": train_keys, "val": val_keys, "test": test_keys}[SUBSET]
+    # Show a few keys
+    print(f"[split] using subset='{SUBSET}' with {len(include_sr)} (subject,task,run) keys")
+    for i, k in enumerate(include_sr[:min(8, len(include_sr))]):
+        print(f"  [split] key[{i}]: sub={k[0]} task={k[1]} run={k[2]}")
 
     ds = PairedAlignedDataset(
         eeg_root=EEG_ROOT, fmri_root=FMRI_ROOT, a424_label_nii=A424_LABEL_NII,
@@ -355,6 +534,7 @@ def main():
         channels_limit=CHANNELS_LIMIT, fmri_norm=FMRI_NORM, stride_sec=STRIDE_SEC,
         device='cpu', include_sr_keys=include_sr
     )
+    print(f"[dataset] windows in subset='{SUBSET}': {len(ds)} | window_sec={WINDOW_SEC} | stride_sec={STRIDE_SEC}")
     if len(ds) == 0:
         raise RuntimeError(f"Empty dataset for subset='{SUBSET}'. Check paths/splits.")
     dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False,
@@ -365,7 +545,11 @@ def main():
     batch = next(iter(dl))
     fmri_t = batch['fmri_window'].to(device)  # (B,T,V)
     B, T, V = map(int, fmri_t.shape)
+    meta0 = batch.get('meta', [{}])[0] if isinstance(batch.get('meta'), list) and len(batch['meta']) > 0 else {}
     print(f"[debug] batch shapes: fmri={tuple(fmri_t.shape)} | {fmt_mem()}")
+    if meta0:
+        print(f"[debug] first sample meta: sub={meta0.get('subject')} task={meta0.get('task')} run={meta0.get('run')} "
+              f"win_idx={meta0.get('window_idx')} eeg_path={meta0.get('eeg_path')} fmri_path={meta0.get('fmri_path')}")
 
     # Frozen BrainLM
     brainlm = FrozenBrainLM(Path(BRAINLM_MODEL_DIR), device)
@@ -412,18 +596,19 @@ def main():
     ).to(device)
     translator.eval()
 
-    # Load per-module weights (with fixed check)
+    # ---- Load per-module weights (ALWAYS try adapter/encoder/decoder/AFFINE) ----
     default_tag = f"stage{STAGE}_best"
     use_tag = TAG or default_tag
-    need = ["adapter"] if STAGE == 1 else (["adapter","encoder"] if STAGE == 2 else ["adapter","encoder","decoder","affine"])
-    loaded = load_modules_if_exist(Path(RUN_DIR), translator, use_tag, which=need, device=device)
-    missing = set(need) - loaded
-    if missing:
-        print(f"[WARN] Some modules for '{use_tag}' not found in {RUN_DIR}: {sorted(missing)}")
+    want = ["adapter", "encoder", "decoder", "affine"]
+    loaded = load_modules_if_exist(Path(RUN_DIR), translator, use_tag, which=want, device=device)
+
+    if not loaded:
+        print(f"[WARN] No modules found for tag '{use_tag}' in {RUN_DIR}.")
     else:
         print(f"[load] restored modules for tag '{use_tag}': {', '.join(sorted(loaded))}")
 
-    print(f"[diag] affine scale={translator.fmri_out_scale.item():.6f}, bias={translator.fmri_out_bias.item():.6f}")
+    print(f"[diag] affine scale={translator.fmri_out_scale.item():.6f}, "
+          f"bias={translator.fmri_out_bias.item():.6f}")
 
     # Reconstruct fMRI
     with torch.no_grad():
@@ -434,7 +619,27 @@ def main():
     x_true = fmri_t[b].detach().cpu().numpy()    # (T,V)
     x_rec  = recon[b].detach().cpu().numpy()     # (T,V)
 
-    # Compute per-ROI diag
+    # ---------- heatmaps ----------
+    SHARED_VLIM: Optional[Tuple[float, float]] = None
+    # Example to force identical scales across both:
+    # SHARED_VLIM = (min(x_true.min(), x_rec.min()), max(x_true.max(), x_rec.max()))
+
+    save_heatmap(
+        x_true,
+        out_dir / "plots" / "fmri_target_heatmap.png",
+        title="fMRI target (T × V)",
+        tr=float(TR),
+        vlim=SHARED_VLIM,
+    )
+    save_heatmap(
+        x_rec,
+        out_dir / "plots" / "fmri_recon_heatmap.png",
+        title="fMRI recon (T × V)",
+        tr=float(TR),
+        vlim=SHARED_VLIM,
+    )
+
+    # ---------- per-ROI diagnostics ----------
     diag_rows: List[List[float]] = []
     rs: List[Tuple[int,float]] = []
     for roi in range(V):
@@ -464,7 +669,41 @@ def main():
     print(f"[summary] mean r0={r_vals.mean():.3f} | median r0={np.median(r_vals):.3f} | max r0={r_vals.max():.3f}")
     print(f"[summary] mean std(GT)={std_gt.mean():.3f} | mean std(Rec)={std_rc.mean():.3f} | frac std(Rec)<0.2 = {small_var_frac:.2f}")
 
-    # Top-K plots (raw)
+    # ---------- NEW: fMRI correlation matrices ----------
+    C_fmri_gt  = corr_matrix(x_true)              # (V x V)
+    C_fmri_rec = corr_matrix(x_rec)               # (V x V)
+    C_fmri_x   = cross_corr_matrix(x_true, x_rec) # (V x V) GT vs Recon
+
+    plot_corrmat(
+        C_fmri_gt,
+        out_dir / "plots" / "corrmat_fmri_gt.png",
+        title="Corr — fMRI GT (ROI×ROI)",
+        xlabel="ROI (GT)",
+        ylabel="ROI (GT)",
+    )
+    plot_corrmat(
+        C_fmri_rec,
+        out_dir / "plots" / "corrmat_fmri_recon.png",
+        title="Corr — fMRI Recon (ROI×ROI)",
+        xlabel="ROI (Recon)",
+        ylabel="ROI (Recon)",
+    )
+    plot_corrmat(
+        C_fmri_x,
+        out_dir / "plots" / "corrmat_fmri_gt_vs_recon.png",
+        title="Cross Corr — fMRI GT vs Recon (ROI×ROI)",
+        xlabel="ROI (Recon)",
+        ylabel="ROI (GT)",
+    )
+
+    save_corr_csv(C_fmri_gt,  out_dir / "tables" / "corrmat_fmri_gt.csv",
+                  row_prefix="roi", col_prefix="roi")
+    save_corr_csv(C_fmri_rec, out_dir / "tables" / "corrmat_fmri_recon.csv",
+                  row_prefix="roi", col_prefix="roi")
+    save_corr_csv(C_fmri_x,   out_dir / "tables" / "corrmat_fmri_gt_vs_recon.csv",
+                  row_prefix="roi_gt", col_prefix="roi_rec")
+
+    # ---------- Top-K plots (raw) ----------
     top = rs[:min(TOP_K, len(rs))]
     t = np.arange(T) * float(TR)
     if len(top) > 0:

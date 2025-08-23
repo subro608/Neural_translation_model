@@ -1,26 +1,31 @@
 #!/usr/bin/env python3
 """
-Multi-modal neural translation model with hierarchical Transformer encoders and cross-attention
-Handles missing modalities and leverages multi-layer latent representations with BidirectionalAdaptiveCompressor
-Uses geometric mean strategy for optimal sequence alignment
-Includes decoders for reconstructing EEG (CBraMod latent format) and fMRI (BrainLM latent format)
+Multi-modal components (fMRI-focused) with axial RoPE and true S = T×V flow.
+
+Key points:
+- No fixed 512 anywhere. The sequence length is the true S = T×V.
+- fMRIInputAdapterConv1d: (L,B,Ttok,Dh) -> (B,S,D) with optional retarget to S.
+- AxialRotaryMHA: applies Rotary Positional Embeddings along time and voxel axes.
+- TransformerLayer / HierarchicalEncoder require (T, V) to compute axial RoPE.
+- fMRIDecodingAdapter2D: predicts (B,T,V) directly (time-only resize), removing the
+  rank-1-over-voxels issue in the old Lite decoder.
+
+Kept:
+- EEGDecodingAdapterLite (unchanged, included for completeness).
+- fMRIDecodingAdapterLite retained for backward-compat but DO NOT use for fMRI;
+  it’s rank-1 across voxels by design. Use fMRIDecodingAdapter2D instead.
 """
 
 import math
-import json
-import sys
-from pathlib import Path
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 # -------------------------------
-# Path setup for local modules
+# EEG (unchanged)
 # -------------------------------
-sys.path.append(str(Path(__file__).parent.parent / "CBraMod"))
-sys.path.append(str(Path(__file__).parent.parent / "BrainLM"))
-
 class EEGDecodingAdapterLite(nn.Module):
     """
     Very small EEG decoder.
@@ -29,11 +34,11 @@ class EEGDecodingAdapterLite(nn.Module):
     """
     def __init__(self, channels, patch_num, patch_size=200, d_model=128, rank=32):
         super().__init__()
-        self.channels = int(channels)
-        self.patch_num = int(patch_num)
+        self.channels   = int(channels)
+        self.patch_num  = int(patch_num)
         self.patch_size = int(patch_size)
-        self.d_model = int(d_model)
-        self.rank = int(rank)
+        self.d_model    = int(d_model)
+        self.rank       = int(rank)
         self.target_tokens = self.channels * self.patch_num
 
         self.seq_adjust = nn.Sequential(
@@ -41,37 +46,29 @@ class EEGDecodingAdapterLite(nn.Module):
             nn.GELU(),
             nn.LayerNorm(self.d_model),
         )
-        # low-rank factorization D -> r -> S
         self.to_rank   = nn.Linear(self.d_model, self.rank, bias=False)
         self.from_rank = nn.Linear(self.rank, self.patch_size, bias=True)
 
     def forward(self, fused: torch.Tensor) -> torch.Tensor:
         B, T, D = fused.shape
         x = self.seq_adjust(fused)
-
-        # resample sequence len to channels*patch_num
-        xt = x.transpose(1, 2)                       # (B, D, T)
+        xt = x.transpose(1, 2)  # (B,D,T)
         if T != self.target_tokens:
             if T < self.target_tokens:
                 xt = F.interpolate(xt, size=self.target_tokens, mode="linear", align_corners=False)
             else:
                 xt = F.adaptive_avg_pool1d(xt, self.target_tokens)
-        x = xt.transpose(1, 2)                        # (B, target_tokens, D)
-
-        # low-rank projection per token -> patch_size
-        z = self.to_rank(x)                           # (B, target_tokens, r)
-        z = self.from_rank(z)                         # (B, target_tokens, S)
-
-        # reshape tokens back to (C, P)
-        z = z.view(B, self.channels, self.patch_num, self.patch_size)  # (B,C,P,S)
+        x = xt.transpose(1, 2)  # (B,target_tokens,D)
+        z = self.from_rank(self.to_rank(x))  # (B,target_tokens,S)
+        z = z.view(B, self.channels, self.patch_num, self.patch_size)
         return z
 
-
+# -------------------------------
+# (Deprecated) fMRI Lite decoder
+# -------------------------------
 class fMRIDecodingAdapterLite(nn.Module):
     """
-    Very small fMRI decoder that outputs scalar tokens directly.
-    Input:  (B, Tfused, D)
-    Output: (B, T*V) tokens (scalar), caller reshapes to (B,T,V)
+    DEPRECATED for fMRI: rank-1 across voxels (kept for backwards-compat).
     """
     def __init__(self, target_T: int, target_V: int, d_model: int = 128, rank: int = 16):
         super().__init__()
@@ -84,514 +81,273 @@ class fMRIDecodingAdapterLite(nn.Module):
             nn.GELU(),
             nn.LayerNorm(self.d_model),
         )
-        # low-rank projection D -> r -> 1
         self.to_rank   = nn.Linear(self.d_model, self.rank, bias=False)
         self.from_rank = nn.Linear(self.rank, 1, bias=True)
 
     def forward(self, fused: torch.Tensor) -> torch.Tensor:
         B, T, D = fused.shape
-        x = self.seq_adjust(fused)                    # (B,T,D)
-
-        # produce scalar token per fused step
-        z = self.from_rank(self.to_rank(x))           # (B,T,1)
-        z = z.transpose(1, 2)                         # (B,1,T)
-
-        # resize to exactly T*V scalar tokens
+        x = self.seq_adjust(fused)
+        z = self.from_rank(self.to_rank(x))  # (B,T,1)
+        z = z.transpose(1, 2)                # (B,1,T)
         if T != self.target_tokens:
             if T < self.target_tokens:
                 z = F.interpolate(z, size=self.target_tokens, mode="linear", align_corners=False)
             else:
                 z = F.adaptive_avg_pool1d(z, self.target_tokens)
-
-        z = z.squeeze(1)                              # (B, target_tokens)
+        z = z.squeeze(1)                     # (B, target_tokens)
         return z
-# -------------------------------
-# Simplified Bidirectional Adaptive Compressor
-# -------------------------------
-class BidirectionalAdaptiveCompressor(nn.Module):
-    def __init__(self):
-        super().__init__()
 
-    def forward(self, eeg_seq, fmri_seq):
-        """
-        Args:
-            eeg_seq: (batch, eeg_len, d_model)
-            fmri_seq: (batch, fmri_len, d_model)
-        Returns:
-            compressed_eeg: (batch, target_len, d_model)
-            compressed_fmri: (batch, target_len, d_model)
-            target_length: int
-        """
-        batch_size, eeg_len, d_model = eeg_seq.shape
-        _, fmri_len, _ = fmri_seq.shape
-        target_length = math.ceil((eeg_len * fmri_len) ** 0.5)
-        return (
-            self._resize(eeg_seq, target_length),
-            self._resize(fmri_seq, target_length),
-            target_length,
+# -------------------------------
+# fMRI 2-D decoder (FIXED)
+# -------------------------------
+class fMRIDecodingAdapter2D(nn.Module):
+    """
+    Predicts V voxel channels first, then resizes along time only.
+    Input:  (B, Tfused, D)
+    Output: (B, T, V)
+    """
+    def __init__(self, target_T: int, target_V: int, d_model: int = 128, rank: int = 32):
+        super().__init__()
+        self.target_T = int(target_T)
+        self.target_V = int(target_V)
+        self.d_model  = int(d_model)
+        self.rank     = int(rank)
+
+        self.seq_adjust = nn.Sequential(
+            nn.Linear(self.d_model, self.d_model, bias=True),
+            nn.GELU(),
+            nn.LayerNorm(self.d_model),
         )
+        # low-rank factorization D -> rank -> V
+        self.to_rank   = nn.Linear(self.d_model, self.rank, bias=False)
+        self.to_voxels = nn.Linear(self.rank, self.target_V, bias=True)
 
-    def _resize(self, x, target_length):
-        B, T, D = x.shape
-        if T == target_length:
-            return x
-        xt = x.transpose(1, 2)
-        if T < target_length:
-            xt = F.interpolate(xt, size=target_length, mode="linear", align_corners=False)
-        else:
-            xt = F.adaptive_avg_pool1d(xt, target_length)
-        return xt.transpose(1, 2)
+    def forward(self, fused: torch.Tensor) -> torch.Tensor:
+        """
+        fused: (B, Tf, D) with Tf ~ S or any intermediate fused length
+        returns: (B, T, V) where T=self.target_T, V=self.target_V
+        """
+        B, Tf, D = fused.shape
+        x = self.seq_adjust(fused)           # (B,Tf,D)
+        z = self.to_voxels(self.to_rank(x))  # (B,Tf,V)
+        z = z.transpose(1, 2)                # (B,V,Tf)
+        if Tf != self.target_T:
+            # time-only resize
+            if Tf < self.target_T:
+                z = F.interpolate(z, size=self.target_T, mode="linear", align_corners=False)
+            else:
+                z = F.adaptive_avg_pool1d(z, self.target_T)
+        z = z.transpose(1, 2)                # (B,T,V)
+        return z
 
 # -------------------------------
-# Input Adapters
+# Input adapter (no fixed 512)
 # -------------------------------
-class ConvEEGInputAdapter(nn.Module):
-    """
-    Accepts either:
-    - x: (n_layers, batch, seq_len, channels, input_dim)
-    - x: (n_layers, batch, T, D) where T == channels * patch_num and D == input_dim
-    Projects (n_layers * input_dim) -> output_dim per token.
-    """
-    def __init__(self, seq_len, n_layers, channels, input_dim, output_dim=256):
-        super().__init__()
-        self.seq_len = seq_len
-        self.n_layers = n_layers
-        self.channels = channels
-        self.input_dim = input_dim
-        self.proj = nn.Linear(n_layers * input_dim, output_dim)
-        self.norm = nn.LayerNorm(output_dim)
-
-    def forward(self, x):
-        if x.dim() == 4:
-            L, B, T, D = x.shape
-            assert L == self.n_layers and D == self.input_dim
-            assert T == self.seq_len * self.channels
-            x = x.view(L, B, self.seq_len, self.channels, self.input_dim)
-        L, B, S, C, D = x.shape  # (L,B,seq_len,channels,input_dim)
-        x = x.permute(1, 2, 3, 0, 4).contiguous()          # (B, seq_len, channels, L, D)
-        x = x.view(B, S * C, L * D)                        # (B, S*C, L*D)
-        x = self.proj(x)                                   # (B, S*C, out_dim)
-        return self.norm(x)
-
 class fMRIInputAdapterConv1d(nn.Module):
     """
-    x: (n_layers, batch, seq_len, input_dim)
-    Projects (n_layers * input_dim) -> output_dim, resamples to target_seq_len.
+    x: (n_layers, batch, seq_len_tokens, input_dim)
+    Projects (n_layers * input_dim) -> output_dim, optional retarget to target_seq_len (= S=T×V).
     """
-    def __init__(self, seq_len, n_layers, input_dim, output_dim=256, target_seq_len=512):
+    def __init__(self, seq_len: int, n_layers: int, input_dim: int,
+                 output_dim: int = 256, target_seq_len: Optional[int] = None):
         super().__init__()
-        self.n_layers = n_layers
-        self.input_dim = input_dim
-        self.target_seq_len = target_seq_len
-        self.proj = nn.Linear(n_layers * input_dim, output_dim)
-        self.norm = nn.LayerNorm(output_dim)
+        self.n_layers = int(n_layers)
+        self.input_dim = int(input_dim)
+        self.output_dim = int(output_dim)
+        self.target_seq_len = int(target_seq_len) if target_seq_len is not None else None
+        self.proj = nn.Linear(self.n_layers * self.input_dim, self.output_dim)
+        self.norm = nn.LayerNorm(self.output_dim)
 
-    def forward(self, x):
-        L, B, T, D = x.shape
-        assert L == self.n_layers and D == self.input_dim
-        x = x.permute(1, 2, 0, 3).contiguous()   # (B, T, L, D)
-        x = x.view(B, T, L * D)                  # (B, T, L*D)
-        xt = x.transpose(1, 2)                   # (B, L*D, T)
-        if T != self.target_seq_len:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (L,B,Ttok,Din)
+        returns: (B, S', D) where S' = target_seq_len (if set) else Ttok
+        """
+        L, B, T, Din = x.shape
+        assert L == self.n_layers and Din == self.input_dim
+        x = x.permute(1, 2, 0, 3).contiguous()         # (B,T,L,D)
+        x = x.view(B, T, L * Din)                      # (B,T,L*D)
+        xt = x.transpose(1, 2)                         # (B,L*D,T)
+        if self.target_seq_len is not None and T != self.target_seq_len:
             if T < self.target_seq_len:
                 xt = F.interpolate(xt, size=self.target_seq_len, mode="linear", align_corners=False)
             else:
                 xt = F.adaptive_avg_pool1d(xt, self.target_seq_len)
-        x = xt.transpose(1, 2)                   # (B, target, L*D)
-        x = self.proj(x)
+        x = xt.transpose(1, 2)                         # (B,S',L*D)
+        x = self.proj(x)                               # (B,S',out)
         return self.norm(x)
 
 # -------------------------------
-# Transformer Blocks
+# Axial Rotary MHA
+# -------------------------------
+def _build_rope_cos_sin(idx: torch.Tensor, rot_dim: int, base: float = 10000.0) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    idx: (S,) integer positions
+    rot_dim must be even. returns cos,sin: (S, rot_dim)
+    """
+    if rot_dim % 2 != 0:
+        rot_dim -= 1  # ensure even
+    half = rot_dim // 2
+    inv_freq = 1.0 / (base ** (torch.arange(0, half, device=idx.device, dtype=torch.float32) / half))
+    angles = idx.float().unsqueeze(1) * inv_freq.unsqueeze(0)  # (S, half)
+    cos = torch.cos(angles).repeat_interleave(2, dim=-1)       # (S, rot_dim)
+    sin = torch.sin(angles).repeat_interleave(2, dim=-1)       # (S, rot_dim)
+    return cos, sin
+
+def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """
+    x:   (B, H, S, R)   R even
+    cos: (S, R)
+    sin: (S, R)
+    """
+    x_even = x[..., ::2]
+    x_odd  = x[..., 1::2]
+    cos_e  = cos[..., ::2].unsqueeze(0).unsqueeze(0)  # (1,1,S,R/2)
+    sin_e  = sin[..., ::2].unsqueeze(0).unsqueeze(0)
+    cos_o  = cos[..., 1::2].unsqueeze(0).unsqueeze(0)
+    sin_o  = sin[..., 1::2].unsqueeze(0).unsqueeze(0)
+    # Interleave apply
+    out_even = x_even * cos_e - x_odd * sin_e
+    out_odd  = x_even * sin_o + x_odd * cos_o
+    out = torch.empty_like(x)
+    out[..., ::2] = out_even
+    out[..., 1::2] = out_odd
+    return out
+
+class AxialRotaryMHA(nn.Module):
+    """
+    Multi-head self-attention with axial Rotary Positional Embeddings.
+    Splits head dim into: [time-rotated | voxel-rotated | (optional) rest]
+    """
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0,
+                 rope_fraction: float = 1.0, rope_base: float = 10000.0):
+        super().__init__()
+        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim  = embed_dim // num_heads
+        self.scale     = self.head_dim ** -0.5
+        self.rope_base = float(rope_base)
+        # rotate at most rope_fraction of head_dim (rounded to nearest even)
+        rot_total = int(self.head_dim * max(0.0, min(1.0, rope_fraction)))
+        rot_total = (rot_total // 2) * 2
+        self.rot_t = rot_total // 2
+        self.rot_v = rot_total - self.rot_t
+        self.rest  = self.head_dim - (self.rot_t + self.rot_v)
+
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.o_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.attn_drop = nn.Dropout(dropout)
+        self.proj_drop = nn.Dropout(dropout)
+
+    def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
+        B, S, D = x.shape
+        x = x.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)  # (B,H,S,hd)
+        return x
+
+    def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:
+        B, H, S, hd = x.shape
+        x = x.transpose(1, 2).contiguous().view(B, S, H * hd)  # (B,S,D)
+        return x
+
+    def forward(self, x: torch.Tensor, *, T: int, V: int,
+                attn_mask: Optional[torch.Tensor] = None,
+                key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        x: (B, S, D) where S = T×V
+        """
+        B, S, D = x.shape
+        assert S == T * V, f"Expected S=T×V, got S={S}, T×V={T*V}"
+
+        q = self._split_heads(self.q_proj(x))  # (B,H,S,hd)
+        k = self._split_heads(self.k_proj(x))
+        v = self._split_heads(self.v_proj(x))
+
+        # Axial indices
+        p = torch.arange(S, device=x.device)
+        t_idx = torch.div(p, V, rounding_mode='floor')  # (S,)
+        v_idx = p % V                                   # (S,)
+
+        # Build cos/sin for each axis on the split dims
+        if self.rot_t > 0:
+            cos_t, sin_t = _build_rope_cos_sin(t_idx, self.rot_t, base=self.rope_base)
+        if self.rot_v > 0:
+            cos_v, sin_v = _build_rope_cos_sin(v_idx, self.rot_v, base=self.rope_base)
+
+        # Slice head dim: [t | v | rest]
+        if self.rot_t > 0:
+            q_t, k_t = q[..., :self.rot_t], k[..., :self.rot_t]
+            q[..., :self.rot_t] = _apply_rope(q_t, cos_t, sin_t)
+            k[..., :self.rot_t] = _apply_rope(k_t, cos_t, sin_t)
+        if self.rot_v > 0:
+            t_end = self.rot_t
+            v_end = self.rot_t + self.rot_v
+            q_v, k_v = q[..., t_end:v_end], k[..., t_end:v_end]
+            q[..., t_end:v_end] = _apply_rope(q_v, cos_v, sin_v)
+            k[..., t_end:v_end] = _apply_rope(k_v, cos_v, sin_v)
+        # rest (if any) is left unrotated
+
+        # Scaled dot-product attention
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B,H,S,S)
+
+        if attn_mask is not None:
+            attn = attn + attn_mask  # broadcast as needed
+        if key_padding_mask is not None:
+            # key_padding_mask: (B,S) -> (B,1,1,S)
+            attn = attn.masked_fill(key_padding_mask.unsqueeze(1).unsqueeze(2), float("-inf"))
+
+        attn = F.softmax(attn, dim=-1)
+        attn = self.attn_drop(attn)
+
+        y = torch.matmul(attn, v)  # (B,H,S,hd)
+        y = self._merge_heads(y)   # (B,S,D)
+        y = self.o_proj(y)
+        y = self.proj_drop(y)
+        return y
+
+# -------------------------------
+# Transformer blocks (with axial RoPE)
 # -------------------------------
 class TransformerLayer(nn.Module):
-    def __init__(self, d_model, n_heads, d_ff, dropout):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float, rope_fraction: float = 1.0):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
-        self.ff = nn.Sequential(
-            nn.Linear(d_model, d_ff), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(d_ff, d_model), nn.Dropout(dropout),
-        )
+        self.self_attn = AxialRotaryMHA(d_model, n_heads, dropout=dropout, rope_fraction=rope_fraction)
         self.n1 = nn.LayerNorm(d_model)
         self.n2 = nn.LayerNorm(d_model)
         self.do = nn.Dropout(dropout)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model),
+            nn.Dropout(dropout),
+        )
 
-    def forward(self, x, mask=None):
-        attn_out, _ = self.self_attn(x, x, x, attn_mask=mask)
+    def forward(self, x: torch.Tensor, *, T: int, V: int,
+                attn_mask: Optional[torch.Tensor] = None,
+                key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        attn_out = self.self_attn(x, T=T, V=V, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
         x = self.n1(x + self.do(attn_out))
         x = self.n2(x + self.ff(x))
         return x
 
-class CrossAttentionLayer(nn.Module):
-    def __init__(self, d_model, n_heads, dropout):
-        super().__init__()
-        self.cross = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
-        self.n = nn.LayerNorm(d_model)
-        self.do = nn.Dropout(dropout)
-
-    def forward(self, query, key_value, mask=None, key_padding_mask=None):
-        attn_out, _ = self.cross(query, key_value, key_value, attn_mask=mask, key_padding_mask=key_padding_mask)
-        return self.n(query + self.do(attn_out))
-
 class HierarchicalEncoder(nn.Module):
-    def __init__(self, d_model, n_heads, d_ff, dropout, n_layers_per_stack):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float, n_layers_per_stack: int, rope_fraction: float = 1.0):
         super().__init__()
-        self.lower_stack = nn.ModuleList([TransformerLayer(d_model, n_heads, d_ff, dropout) for _ in range(n_layers_per_stack)])
-        self.higher_stack = nn.ModuleList([TransformerLayer(d_model, n_heads, d_ff, dropout) for _ in range(n_layers_per_stack)])
+        self.lower_stack = nn.ModuleList([
+            TransformerLayer(d_model, n_heads, d_ff, dropout, rope_fraction=rope_fraction)
+            for _ in range(n_layers_per_stack)
+        ])
+        self.higher_stack = nn.ModuleList([
+            TransformerLayer(d_model, n_heads, d_ff, dropout, rope_fraction=rope_fraction)
+            for _ in range(n_layers_per_stack)
+        ])
 
-    def forward(self, x_lower, x_higher, mask=None):
+    def forward(self, x_lower: torch.Tensor, x_higher: torch.Tensor, *, T: int, V: int) -> Tuple[torch.Tensor, torch.Tensor]:
         for layer in self.lower_stack:
-            x_lower = layer(x_lower, mask)
+            x_lower = layer(x_lower, T=T, V=V)
         for layer in self.higher_stack:
-            x_higher = layer(x_higher, mask)
+            x_higher = layer(x_higher, T=T, V=V)
         return x_lower, x_higher
-
-# -------------------------------
-# Model Loading (CBraMod / BrainLM)
-# -------------------------------
-def _safe_load_state_dict(model, weights_path):
-    try:
-        checkpoint = torch.load(weights_path, map_location='cpu', weights_only=True)  # PyTorch 2+
-    except TypeError:
-        checkpoint = torch.load(weights_path, map_location='cpu')                     # PyTorch <2
-    missing, unexpected = model.load_state_dict(checkpoint, strict=False)
-    print(f"   Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
-
-def load_cbramod(channels, patch_num, patch_size=200, n_layer=12, nhead=8):
-    from models.cbramod import CBraMod
-    model = CBraMod(
-        in_dim=patch_size, out_dim=patch_size, d_model=patch_size,
-        seq_len=patch_num, n_layer=n_layer, nhead=nhead
-    )
-    weights_path = Path(__file__).parent.parent / "CBraMod" / "pretrained_weights" / "pretrained_weights.pth"
-    try:
-        _safe_load_state_dict(model, weights_path)
-        print("✅ CBraMod loaded")
-    except Exception as e:
-        print(f"❌ Failed to load CBraMod weights: {e}")
-        return None
-    batch_size = 1
-    x = torch.randn(batch_size, channels, patch_num, patch_size)
-    model.eval()
-    with torch.no_grad():
-        patch_emb = model.patch_embedding(x)
-        model.encoder.eval()
-        cur = patch_emb
-        outs = []
-        for layer in model.encoder.layers:
-            cur = layer(cur)
-            outs.append(cur)
-        combined_latent = torch.stack(outs, dim=0)  # (L,B,T,D) or (L,B,seq_len,channels,input_dim) depending on model
-        print(f"CBraMod combined latent shape: {tuple(combined_latent.shape)}")
-        return model, x, combined_latent
-
-def load_brainlm(num_voxels=424, timepoints_per_voxel=200, n_layer=5):
-    from brainlm_mae.modeling_brainlm import BrainLMForPretraining
-    from brainlm_mae.configuration_brainlm import BrainLMConfig
-    config_path = Path(__file__).parent.parent / "BrainLM" / "pretrained_models" / "2023-06-06-22_15_00-checkpoint-1400" / "config.json"
-    with open(config_path, 'r') as f:
-        config_data = json.load(f)
-    config = BrainLMConfig(**config_data)
-    model = BrainLMForPretraining(config)
-    weights_path = Path(__file__).parent.parent / "BrainLM" / "pretrained_models" / "2023-06-06-22_15_00-checkpoint-1400" / "pytorch_model.bin"
-    try:
-        _safe_load_state_dict(model, weights_path)
-        print("✅ BrainLM loaded")
-    except Exception as e:
-        print(f"❌ Failed to load BrainLM weights: {e}")
-        return None
-    batch_size = 1
-    signal_vectors = torch.randn(batch_size, num_voxels, timepoints_per_voxel)
-    xyz_vectors = torch.randn(batch_size, num_voxels, 3)
-    noise = torch.rand(batch_size, num_voxels * (timepoints_per_voxel // 20))
-    model.eval()
-    with torch.no_grad():
-        embeddings, mask, ids_restore = model.vit.embeddings(
-            signal_vectors=signal_vectors, xyz_vectors=xyz_vectors, noise=noise
-        )
-        encoder_outputs = model.vit.encoder(
-            hidden_states=embeddings, output_hidden_states=True, return_dict=True
-        )
-        all_hidden_states = encoder_outputs.hidden_states
-        combined_latent = torch.stack(all_hidden_states, dim=0)  # (L,B,T,D)
-        print(f"BrainLM combined latent shape: {tuple(combined_latent.shape)}")
-        return model, signal_vectors, xyz_vectors, noise, combined_latent
-
-# -------------------------------
-# Decoding Adapters (EEG / fMRI)
-# -------------------------------
-class EEGDecodingAdapter(nn.Module):
-    """
-    Input:  (B, fused_seq_len, d_model)
-    Output: (n_layers, B, patch_num, channels, patch_size)
-    """
-    def __init__(self, channels, patch_num, n_layers=12, patch_size=200, d_model=256):
-        super().__init__()
-        self.channels = channels
-        self.patch_num = patch_num
-        self.n_layers = n_layers
-        self.patch_size = patch_size
-        self.d_model = d_model
-        self.original_seq_len = channels * patch_num
-
-        self.seq_adjuster = nn.Sequential(
-            nn.Linear(d_model, d_model), nn.ReLU(), nn.Dropout(0.1), nn.LayerNorm(d_model)
-        )
-        self.layer_projector = nn.Linear(d_model, n_layers * patch_size)
-        self.layer_norm = nn.LayerNorm(n_layers * patch_size)
-        self.refinement = nn.Sequential(
-            nn.Linear(n_layers * patch_size, n_layers * patch_size * 2),
-            nn.ReLU(), nn.Dropout(0.1),
-            nn.Linear(n_layers * patch_size * 2, n_layers * patch_size),
-            nn.LayerNorm(n_layers * patch_size)
-        )
-        self.final_activation = nn.Tanh()
-
-    def forward(self, fused_representation):
-        B, T, D = fused_representation.shape
-        if T != self.original_seq_len:
-            xt = fused_representation.transpose(1, 2)
-            xt = F.adaptive_avg_pool1d(xt, self.original_seq_len)
-            x = xt.transpose(1, 2)
-        else:
-            x = fused_representation
-        x = self.seq_adjuster(x)
-        x = self.layer_projector(x)
-        x = self.layer_norm(x)
-        x = self.refinement(x)
-        x = self.final_activation(x)
-        x = x.view(B, self.channels, self.patch_num, self.n_layers * self.patch_size)
-        x = x.view(B, self.channels, self.patch_num, self.n_layers, self.patch_size)
-        x = x.permute(3, 0, 2, 1, 4)  # (L,B,patch_num,channels,patch_size)
-        return x
-
-class fMRIDecodingAdapter(nn.Module):
-    """
-    Fast + memory-safe fMRI decoder.
-    - Single-shot linear interpolation
-    - Optional cap on target tokens with automatic downsampling
-    Returns:
-      reconstructed: (n_layers, B, effective_target_len, hidden_size)
-      effective_target_len: int
-      downsample_factor: int
-    """
-    def __init__(self, num_voxels=424, timepoints_per_voxel=200, n_layers=5,
-                 hidden_size=256, d_model=256,
-                 max_target_tokens=100_000, downsample_to_cap=True):
-        super().__init__()
-        self.num_voxels = num_voxels
-        self.timepoints_per_voxel = timepoints_per_voxel
-        self.n_layers = n_layers
-        self.hidden_size = hidden_size
-        self.d_model = d_model
-
-        self.nominal_target_len = num_voxels * timepoints_per_voxel
-        self.max_target_tokens = max_target_tokens
-        self.downsample_to_cap = downsample_to_cap
-
-        if self.nominal_target_len > self.max_target_tokens and self.downsample_to_cap:
-            factor = math.ceil(self.nominal_target_len / self.max_target_tokens)
-            self.effective_target_len = self.nominal_target_len // factor
-            self.downsample_factor = factor
-        else:
-            self.effective_target_len = self.nominal_target_len
-            self.downsample_factor = 1
-
-        self.seq_adjuster = nn.Sequential(
-            nn.Linear(d_model, d_model * 2), nn.ReLU(), nn.Dropout(0.1),
-            nn.Linear(d_model * 2, d_model), nn.LayerNorm(d_model)
-        )
-        self.layer_projector = nn.Linear(d_model, n_layers * hidden_size)
-        self.layer_norm = nn.LayerNorm(n_layers * hidden_size)
-        self.smooth_conv = nn.Conv1d(
-            in_channels=n_layers * hidden_size, out_channels=n_layers * hidden_size,
-            kernel_size=3, padding=1, groups=n_layers * hidden_size
-        )
-        self.refinement = nn.Sequential(
-            nn.Linear(n_layers * hidden_size, n_layers * hidden_size * 2),
-            nn.ReLU(), nn.Dropout(0.1),
-            nn.Linear(n_layers * hidden_size * 2, n_layers * hidden_size),
-            nn.LayerNorm(n_layers * hidden_size)
-        )
-        self.final_activation = nn.Identity() 
-
-    def forward(self, fused_representation):
-        B, T, D = fused_representation.shape
-        x = self.seq_adjuster(fused_representation)     # (B,T,D)
-        x = self.layer_projector(x)                     # (B,T,L*H)
-        x = self.layer_norm(x)
-
-        tgt = self.effective_target_len
-        xt = x.transpose(1, 2)                          # (B,L*H,T)
-        if T != tgt:
-            xt = F.interpolate(xt, size=tgt, mode="linear", align_corners=False)
-            xt = self.smooth_conv(xt)
-        x = xt.transpose(1, 2)                          # (B,tgt,L*H)
-
-        x = self.refinement(x)
-        x = self.final_activation(x)
-
-        x = x.view(B, tgt, self.n_layers, self.hidden_size).permute(2, 0, 1, 3)
-        return x, tgt, self.downsample_factor
-
-# -------------------------------
-# Main experiment
-# -------------------------------
-def main():
-    print("=" * 60)
-    print("🧠 Multi-Modal Neural Translation Model with Geometric Mean Compression")
-    print("=" * 60)
-
-    # Only TWO test cases (Test 3 removed)
-    eeg_configs = [
-        {"channels": 34, "patch_num": 4},   # 136 tokens
-        {"channels": 64, "patch_num": 8},   # 512 tokens
-    ]
-    fmri_configs = [
-        {"timepoints_per_voxel": 200},
-        {"timepoints_per_voxel": 400},
-    ]
-
-    compressor = BidirectionalAdaptiveCompressor()
-
-    for i, (eeg_config, fmri_config) in enumerate(zip(eeg_configs, fmri_configs)):
-        print(f"\n{'='*60}")
-        print(f"Test Case {i+1}: EEG(ch={eeg_config['channels']}, patches={eeg_config['patch_num']}), "
-              f"fMRI(voxels=424, t/voxel={fmri_config['timepoints_per_voxel']})")
-        print(f"{'='*60}")
-
-        modality_mask = torch.tensor([[1, 1]], dtype=torch.bool)
-
-        # ---- Load CBraMod and adapt EEG
-        print("\n🔄 Loading CBraMod...")
-        cbramod_result = load_cbramod(**eeg_config)
-        if cbramod_result is None:
-            print("❌ CBraMod loading failed, skipping test case...")
-            continue
-        _, _, combined_latent_eeg = cbramod_result
-
-        print("\n🔧 Applying EEG adapter...")
-        adapter_eeg = ConvEEGInputAdapter(
-            seq_len=eeg_config["patch_num"],
-            n_layers=12,
-            channels=eeg_config["channels"],
-            input_dim=200,
-            output_dim=256
-        )
-        adapted_eeg = adapter_eeg(combined_latent_eeg)  # (B, channels*patch_num, 256)
-        eeg_lower = adapted_eeg
-        eeg_higher = adapted_eeg
-
-        # ---- Load BrainLM and adapt fMRI
-        print("\n🔄 Loading BrainLM...")
-        brainlm_result = load_brainlm(**fmri_config)
-        if brainlm_result is None:
-            print("❌ BrainLM loading failed, skipping test case...")
-            continue
-        _, _, _, _, combined_latent_fmri = brainlm_result
-
-        print("\n🔧 Applying fMRI Conv1d adapter...")
-        adapter_fmri = fMRIInputAdapterConv1d(
-            seq_len=424 * fmri_config["timepoints_per_voxel"],
-            n_layers=combined_latent_fmri.shape[0],
-            input_dim=combined_latent_fmri.shape[-1],
-            output_dim=256,
-            target_seq_len=512
-        )
-        adapted_fmri = adapter_fmri(combined_latent_fmri)  # (B, 512, 256)
-        fmri_lower = adapted_fmri
-        fmri_higher = adapted_fmri
-
-        if not modality_mask[0, 0]:
-            eeg_lower = torch.zeros_like(eeg_lower)
-            eeg_higher = torch.zeros_like(eeg_higher)
-        if not modality_mask[0, 1]:
-            fmri_lower = torch.zeros_like(fmri_lower)
-            fmri_higher = torch.zeros_like(fmri_higher)
-
-        # ---- Transformer params
-        d_model = 256
-        n_heads = 8
-        d_ff = 1024
-        dropout = 0.1
-        n_layers_per_stack = 2
-
-        eeg_encoder = HierarchicalEncoder(d_model, n_heads, d_ff, dropout, n_layers_per_stack)
-        fmri_encoder = HierarchicalEncoder(d_model, n_heads, d_ff, dropout, n_layers_per_stack)
-        cross_attn = CrossAttentionLayer(d_model, n_heads, dropout)
-
-        eeg_lower_enc, eeg_higher_enc = eeg_encoder(eeg_lower, eeg_higher)
-        fmri_lower_enc, fmri_higher_enc = fmri_encoder(fmri_lower, fmri_higher)
-
-        print(f"Before compression - EEG Higher: {tuple(eeg_higher_enc.shape)}, fMRI Higher: {tuple(fmri_higher_enc.shape)}")
-
-        print("\n🔧 Applying Geometric Mean Compression...")
-        eeg_compressed, fmri_compressed, target_length = compressor(eeg_higher_enc, fmri_higher_enc)
-        eeg_lower_compressed, fmri_lower_compressed, _ = compressor(eeg_lower_enc, fmri_lower_enc)
-
-        print(f"After compression - EEG: {tuple(eeg_compressed.shape)}, fMRI: {tuple(fmri_compressed.shape)}")
-        print(f"📏 Geometric mean target length: {target_length}")
-
-        fused_output = cross_attn(eeg_compressed, fmri_compressed)  # (B, target_len, d_model)
-
-        print("\n" + "="*60)
-        print("📊 TRANSLATOR RESULTS SUMMARY")
-        print("="*60)
-        print(f"EEG Lower Input:        {tuple(eeg_lower.shape)}")
-        print(f"EEG Lower Compressed:   {tuple(eeg_lower_compressed.shape)}")
-        print(f"EEG Higher Input:       {tuple(eeg_higher.shape)}")
-        print(f"EEG Higher Compressed:  {tuple(eeg_compressed.shape)}")
-        print(f"fMRI Lower Input:       {tuple(fmri_lower.shape)}")
-        print(f"fMRI Lower Compressed:  {tuple(fmri_lower_compressed.shape)}")
-        print(f"fMRI Higher Input:      {tuple(fmri_higher.shape)}")
-        print(f"fMRI Higher Compressed: {tuple(fmri_compressed.shape)}")
-        print(f"Fused Output:           {tuple(fused_output.shape)}")
-
-        eeg_ratio = eeg_higher_enc.shape[1] / eeg_compressed.shape[1]
-        fmr_ratio = fmri_higher_enc.shape[1] / fmri_compressed.shape[1]
-        print(f"\n📈 COMPRESSION ANALYSIS (Geometric Mean Strategy)")
-        print(f"Target length (√{eeg_higher_enc.shape[1]}×{fmri_higher_enc.shape[1]}): {target_length}")
-        print(f"EEG ratio: {eeg_ratio:.2f}:1 {'(compressed' if eeg_ratio>1 else '(upsampled' if eeg_ratio<1 else '(unchanged)'} "
-              f" {eeg_higher_enc.shape[1]} → {eeg_compressed.shape[1]})")
-        print(f"fMRI ratio: {fmr_ratio:.2f}:1 {'(compressed' if fmr_ratio>1 else '(upsampled' if fmr_ratio<1 else '(unchanged)'} "
-              f" {fmri_higher_enc.shape[1]} → {fmri_compressed.shape[1]})")
-
-        # ---- Decode
-        print("\n🔁 Decoding fused representation back to modality latents...")
-
-        eeg_decoder = EEGDecodingAdapter(
-            channels=eeg_config["channels"],
-            patch_num=eeg_config["patch_num"],
-            n_layers=12,
-            patch_size=200,
-            d_model=d_model
-        )
-        fmri_decoder = fMRIDecodingAdapter(
-            num_voxels=424,
-            timepoints_per_voxel=fmri_config["timepoints_per_voxel"],
-            n_layers=5,
-            hidden_size=256,
-            d_model=d_model,
-            max_target_tokens=100_000,
-            downsample_to_cap=True
-        )
-
-        reconstructed_eeg = eeg_decoder(fused_output)
-        reconstructed_fmri, eff_len, ds_factor = fmri_decoder(fused_output)
-
-        expected_eeg_shape = (12, fused_output.shape[0], eeg_config["patch_num"], eeg_config["channels"], 200)
-        print("\n" + "="*60)
-        print("🧩 DECODE RESULTS")
-        print("="*60)
-        print(f"EEG reconstructed:   {tuple(reconstructed_eeg.shape)}")
-        print(f"EEG expected:        {expected_eeg_shape}")
-        print(f"EEG shape OK?        {'✅' if reconstructed_eeg.shape == expected_eeg_shape else '❌'}")
-
-        nominal_len = 424 * fmri_config["timepoints_per_voxel"]
-        print(f"\nfMRI reconstructed:  {tuple(reconstructed_fmri.shape)}")
-        print(f"[fMRI decoder] nominal_len={nominal_len}, effective_len={eff_len}, downsample_factor={ds_factor}")
-
-        print("\n✅ Structural end-to-end pass complete for this test case.")
-
-if __name__ == "__main__":
-    main()

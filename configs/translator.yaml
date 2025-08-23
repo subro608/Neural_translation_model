@@ -4,11 +4,11 @@ train:
   a424_label_nii: D:/Neuroinformatics_research_2025/BrainLM/A424_resampled_to_bold.nii.gz
   cbramod_weights: D:/Neuroinformatics_research_2025/MNI_templates/CBraMod/pretrained_weights/pretrained_weights.pth
   brainlm_model_dir: D:/Neuroinformatics_research_2025/MNI_templates/BrainLM/pretrained_models/2023-06-06-22_15_00-checkpoint-1400
-  output_dir: D:/Neuroinformatics_research_2025/Multi_modal_NTM/translator_runs_aug14_updated_fmri_loss_w_6_eeg_loss_w_1
+  output_dir: D:/Neuroinformatics_research_2025/Multi_modal_NTM/oddball_Neural_translation_run1_aug18_fmribranch
   device: cuda
   seed: 42
   epochs: 200
-  batch_size: 16
+  batch_size: 2
   lr: 0.0001
   weight_decay: 0.0001
   window_sec: 40
@@ -17,8 +17,8 @@ train:
   amp: false
   debug: false
   fmri_norm: zscore
-  wandb_project: Neural_translation_august14
-  wandb_run_name: oddball_Neural_translation_run1_aug14_data_split_updated_fmri_loss_w_6_eeg_loss_w_1
+  wandb_project: Neural_translation_august18
+  wandb_run_name: oddball_Neural_translation_run1_aug18_fmribranch
   wandb_off: false
   eeg_loss_w: 1.0
   fmri_loss_w: 6.0

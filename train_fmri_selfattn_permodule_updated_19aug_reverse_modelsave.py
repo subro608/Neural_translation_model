@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
 Reversed stage-wise training (decoder-first) for fMRI-only self-attention model.
+
 Order:
-  - Rev Stage 1:    train **decoder only**  (no affine by default)
-  - Rev Stage 2:    train **decoder + encoder** (warm-starts from Rev Stage 1 best)
+  - Rev Stage 1:    train **decoder only**  (affine frozen)
+  - Rev Stage 2:    train **decoder + encoder** (warm-start from Rev Stage 1 best; affine frozen)
   - Rev Stage 3:    train **adapter + encoder + decoder** (+ optional affine via --train_affine_stage3)
 
-What this script adds:
+What this script adds / fixes (updated):
+- Uses fMRIDecodingAdapter2D (predicts V channels first; time-only resize) to remove rank-1-over-voxels bug.
+- No fixed 512 tokens. The adapter retargets to the true sequence length S = T×V.
+- Drops 1-D additive positional encodings; encoder uses axial RoPE along (time, ROI) via HierarchicalEncoder.
 - BEST & LAST checkpoints for every sweep trial and the main run.
 - On every NEW BEST: generate diagnostics under out_dir:
     plots/topK_fmri_corr.png
@@ -79,12 +83,12 @@ for p in candidate_blm_roots:
         sys.path.insert(0, str(p.parent)); break
 
 # -----------------------------
-# Local modules
+# Local modules (UPDATED)
 # -----------------------------
 from module import (  # type: ignore
     fMRIInputAdapterConv1d,
-    HierarchicalEncoder,
-    fMRIDecodingAdapterLite,
+    HierarchicalEncoder,          # axial RoPE inside
+    fMRIDecodingAdapter2D,        # <-- fixed 2-D decoder
 )
 
 # BrainLM imports
@@ -168,7 +172,9 @@ class TrainCfg:
     lr_stage3: float = 5e-5
     weight_decay: float = 1e-4
     amp: bool = False
-    train_fmri_affine_stage3: bool = False  # unfreeze fmri_out_scale/bias in Rev Stage 3
+
+    # affine policy for reversed staging
+    train_affine_stage3: bool = False  # unfreeze fmri_out_scale/bias only in Rev Stage 3 when True
 
     # fixed subjects
     train_subjects: Optional[List[int]] = None
@@ -253,41 +259,61 @@ class FrozenBrainLM(nn.Module):
         return torch.stack(list(enc.hidden_states), dim=0)  # (L,B,Ttok,Dh)
 
 # -----------------------------
-# Translator (fMRI-only, self-attn)
+# Translator (fMRI-only, axial-RoPE self-attn)
 # -----------------------------
 class TranslatorFMRISelfAttn(nn.Module):
+    """
+    fMRI branch:
+      adapter_fmri (→ S=T×V) -> fmri_encoder (axial RoPE) -> fmri_decoder_2d -> tanh + affine
+    """
     def __init__(self, cfg: TrainCfg, fmri_n_layers:int, fmri_hidden_size:int):
         super().__init__()
         self.cfg = cfg
-        # Adapter from BrainLM stacked latents to d_model tokens (resamples to 512)
+        T = int(round(cfg.window_sec / cfg.tr))
+        V = int(cfg.fmri_voxels)
+        S = T * V
+
+        # Adapter: stack BrainLM latents → tokens, retarget to S=T×V
         self.adapter_fmri = fMRIInputAdapterConv1d(
-            seq_len=cfg.fmri_voxels * int(round(cfg.window_sec/cfg.tr)),
-            n_layers=fmri_n_layers, input_dim=fmri_hidden_size,
-            output_dim=cfg.d_model, target_seq_len=512
+            seq_len=V * T,  # nominal
+            n_layers=fmri_n_layers,
+            input_dim=fmri_hidden_size,
+            output_dim=cfg.d_model,
+            target_seq_len=S
         )
-        self.pos_fmri = self._pos_enc(cfg.d_model, 100_000)
-        self.fmri_encoder = HierarchicalEncoder(cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.dropout, n_layers_per_stack=1)
-        T = int(round(cfg.window_sec/cfg.tr))
-        self.fmri_decoder = fMRIDecodingAdapterLite(target_T=T, target_V=cfg.fmri_voxels, d_model=cfg.d_model, rank=32)
+
+        # Self-attention encoder (lower/higher stacks identical here; we use 'higher')
+        self.fmri_encoder = HierarchicalEncoder(
+            cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.dropout,
+            n_layers_per_stack=1, rope_fraction=1.0
+        )
+
+        # 2-D decoder (FIXED): predicts (B,T,V) with time-only up/downsample
+        self.fmri_decoder = fMRIDecodingAdapter2D(
+            target_T=T, target_V=V, d_model=cfg.d_model, rank=32
+        )
+
+        # Output affine (per-run learnable; may remain frozen until stage 3)
         self.fmri_out_scale = nn.Parameter(torch.tensor(1.0))
         self.fmri_out_bias  = nn.Parameter(torch.tensor(0.0))
 
-    @staticmethod
-    def _pos_enc(d_model:int, max_len:int):
-        pe = torch.zeros(max_len, d_model)
-        pos = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
-        div = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32)*(-math.log(10000.0)/d_model))
-        pe[:,0::2]=torch.sin(pos*div); pe[:,1::2]=torch.cos(pos*div)
-        return nn.Parameter(pe, requires_grad=False)
+        self.T = T
+        self.V = V
 
     def forward(self, fmri_latents: torch.Tensor, fmri_T:int, fmri_V:int) -> torch.Tensor:
-        fmri_adapt = self.adapter_fmri(fmri_latents)  # (B, 512, D)
-        fmri_adapt = fmri_adapt + self.pos_fmri[:fmri_adapt.size(1)].unsqueeze(0).to(fmri_adapt.device)
-        _, fmr_hi = self.fmri_encoder(fmri_adapt, fmri_adapt)  # (B, Tf, D)
-        fmri_flat = self.fmri_decoder(fmr_hi)                  # (B, T*V)
-        fmri_sig  = fmri_flat.view(fmri_adapt.size(0), int(fmri_T), int(fmri_V))
-        fmri_sig  = torch.tanh(fmri_sig)  # keep as in your reverse trainer
-        fmri_sig  = self.fmri_out_scale * fmri_sig + self.fmri_out_bias
+        """
+        fmri_latents: (L,B,Ttok,Dh) from BrainLM
+        returns: (B,T,V)
+        """
+        # Project & retarget to S=T×V
+        fmri_adapt = self.adapter_fmri(fmri_latents)       # (B,S,D) with S=T×V
+        # Axial-RoPE encoder
+        _, fmr_hi = self.fmri_encoder(fmri_adapt, fmri_adapt, T=fmri_T, V=fmri_V)  # (B,S,D)
+        # 2-D decoder -> (B,T,V)
+        fmri_sig = self.fmri_decoder(fmr_hi)
+        # squash + affine
+        fmri_sig = torch.tanh(fmri_sig)
+        fmri_sig = self.fmri_out_scale * fmri_sig + self.fmri_out_bias
         return fmri_sig
 
 # -----------------------------
@@ -298,10 +324,10 @@ def freeze_all(m: nn.Module):
 
 def set_stage_rev(m: TranslatorFMRISelfAttn, stage: int, *, train_affine_stage3: bool = False):
     """
-    Reversed (decoder-first) stages (affine ALWAYS trainable):
-      - 1: decoder
-      - 2: decoder + encoder
-      - 3: adapter + encoder + decoder
+    Reversed (decoder-first) stages:
+      - 1: decoder (affine frozen)
+      - 2: decoder + encoder (affine frozen)
+      - 3: adapter + encoder + decoder (+ optional affine if train_affine_stage3)
     """
     # freeze everything first
     freeze_all(m)
@@ -323,10 +349,9 @@ def set_stage_rev(m: TranslatorFMRISelfAttn, stage: int, *, train_affine_stage3:
     else:
         raise ValueError(f"Unknown reversed stage {stage}")
 
-    # Affine params ALWAYS learnable (ignore train_affine_stage3)
-    m.fmri_out_scale.requires_grad = True
-    m.fmri_out_bias.requires_grad  = True
-
+    # Affine learnable only in stage 3 when requested
+    m.fmri_out_scale.requires_grad = bool(train_affine_stage3 and stage == 3)
+    m.fmri_out_bias.requires_grad  = bool(train_affine_stage3 and stage == 3)
 
 # -----------------------------
 # Per-module save/load helpers
@@ -452,13 +477,12 @@ def make_dataloaders(cfg: TrainCfg, device: torch.device) -> Tuple[DataLoader, D
         dl = DataLoader(
             ds,
             batch_size=cfg.batch_size,
-            shuffle=(name == "train"),        # ← shuffle only for train
+            shuffle=(name == "train"),
             num_workers=cfg.num_workers,
             pin_memory=(device.type == 'cuda'),
             collate_fn=collate_paired,
             drop_last=False
         )
-
         if cfg.debug:
             print(f"[debug][dataloader] {name}: batches={len(dl)} (bs={cfg.batch_size}, workers={cfg.num_workers}, pin={device.type=='cuda'})")
         return dl
@@ -645,8 +669,7 @@ def _pearsonr_safe(a: np.ndarray, b: np.ndarray) -> float:
 
 def _lagged_corr(gt: np.ndarray, rc: np.ndarray, max_lag:int) -> Tuple[int, float]:
     lags = range(-max_lag, max_lag+1)
-    best_r = -2.0
-    best_l = 0
+    best_r = -2.0; best_l = 0
     for l in lags:
         if l < 0:
             r = _pearsonr_safe(gt[:l], rc[-l:])
@@ -680,7 +703,6 @@ def _ensure_dirs(out_dir: Path):
 
 def _plot_heatmap(arr: np.ndarray, title: str, out_path: Path, xlabel="ROI", ylabel="Time (TR)", cmap="viridis"):
     plt.figure(figsize=(12, 6))
-    # arr: (T,V). We display V (ROI) on X-axis, time on Y (transpose for imshow).
     plt.imshow(arr.T, aspect="auto", interpolation="nearest", origin="upper", cmap=cmap)
     plt.colorbar()
     plt.title(title)
@@ -694,13 +716,12 @@ def _plot_topk_and_bars(t: np.ndarray, x_true: np.ndarray, x_rec: np.ndarray,
                         out_dir: Path, TR: float, top_k: int = 12, make_calib: bool = True,
                         plot_max_points: int = 1000):
     T, V = x_true.shape
-    # r per ROI
     rs: List[Tuple[int,float]] = []
     for roi in range(V):
         rs.append((roi, _pearsonr_safe(x_true[:, roi], x_rec[:, roi])))
     rs.sort(key=lambda t_: t_[1], reverse=True)
     top = rs[:min(top_k, len(rs))]
-    # Top-K time series (raw)
+
     if len(top) > 0:
         fig, axes = plt.subplots(nrows=len(top), ncols=1, figsize=(12, 2.2*len(top)), sharex=False)
         if len(top) == 1: axes = [axes]
@@ -717,7 +738,7 @@ def _plot_topk_and_bars(t: np.ndarray, x_true: np.ndarray, x_rec: np.ndarray,
         fig.tight_layout()
         fig.savefig(out_dir / "plots" / "topK_fmri_corr.png", dpi=150)
         plt.close(fig)
-    # Calibrated plots
+
     if make_calib and len(top) > 0:
         fig, axes = plt.subplots(nrows=len(top), ncols=1, figsize=(12, 2.2*len(top)), sharex=False)
         if len(top) == 1: axes = [axes]
@@ -735,7 +756,7 @@ def _plot_topk_and_bars(t: np.ndarray, x_true: np.ndarray, x_rec: np.ndarray,
         fig.tight_layout()
         fig.savefig(out_dir / "plots" / "topK_fmri_corr_calib.png", dpi=150)
         plt.close(fig)
-    # Bar chart (all ROIs)
+
     all_roi = [roi for roi,_ in rs]
     all_r   = [r for _,r in rs]
     order = np.argsort(all_r)[::-1]
@@ -795,17 +816,14 @@ def generate_fmri_diagnostics(
     fmri_latents = brainlm.extract_latents(signal_vectors, xyz)  # (L,B,Ttok,Dh)
     recon = model(fmri_latents, fmri_T=T, fmri_V=V)              # (B,T,V)
 
-    # Work on first item
     b = 0
     x_true = fmri_t[b].detach().cpu().numpy()    # (T,V)
     x_rec  = recon[b].detach().cpu().numpy()     # (T,V)
 
-    # Save heatmaps
     _plot_heatmap(x_true, "GT (T×V)", out_dir / "plots" / "heatmap_gt.png")
     _plot_heatmap(x_rec,  "Recon (T×V)", out_dir / "plots" / "heatmap_recon.png")
     _plot_heatmap(np.abs(x_true - x_rec), "|GT - Recon| (T×V)", out_dir / "plots" / "heatmap_absdiff.png", cmap="magma")
 
-    # Top-K + bars; metrics per ROI (CSV)
     rs = _plot_topk_and_bars(
         t=np.arange(T)*float(cfg.tr),
         x_true=x_true, x_rec=x_rec,
@@ -813,7 +831,6 @@ def generate_fmri_diagnostics(
         make_calib=make_calib_plots, plot_max_points=plot_max_points
     )
 
-    # Extended diagnostics CSV
     rows: List[List[float]] = []
     for roi in range(V):
         gt = x_true[:, roi]
@@ -830,13 +847,9 @@ def generate_fmri_diagnostics(
             w.writerow(row)
     print(f"[diag] wrote diagnostics -> {csv_path}")
 
-    # W&B: log images as artifacts or summary
     if wandb_run is not None:
         try:
-            wandb_run.log({
-                "diag/revstage": stage,
-                "diag/tag": tag_for_logging or "",
-            })
+            wandb_run.log({"diag/revstage": stage, "diag/tag": tag_for_logging or ""})
             for name in ["heatmap_gt.png", "heatmap_recon.png", "heatmap_absdiff.png",
                          "topK_fmri_corr.png", "corr_bars_fmri.png", "topK_fmri_corr_calib.png"]:
                 p = out_dir / "plots" / name
@@ -846,7 +859,7 @@ def generate_fmri_diagnostics(
             pass
 
 # -----------------------------
-# Auto-sweep helpers
+# Auto-sweep helpers (unchanged)
 # -----------------------------
 def dataclass_replace(obj, **updates):
     from dataclasses import replace as _replace
@@ -1081,7 +1094,7 @@ def _apply_config_defaults(parser: argparse.ArgumentParser) -> Dict[str, Any]:
 # Main
 # -----------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Reversed (decoder-first) stage-wise fMRI-only training/testing (self-attn) + per-module checkpoints + W&B + Auto-Resume + Auto-Sweep + Diagnostics")
+    ap = argparse.ArgumentParser(description="Reversed (decoder-first) stage-wise fMRI-only training/testing (axial RoPE + 2-D decoder) + per-module checkpoints + W&B + Auto-Resume + Auto-Sweep + Diagnostics")
     ap.add_argument("--config", type=str, default=None, help="YAML/JSON config; if YAML has sections, uses 'train'")
     ap.add_argument("--eeg_root", type=str)
     ap.add_argument("--fmri_root", type=str)
@@ -1182,7 +1195,7 @@ def main():
         lr_stage2=args.lr2,
         lr_stage3=args.lr3,
         weight_decay=args.weight_decay,
-        train_fmri_affine_stage3=bool(args.train_affine_stage3),
+        train_affine_stage3=bool(args.train_affine_stage3),
         train_subjects=args.train_subjects,
         val_subjects=args.val_subjects,
         test_subjects=args.test_subjects,
@@ -1248,11 +1261,7 @@ def main():
             print(f"[debug] brainlm_mae import check failed: {e}")
         print(f"[debug] sys.path[:5] = {sys.path[:5]}")
 
-    # ---------- AUTO-SWEEP (before main W&B run) ----------
-    if cfg.auto_sweep and args.mode == "train":
-        # NOTE: Python doesn't support '&&'; keep it as 'and' in actual code!
-        pass
-    # (Fixing the above typo properly:)
+    # ---------- AUTO-SWEEP ----------
     if cfg.auto_sweep and args.mode == "train":
         stage = int(args.stage)
         sweep_dir = Path(cfg.out_dir) / f"sweeps_revstage{stage}"
@@ -1370,7 +1379,7 @@ def main():
                 print(f"[WARN] Some modules for '{tag}' were not found: {sorted(missing)}")
 
     # ---------- Set trainable ----------
-    set_stage_rev(translator, stage, train_affine_stage3=cfg.train_fmri_affine_stage3)
+    set_stage_rev(translator, stage, train_affine_stage3=cfg.train_affine_stage3)
     trainable = [n for n,p in translator.named_parameters() if p.requires_grad]
     print(f"[rev stage {stage}][{mode}] trainable: {len(trainable)} tensors")
     for n in trainable: print("  -", n)
@@ -1440,7 +1449,6 @@ def main():
                 ts_best = save_trainstate(out_dir, stage_label, tag="best", epoch=ep, best_val=best_val_total, opt=opt, scaler=scaler)
                 print(f"[RevStage{stage}] ✅ new best {best_val_total:.6f}")
 
-                # diagnostics on BEST (val)
                 try:
                     generate_fmri_diagnostics(
                         cfg=cfg, out_dir=out_dir, stage=stage,
@@ -1467,7 +1475,6 @@ def main():
             print(f"[TEST][revstage {stage}] test_total_loss={res['total']:.6f}")
             if run is not None:
                 wandb.log({"test/total_loss": float(res["total"]), "revstage": stage})
-            # Diagnostics on test split
             try:
                 generate_fmri_diagnostics(
                     cfg=cfg, out_dir=out_dir, stage=stage,
@@ -1483,7 +1490,6 @@ def main():
             print(f"[TEST][revstage {stage}] val_total_loss={res['total']:.6f}")
             if run is not None:
                 wandb.log({"val/total_loss": float(res["total"]), "revstage": stage})
-            # Diagnostics on val split
             try:
                 generate_fmri_diagnostics(
                     cfg=cfg, out_dir=out_dir, stage=stage,
@@ -1502,3 +1508,9 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# Example:
+# python train_fmri_selfattn_permodule_updated_19aug_reverse_modelsave.py \
+#   --config configs/fmri_selfattn_rev.yaml --stage 1 --mode train \
+#   --auto_sweep --sweep_epochs 5 --sweep_loss_list huber charbonnier mse mae \
+#   --sweep_lr1 5e-4 5e-5 1e-4 5e-2 --num_workers 4
