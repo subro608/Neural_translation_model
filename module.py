@@ -11,38 +11,40 @@ Key points:
   rank-1-over-voxels issue in the old Lite decoder.
 
 Kept:
-- EEGDecodingAdapterLite (unchanged, included for completeness).
-- fMRIDecodingAdapterLite retained for backward-compat but DO NOT use for fMRI;
-  it’s rank-1 across voxels by design. Use fMRIDecodingAdapter2D instead.
+- EEGDecodingAdapterLite (unchanged architecture; safer downsample now).
+- fMRIDecodingAdapterLite retained for backward-compat but DO NOT use for fMRI.
 """
 
-import math
 from typing import Optional, Tuple
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.nn.functional as F
 
+# -------------------------------
+# Safe time resize (fixes CUDA adaptive pooling crash)
+# -------------------------------
 def _time_resize_safe_BVT(x_BVT: torch.Tensor, target_T: int) -> torch.Tensor:
     """
     Resize along time for a (B, V, T) tensor.
-    - Uses linear interpolation for upsampling.
-    - Uses 'area' (mean-preserving) for downsampling via a 2D trick (add a dummy H=1).
+    - For exact integer downsample factors, use avg_pool1d (stable, low shared mem).
+    - Otherwise: linear 1D interpolation.
+    - For upsample: linear 1D interpolation.
     """
     B, V, T = x_BVT.shape
     if T == target_T:
         return x_BVT
     if T > target_T:
-        # downsample: approximate average pooling semantics
-        x4 = x_BVT.unsqueeze(2)  # (B, V, 1, T)
-        x4 = F.interpolate(x4, size=(1, target_T), mode="area")
-        return x4.squeeze(2)     # (B, V, target_T)
+        factor = T // target_T
+        if factor * target_T == T:
+            # expects shape (N, C, L) → (B, V, T) already matches (N=B, C=V, L=T)
+            return F.avg_pool1d(x_BVT, kernel_size=factor, stride=factor, ceil_mode=False)
+        else:
+            return F.interpolate(x_BVT, size=target_T, mode="linear", align_corners=False)
     else:
-        # upsample: linear 1D interpolation
         return F.interpolate(x_BVT, size=target_T, mode="linear", align_corners=False)
+
 # -------------------------------
-# EEG (unchanged)
+# EEG (with safer downsample)
 # -------------------------------
 class EEGDecodingAdapterLite(nn.Module):
     """
@@ -75,7 +77,12 @@ class EEGDecodingAdapterLite(nn.Module):
             if T < self.target_tokens:
                 xt = F.interpolate(xt, size=self.target_tokens, mode="linear", align_corners=False)
             else:
-                xt = F.adaptive_avg_pool1d(xt, self.target_tokens)
+                # safer than adaptive_avg_pool1d for large factors
+                factor = T // self.target_tokens
+                if factor * self.target_tokens == T:
+                    xt = F.avg_pool1d(xt, kernel_size=factor, stride=factor, ceil_mode=False)
+                else:
+                    xt = F.interpolate(xt, size=self.target_tokens, mode="linear", align_corners=False)
         x = xt.transpose(1, 2)  # (B,target_tokens,D)
         z = self.from_rank(self.to_rank(x))  # (B,target_tokens,S)
         z = z.view(B, self.channels, self.patch_num, self.patch_size)
@@ -121,7 +128,7 @@ class fMRIDecodingAdapter2D(nn.Module):
         return z
 
 # -------------------------------
-# Input adapter (no fixed 512)
+# Input adapter (no fixed 512; safer downsample)
 # -------------------------------
 class fMRIInputAdapterConv1d(nn.Module):
     """
@@ -150,12 +157,12 @@ class fMRIInputAdapterConv1d(nn.Module):
         xt = x.transpose(1, 2)                         # (B,L*D,T)
         if self.target_seq_len is not None and T != self.target_seq_len:
             if T > self.target_seq_len:
-                # downsample (N,C,L) -> use 2D 'area' trick
-                xt4 = xt.unsqueeze(2)  # (B, C, 1, L)
-                xt4 = F.interpolate(xt4, size=(1, self.target_seq_len), mode="area")
-                xt  = xt4.squeeze(2)
+                factor = T // self.target_seq_len
+                if factor * self.target_seq_len == T:
+                    xt = F.avg_pool1d(xt, kernel_size=factor, stride=factor, ceil_mode=False)
+                else:
+                    xt = F.interpolate(xt, size=self.target_seq_len, mode="linear", align_corners=False)
             else:
-                # upsample
                 xt = F.interpolate(xt, size=self.target_seq_len, mode="linear", align_corners=False)
         x = xt.transpose(1, 2)                         # (B,S',L*D)
         x = self.proj(x)                               # (B,S',out)
@@ -184,13 +191,16 @@ def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.
     cos: (S, R)
     sin: (S, R)
     """
+    # cast cos/sin to x dtype to avoid implicit up/downcasts under AMP
+    cos = cos.to(dtype=x.dtype)
+    sin = sin.to(dtype=x.dtype)
+
     x_even = x[..., ::2]
     x_odd  = x[..., 1::2]
     cos_e  = cos[..., ::2].unsqueeze(0).unsqueeze(0)  # (1,1,S,R/2)
     sin_e  = sin[..., ::2].unsqueeze(0).unsqueeze(0)
     cos_o  = cos[..., 1::2].unsqueeze(0).unsqueeze(0)
     sin_o  = sin[..., 1::2].unsqueeze(0).unsqueeze(0)
-    # Interleave apply
     out_even = x_even * cos_e - x_odd * sin_e
     out_odd  = x_even * sin_o + x_odd * cos_o
     out = torch.empty_like(x)
@@ -273,14 +283,12 @@ class AxialRotaryMHA(nn.Module):
             k[..., t_end:v_end] = _apply_rope(k_v, cos_v, sin_v)
         # rest (if any) is left unrotated
 
-        # Scaled dot-product attention
+        # Scaled dot-product attention (custom SDPA to keep shapes)
         attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B,H,S,S)
-
         if attn_mask is not None:
-            attn = attn + attn_mask  # broadcast as needed
+            attn = attn + attn_mask.to(attn.dtype)
         if key_padding_mask is not None:
-            # key_padding_mask: (B,S) -> (B,1,1,S)
-            attn = attn.masked_fill(key_padding_mask.unsqueeze(1).unsqueeze(2), float("-inf"))
+            attn = attn.masked_fill(key_padding_mask.unsqueeze(1).unsqueeze(2).to(torch.bool), float("-inf"))
 
         attn = F.softmax(attn, dim=-1)
         attn = self.attn_drop(attn)
@@ -292,7 +300,7 @@ class AxialRotaryMHA(nn.Module):
         return y
 
 # -------------------------------
-# Transformer blocks (with axial RoPE)
+# Transformer blocks (Pre-LN; axial RoPE inside)
 # -------------------------------
 class TransformerLayer(nn.Module):
     def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float, rope_fraction: float = 1.0):
@@ -312,10 +320,11 @@ class TransformerLayer(nn.Module):
     def forward(self, x: torch.Tensor, *, T: int, V: int,
                 attn_mask: Optional[torch.Tensor] = None,
                 key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        attn_out = self.self_attn(x, T=T, V=V, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
-        x = self.n1(x + self.do(attn_out))
-        x = self.n2(x + self.ff(x))
-        return x
+        # Pre-LN
+        y = x + self.do(self.self_attn(self.n1(x), T=T, V=V,
+                                       attn_mask=attn_mask, key_padding_mask=key_padding_mask))
+        z = y + self.ff(self.n2(y))
+        return z
 
 class HierarchicalEncoder(nn.Module):
     def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float, n_layers_per_stack: int, rope_fraction: float = 1.0):
