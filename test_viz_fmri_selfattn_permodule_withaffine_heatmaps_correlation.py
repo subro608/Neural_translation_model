@@ -56,35 +56,33 @@ FMRI_ROOT         = Path(r"D:\Neuroinformatics_research_2025\Oddball\ds000116")
 A424_LABEL_NII    = Path(r"D:\Neuroinformatics_research_2025\BrainLM\A424_resampled_to_bold.nii.gz")
 BRAINLM_MODEL_DIR = Path(r"D:\Neuroinformatics_research_2025\MNI_templates\BrainLM\pretrained_models\2023-06-06-22_15_00-checkpoint-1400")
 
-RUN_DIR           = Path(r"D:\Neuroinformatics_research_2025\Multi_modal_NTM\translator_sweep_runs_viz_20aug_normal_100epochs_sweep\sweeps_stage3\trial_005_mse_lr5.0e-05_cw0.0_tv0.0")
+RUN_DIR           = Path(r"D:\Neuroinformatics_research_2025\Multi_modal_NTM\translator_sweep_runs_viz_23aug_reverse_100epoch_sweep\sweeps_revstage2\trial_001_huber_lr8.0e-05_cw0.0_tv0.0")
 # Keep outputs tidy but colocated with the run:
-SUBSET= "val"   # "train" | "val" | "test"
+SUBSET            = "train"   # "train" | "val" | "test"
+OUT_DIR           = RUN_DIR / f"viz_diagnostics_{SUBSET}"
 
-OUT_DIR= RUN_DIR / f"viz_diagnostics_{SUBSET}"
+STAGE             = 1       # 1 | 2 | 3 (only used for default tag name)
+TAG               = None     # None -> uses f"revstage{STAGE}_best" (matches trainer)
+TOP_K             = 34
+PLOT_MAX_POINTS   = 1000
+MAX_LAG_TR        = 3         # search Pearson r over [-MAX_LAG_TR..+MAX_LAG_TR]
+MAKE_CALIB_PLOTS  = True      # plot GT vs linearly-calibrated Recon (per ROI)
 
-# SUBSET              = "train"   # "train" | "val" | "test"
-STAGE               = 3        # 1 | 2 | 3 (only used for default tag name)
-TAG                 = "stage3_best"  # e.g., "stage3_best"; None -> uses f"stage{STAGE}_best"
-TOP_K               = 12
-PLOT_MAX_POINTS     = 1000
-MAX_LAG_TR          = 3         # search Pearson r over [-MAX_LAG_TR..+MAX_LAG_TR]
-MAKE_CALIB_PLOTS    = True      # plot GT vs linearly-calibrated Recon (per ROI)
-
-DEVICE              = "cuda"
-SEED                = 42
-WINDOW_SEC          = 40
-TR                  = 2.0
-FMRI_NORM           = "zscore"   # "zscore" | "psc" | "mad" | "none"
-BATCH_SIZE          = 1
-NUM_WORKERS         = 0
-STRIDE_SEC          = 10
-CHANNELS_LIMIT      = 34
+DEVICE            = "cuda"
+SEED              = 42
+WINDOW_SEC        = 40
+TR                = 2.0
+FMRI_NORM         = "zscore"   # "zscore" | "psc" | "mad" | "none"
+BATCH_SIZE        = 1
+NUM_WORKERS       = 0
+STRIDE_SEC        = 10
+CHANNELS_LIMIT    = 34
 
 # =========================
 # Repo paths / sys.path
 # =========================
-THIS_DIR   = Path(__file__).parent
-REPO_ROOT  = THIS_DIR.parent
+THIS_DIR    = Path(__file__).parent
+REPO_ROOT   = THIS_DIR.parent
 CBRAMOD_DIR = REPO_ROOT / "CBraMod"
 BRAINLM_DIR = REPO_ROOT / "BrainLM"
 
@@ -114,8 +112,8 @@ for p in candidate_blm_roots:
 # =========================
 from module import (  # type: ignore
     fMRIInputAdapterConv1d,
-    HierarchicalEncoder,
-    fMRIDecodingAdapterLite,
+    HierarchicalEncoder,          # axial RoPE inside; requires (T, V) on forward
+    fMRIDecodingAdapter2D,        # <— fixed 2-D decoder (predict V then time-only resize)
 )
 from brainlm_mae.modeling_brainlm import BrainLMForPretraining  # type: ignore
 from brainlm_mae.configuration_brainlm import BrainLMConfig     # type: ignore
@@ -272,7 +270,29 @@ def save_corr_csv(C: np.ndarray, out_path: Path,
                        [f"{float(v):.6f}" for v in C[i]])
 
 # =========================
-# Frozen BrainLM
+# Torch load compat (match trainer)
+# =========================
+def _torch_load_compat(path: Path, map_location, *, allow_weights_only: bool = False):
+    try:
+        return torch.load(str(path), map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(str(path), map_location=map_location)
+    except Exception as e1:
+        if allow_weights_only:
+            try:
+                import torch.serialization as ts
+                try:
+                    from torch.torch_version import TorchVersion  # type: ignore
+                    ts.add_safe_globals([TorchVersion])
+                except Exception:
+                    pass
+                return torch.load(str(path), map_location=map_location, weights_only=True)
+            except Exception as e2:
+                raise RuntimeError(f"Failed to load {path.name} via classic and safe weights_only paths:\n{e1}\n{e2}") from e2
+        raise
+
+# =========================
+# Frozen BrainLM (match trainer)
 # =========================
 class FrozenBrainLM(nn.Module):
     def __init__(self, model_dir: Path, device: torch.device):
@@ -282,7 +302,7 @@ class FrozenBrainLM(nn.Module):
         with open(cfg_path, "r") as f:
             cfg = BrainLMConfig(**json.load(f))
         self.model = BrainLMForPretraining(cfg)
-        ckpt = torch.load(str(w_path), map_location=device)
+        ckpt = _torch_load_compat(w_path, map_location=device, allow_weights_only=True)
         self.model.load_state_dict(ckpt, strict=False)
         self.model.eval()
         for p in self.model.parameters(): p.requires_grad = False
@@ -306,55 +326,57 @@ class FrozenBrainLM(nn.Module):
         return torch.stack(list(enc.hidden_states), dim=0)  # (L,B,Ttok,Dh)
 
 # =========================
-# Translator head (fMRI-only)
+# Translator head (aligned to trainer)
 # =========================
 class TranslatorFMRISelfAttn(nn.Module):
     """
     fMRI-only path:
-      adapter_fmri -> fmri_encoder (self-attn) -> fmri_decoder -> tanh + affine
+      adapter_fmri (→ S=T×V) -> fmri_encoder (axial RoPE) -> fmri_decoder_2d -> tanh + affine
     """
     def __init__(self, fmri_voxels:int, window_sec:int, tr:float,
                  fmri_n_layers:int, fmri_hidden_size:int,
                  d_model:int=128, n_heads:int=4, d_ff:int=512, dropout:float=0.1):
         super().__init__()
-        import math as _m
         self.fmri_voxels = int(fmri_voxels)
         self.window_sec  = int(window_sec)
         self.tr          = float(tr)
 
+        T = int(round(self.window_sec / self.tr))
+        V = int(self.fmri_voxels)
+        S = T * V
+
+        # Adapter: stack BrainLM latents → tokens, retarget to S=T×V
         self.adapter_fmri = fMRIInputAdapterConv1d(
-            seq_len=self.fmri_voxels * int(round(self.window_sec/self.tr)),
+            seq_len=S,  # nominal
             n_layers=fmri_n_layers, input_dim=fmri_hidden_size,
-            output_dim=d_model, target_seq_len=512
+            output_dim=d_model, target_seq_len=S
         )
-        # sinusoidal PE
-        pe = torch.zeros(100_000, d_model)
-        pos = torch.arange(0, 100_000, dtype=torch.float32).unsqueeze(1)
-        div = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) *
-                        (-_m.log(10000.0)/d_model))
-        pe[:,0::2]=torch.sin(pos*div); pe[:,1::2]=torch.cos(pos*div)
-        self.pos_fmri = nn.Parameter(pe, requires_grad=False)
 
-        self.fmri_encoder = HierarchicalEncoder(d_model, n_heads, d_ff,
-                                                dropout, n_layers_per_stack=1)
+        # Axial-RoPE encoder (two stacks; we use 'higher' output)
+        self.fmri_encoder = HierarchicalEncoder(
+            d_model, n_heads, d_ff, dropout,
+            n_layers_per_stack=1, rope_fraction=1.0
+        )
 
-        T = int(round(self.window_sec/self.tr))
-        self.fmri_decoder = fMRIDecodingAdapterLite(target_T=T,
-                                                    target_V=self.fmri_voxels,
-                                                    d_model=d_model, rank=32)
+        # 2-D decoder: predicts (B,T,V) with time-only up/downsample
+        self.fmri_decoder = fMRIDecodingAdapter2D(
+            target_T=T, target_V=V, d_model=d_model, rank=32
+        )
 
+        # Output affine (always learnable)
         self.fmri_out_scale = nn.Parameter(torch.tensor(1.0))
         self.fmri_out_bias  = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, fmri_latents: torch.Tensor, fmri_T:int, fmri_V:int) -> torch.Tensor:
-        fmri_adapt = self.adapter_fmri(fmri_latents)  # (B, 512, D)
-        fmri_adapt = fmri_adapt + self.pos_fmri[:fmri_adapt.size(1)] \
-                                    .unsqueeze(0).to(fmri_adapt.device)
-        _, fmr_hi = self.fmri_encoder(fmri_adapt, fmri_adapt)  # (B, Tf, D)
-        fmri_flat = self.fmri_decoder(fmr_hi)                  # (B, T*V)
-        fmri_sig  = fmri_flat.view(fmri_adapt.size(0), int(fmri_T), int(fmri_V))
-        fmri_sig  = torch.tanh(fmri_sig)
-        fmri_sig  = self.fmri_out_scale * fmri_sig + self.fmri_out_bias
+        # Project & retarget to S=T×V
+        fmri_adapt = self.adapter_fmri(fmri_latents)       # (B,S,D) where S=T×V
+        # Axial-RoPE encoder (requires T,V)
+        _, fmr_hi = self.fmri_encoder(fmri_adapt, fmri_adapt, T=fmri_T, V=fmri_V)  # (B,S,D)
+        # 2-D decoder -> (B,T,V)
+        fmri_sig = self.fmri_decoder(fmr_hi)
+        # squash + affine
+        fmri_sig = torch.tanh(fmri_sig)
+        fmri_sig = self.fmri_out_scale * fmri_sig + self.fmri_out_bias
         return fmri_sig
 
 # =========================
@@ -386,26 +408,27 @@ def load_modules_if_exist(run_dir: Path, model: TranslatorFMRISelfAttn, tag: str
     loaded = set()
 
     if "adapter" in which and paths["adapter"].exists():
-        sd = torch.load(paths["adapter"], map_location=device)
+        sd = _torch_load_compat(paths["adapter"], map_location=device, allow_weights_only=True)
         model.adapter_fmri.load_state_dict(sd, strict=False)
         loaded.add("adapter")
 
     if "encoder" in which and paths["encoder"].exists():
-        sd = torch.load(paths["encoder"], map_location=device)
+        sd = _torch_load_compat(paths["encoder"], map_location=device, allow_weights_only=True)
         model.fmri_encoder.load_state_dict(sd, strict=False)
         loaded.add("encoder")
 
     if "decoder" in which and paths["decoder"].exists():
-        sd = torch.load(paths["decoder"], map_location=device)
+        sd = _torch_load_compat(paths["decoder"], map_location=device, allow_weights_only=True)
         model.fmri_decoder.load_state_dict(sd, strict=False)
         loaded.add("decoder")
 
     if "affine" in which and paths["affine"].exists():
-        sd = torch.load(paths["affine"], map_location=device)
-        if isinstance(sd, dict) and "scale" in sd and "bias" in sd:
+        sd = _torch_load_compat(paths["affine"], map_location=device, allow_weights_only=True)
+        if isinstance(sd, dict):
             with torch.no_grad():
-                model.fmri_out_scale.copy_(sd["scale"].to(model.fmri_out_scale.device))
-                model.fmri_out_bias.copy_(sd["bias"].to(model.fmri_out_bias.device))
+                print(f"[load] loading affine scale={sd['scale'].item():.6f}, bias={sd['bias'].item():.6f}")
+                if "scale" in sd: model.fmri_out_scale.copy_(sd["scale"].to(model.fmri_out_scale.device))
+                if "bias"  in sd: model.fmri_out_bias.copy_(sd["bias"].to(model.fmri_out_bias.device))
         else:
             # best-effort fallback if someone saved a state_dict
             try:
@@ -588,7 +611,7 @@ def main():
         fmri_latents = brainlm.extract_latents(signal_vectors, xyz)  # (L,B,Ttok,Dh)
     print(f"[debug] latents: {tuple(fmri_latents.shape)} (layers,B,Ttok,Dh)")
 
-    # Translator head
+    # Translator head (aligned to trainer)
     translator = TranslatorFMRISelfAttn(
         fmri_voxels=V, window_sec=WINDOW_SEC, tr=TR,
         fmri_n_layers=brainlm.n_layers_out, fmri_hidden_size=brainlm.hidden_size,
@@ -597,7 +620,7 @@ def main():
     translator.eval()
 
     # ---- Load per-module weights (ALWAYS try adapter/encoder/decoder/AFFINE) ----
-    default_tag = f"stage{STAGE}_best"
+    default_tag = f"revstage{STAGE}_best"
     use_tag = TAG or default_tag
     want = ["adapter", "encoder", "decoder", "affine"]
     loaded = load_modules_if_exist(Path(RUN_DIR), translator, use_tag, which=want, device=device)

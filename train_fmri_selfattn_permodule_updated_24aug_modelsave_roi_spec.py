@@ -9,8 +9,7 @@ Changes vs. previous:
 - Encoder APIs require (T, V).
 - FIXED DECODER: fMRIDecodingAdapter2D predicts (B,T,V) by producing V channels
   first and resizing along time only, removing rank-1-over-voxels pathology.
-
-Everything else (dataset, diagnostics) unchanged, except they now see real S.
+- NEW (minimal): optional single-ROI training/eval via --target_roi (loss slicing + diagnostics).
 """
 
 from __future__ import annotations
@@ -105,7 +104,6 @@ def fmt_mem() -> str:
     r = torch.cuda.memory_reserved() / (1024**2)
     return f"cuda: alloc={a:.1f}MB, reserv={r:.1f}MB"
 
-# --- Torch load compat (PyTorch >=2.6 & earlier) ---
 def _torch_load_compat(path: Path, map_location, *, allow_weights_only: bool = False):
     try:
         return torch.load(str(path), map_location=map_location, weights_only=False)
@@ -160,7 +158,7 @@ class TrainCfg:
     lr_stage3: float = 5e-5
     weight_decay: float = 1e-4
     amp: bool = False
-    train_fmri_affine_stage3: bool = False  # kept for parity; affine is always trainable
+    train_fmri_affine_stage3: bool = False
 
     # fixed subjects (optional)
     train_subjects: Optional[List[int]] = None
@@ -207,6 +205,9 @@ class TrainCfg:
     wandb_tags: Optional[List[str]] = None
     wandb_notes: Optional[str] = None
     wandb_mode: str = "online"
+
+    # --- NEW: single ROI ---
+    target_roi: Optional[int] = None
 
 # -----------------------------
 # Frozen BrainLM
@@ -412,9 +413,9 @@ def load_trainstate_if_exist(out_dir: Path, stage: int, tag: str,
                              opt: Optional[torch.optim.Optimizer],
                              scaler: Optional[torch.amp.GradScaler],
                              device: torch.device) -> Tuple[int, float, bool]:
-    p = _trainstate_path(out_dir, stage, tag)
-    if not p.exists():
+    if not _trainstate_path(out_dir, stage, tag).exists():
         return 1, float('inf'), False
+    p = _trainstate_path(out_dir, stage, tag)
     try:
         sd = _torch_load_compat(p, map_location=device, allow_weights_only=False)
         if opt is not None and sd.get("optimizer_state") is not None:
@@ -486,6 +487,7 @@ def cache_a424_xyz(device: torch.device) -> Optional[torch.Tensor]:
     for p in candidates:
         if p.exists():
             try:
+                from data_oddball import load_a424_coords  # type: ignore
                 arr = load_a424_coords(p)
                 arr = arr / (float(np.max(np.abs(arr))) or 1.0)
                 coords = torch.from_numpy(arr.astype(np.float32)).to(device)
@@ -506,7 +508,7 @@ def _grad_norm(model: nn.Module) -> float:
 # Loss & epoch runner
 # -----------------------------
 def _compute_loss_components(recon: torch.Tensor, target: torch.Tensor, cfg: TrainCfg) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    # recon, target: (B, T, V)
+    # recon, target: (B, T, V') where V' is 1 if target_roi is set, else V
     diff = recon - target
 
     if cfg.loss_type in ("mse", "mse+pearson"):
@@ -527,7 +529,7 @@ def _compute_loss_components(recon: torch.Tensor, target: torch.Tensor, cfg: Tra
         y = target - target.mean(dim=1, keepdim=True)
         xs = torch.sqrt(x.pow(2).mean(dim=1) + 1e-6)
         ys = torch.sqrt(y.pow(2).mean(dim=1) + 1e-6)
-        r = (x * y).mean(dim=1) / (xs * ys)  # (B, V)
+        r = (x * y).mean(dim=1) / (xs * ys)  # (B, V')
         corr_loss = 1.0 - r.mean()
 
     tv_loss = torch.tensor(0.0, device=recon.device)
@@ -578,8 +580,19 @@ def run_epoch(mode:str, dl, model, brainlm, xyz_ref, cfg:TrainCfg, device, scale
         # Forward + loss
         t_fwd0 = time.time()
         with torch.amp.autocast('cuda', enabled=(cfg.amp and device.type=='cuda')):
-            recon = model(fmri_latents, fmri_T=T, fmri_V=V)                 # (B,T,V)
-            total_loss, comps = _compute_loss_components(recon, fmri_t, cfg)
+            recon_full = model(fmri_latents, fmri_T=T, fmri_V=V)            # (B,T,V)
+
+            # --- Minimal single-ROI slicing for loss ---
+            if cfg.target_roi is not None:
+                v = int(cfg.target_roi)
+                if v < 0 or v >= V:
+                    raise ValueError(f"--target_roi={v} out of range for V={V}")
+                recon = recon_full[:, :, v:v+1]      # (B,T,1)
+                target = fmri_t[:, :, v:v+1]         # (B,T,1)
+            else:
+                recon, target = recon_full, fmri_t
+
+            total_loss, comps = _compute_loss_components(recon, target, cfg)
         t_fwd = time.time() - t_fwd0
 
         t_bwd = t_step = gnorm = 0.0
@@ -645,7 +658,7 @@ def run_epoch(mode:str, dl, model, brainlm, xyz_ref, cfg:TrainCfg, device, scale
     return avg
 
 # -----------------------------
-# Diagnostics (unchanged)
+# Diagnostics
 # -----------------------------
 def _ensure_dirs(out_dir: Path):
     (out_dir / "plots").mkdir(parents=True, exist_ok=True)
@@ -765,6 +778,36 @@ def _plot_topk_and_bars(t: np.ndarray, x_true: np.ndarray, x_rec: np.ndarray,
 
     return rs
 
+def _plot_single_roi(t: np.ndarray, gt: np.ndarray, rc: np.ndarray,
+                     out_dir: Path, TR: float, roi_index: int,
+                     make_calib: bool = True, plot_max_points: int = 1000):
+    """Minimal plots for a single ROI."""
+    tt = np.arange(len(gt)) * float(TR)
+    tt_d, gtd = _downsample(tt, gt, plot_max_points)
+    _,    rcd = _downsample(tt, rc, plot_max_points)
+
+    plt.figure(figsize=(12, 3))
+    plt.plot(tt_d, gtd, label="GT")
+    plt.plot(tt_d, rcd, label="Recon", alpha=0.9)
+    r = _pearsonr_safe(gt, rc)
+    plt.title(f"ROI {roi_index} — r={r:.3f}")
+    plt.xlabel("Time (s)"); plt.ylabel("Z-score"); plt.legend(loc="upper right")
+    plt.tight_layout()
+    plt.savefig(out_dir / "plots" / "single_roi_timeseries.png", dpi=150)
+    plt.close()
+
+    if make_calib:
+        a, b, rc_lin, R2, nrmse = _lin_calibrate(rc, gt)
+        _, rcd2 = _downsample(tt, rc_lin, plot_max_points)
+        plt.figure(figsize=(12, 3))
+        plt.plot(tt_d, gtd, label="GT")
+        plt.plot(tt_d, rcd2, label=f"Recon (calib) a={a:.2f}, b={b:.2f}, R²={R2:.2f}", alpha=0.9)
+        plt.title(f"ROI {roi_index} — raw r={r:.3f}")
+        plt.xlabel("Time (s)"); plt.ylabel("Z-score"); plt.legend(loc="upper right")
+        plt.tight_layout()
+        plt.savefig(out_dir / "plots" / "single_roi_timeseries_calib.png", dpi=150)
+        plt.close()
+
 @torch.no_grad()
 def generate_fmri_diagnostics(
     cfg: TrainCfg,
@@ -804,12 +847,60 @@ def generate_fmri_diagnostics(
         xyz = torch.zeros(B, V, 3, device=device)
 
     fmri_latents = brainlm.extract_latents(signal_vectors, xyz)  # (L,B,Ttok,Dh)
-    recon = model(fmri_latents, fmri_T=T, fmri_V=V)              # (B,T,V)
+    recon_full = model(fmri_latents, fmri_T=T, fmri_V=V)         # (B,T,V)
 
     b = 0
-    x_true = fmri_t[b].detach().cpu().numpy()
-    x_rec  = recon[b].detach().cpu().numpy()
+    x_true = fmri_t[b].detach().cpu().numpy()    # (T,V)
+    x_rec  = recon_full[b].detach().cpu().numpy()# (T,V)
 
+    # --- Single-ROI diagnostics if requested ---
+    if cfg.target_roi is not None:
+        v = int(cfg.target_roi)
+        if v < 0 or v >= V:
+            print(f"[diag] target_roi={v} out of range for V={V}; skipping.")
+            return
+        # Heatmaps (T×1)
+        _plot_heatmap(x_true[:, [v]], f"GT (ROI {v})", out_dir / "plots" / "heatmap_gt.png")
+        _plot_heatmap(x_rec[:,  [v]], f"Recon (ROI {v})", out_dir / "plots" / "heatmap_recon.png")
+        _plot_heatmap(np.abs(x_true[:, [v]] - x_rec[:, [v]]), f"|GT - Recon| (ROI {v})", out_dir / "plots" / "heatmap_absdiff.png", cmap="magma")
+
+        # Timeseries + (optional) calib
+        _plot_single_roi(
+            t=np.arange(T)*float(cfg.tr),
+            gt=x_true[:, v], rc=x_rec[:, v],
+            out_dir=out_dir, TR=cfg.tr, roi_index=v,
+            make_calib=make_calib_plots, plot_max_points=plot_max_points
+        )
+
+        # CSV (single row)
+        rows: List[List[float]] = []
+        gt = x_true[:, v]; rc = x_rec[:, v]
+        r0 = _pearsonr_safe(gt, rc)
+        a, bb, rc_lin, R2, NRMSE = _lin_calibrate(rc, gt)
+        best_lag, r_best = _lagged_corr(gt, rc, max_lag_tr)
+        rows.append([v, r0, float(gt.std()), float(rc.std()), a, bb, R2, NRMSE, best_lag, r_best])
+
+        csv_path = out_dir / "tables" / "fmri_roi_diagnostics.csv"
+        with open(csv_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["roi","r0","std_gt","std_rec","slope","intercept","R2","NRMSE","best_lag_TR","r_at_best_lag"])
+            for row in rows:
+                w.writerow(row)
+        print(f"[diag] wrote diagnostics (single ROI {v}) -> {csv_path}")
+
+        if wandb_run is not None:
+            try:
+                wandb_run.log({"diag/stage": stage, "diag/tag": tag_for_logging or "", "diag/roi": v})
+                for name in ["heatmap_gt.png", "heatmap_recon.png", "heatmap_absdiff.png",
+                             "single_roi_timeseries.png", "single_roi_timeseries_calib.png"]:
+                    p = out_dir / "plots" / name
+                    if p.exists():
+                        wandb_run.log({f"plots/{name}": wandb.Image(str(p))})
+            except Exception:
+                pass
+        return
+
+    # --- Original multi-ROI diagnostics ---
     _plot_heatmap(x_true, "GT (T×V)", out_dir / "plots" / "heatmap_gt.png")
     _plot_heatmap(x_rec,  "Recon (T×V)", out_dir / "plots" / "heatmap_recon.png")
     _plot_heatmap(np.abs(x_true - x_rec), "|GT - Recon| (T×V)", out_dir / "plots" / "heatmap_absdiff.png", cmap="magma")
@@ -849,7 +940,7 @@ def generate_fmri_diagnostics(
             pass
 
 # -----------------------------
-# Auto-sweep helpers (forward chain)
+# Auto-sweep helpers (unchanged scaffolding)
 # -----------------------------
 def dataclass_replace(obj, **updates):
     from dataclasses import replace as _replace
@@ -863,7 +954,7 @@ def _build_sweep_space(cfg: TrainCfg, stage:int) -> List[Dict[str, Any]]:
     deltas  = cfg.sweep_huber_delta or [0.5, 1.0]
     epses   = cfg.sweep_charbonnier_eps or [1e-3, 3e-3]
 
-    combos = []
+    combos: List[Dict[str, Any]] = []
     for loss_type in loss_list:
         for lr in (lrs or [1e-4]):
             if loss_type == "huber":
@@ -993,7 +1084,7 @@ def _train_once_for_cfg(base_cfg: TrainCfg, stage: int, *, trial_name: str,
             ts_best = save_trainstate(cfg.out_dir, stage, tag="best", epoch=ep, best_val=best, opt=opt, scaler=scaler)
             print(f"[Stage{stage}][trial] ✅ new best {best:.6f}")
 
-            # diagnostics on BEST
+            # diagnostics on BEST (ROI-aware)
             try:
                 generate_fmri_diagnostics(
                     cfg=cfg, out_dir=cfg.out_dir, stage=stage,
@@ -1070,6 +1161,7 @@ def _apply_config_defaults(parser: argparse.ArgumentParser) -> Dict[str, Any]:
             "sweep_max_combos","no_final_full",
             "wandb_project","wandb_entity","wandb_run_name","wandb_group","wandb_job_type",
             "wandb_tags","wandb_notes","wandb_mode",
+            "target_roi",
         ]
         cfg_defaults = {k: raw[k] for k in pass_through_keys if k in raw}
         parser.set_defaults(**cfg_defaults)
@@ -1079,7 +1171,7 @@ def _apply_config_defaults(parser: argparse.ArgumentParser) -> Dict[str, Any]:
 # Main
 # -----------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Stage-wise fMRI-only training/testing with axial RoPE and 2-D decoder")
+    ap = argparse.ArgumentParser(description="Stage-wise fMRI-only training/testing with axial RoPE and 2-D decoder (+single-ROI option)")
     ap.add_argument("--config", type=str, default=None)
     ap.add_argument("--eeg_root", type=str)
     ap.add_argument("--fmri_root", type=str)
@@ -1101,7 +1193,7 @@ def main():
     ap.add_argument("--lr2", type=float, default=8e-5)
     ap.add_argument("--lr3", type=float, default=5e-5)
     ap.add_argument("--weight_decay", type=float, default=1e-4)
-    ap.add_argument("--train_affine_stage3", action="store_true")  # ignored; affine always trainable
+    ap.add_argument("--train_affine_stage3", action="store_true")
     ap.add_argument("--train_subjects", type=int, nargs="*", default=None)
     ap.add_argument("--val_subjects",   type=int, nargs="*", default=None)
     ap.add_argument("--test_subjects",  type=int, nargs="*", default=None)
@@ -1127,22 +1219,19 @@ def main():
     ap.add_argument("--huber_delta", type=float, default=1.0)
     ap.add_argument("--charbonnier_eps", type=float, default=1e-3)
 
-    # ----- Auto-sweep -----
-    ap.add_argument("--auto_sweep", action="store_true",
-                    help="Run automatic LR×loss sweep, pick best by val/total_loss, then retrain fully.")
-    ap.add_argument("--sweep_epochs", type=int, default=0,
-                    help="Epochs per trial during sweep (0 -> auto: min(2, stage_epochs)).")
+    ap.add_argument("--auto_sweep", action="store_true")
+    ap.add_argument("--sweep_epochs", type=int, default=0)
     ap.add_argument("--sweep_loss_list", type=str, nargs="*", default=["mse","mae","huber","charbonnier","mse+pearson"])
     ap.add_argument("--sweep_corr_w", type=float, nargs="*", default=[0.0, 0.2])
     ap.add_argument("--sweep_tv_w", type=float, nargs="*", default=[0.0])
     ap.add_argument("--sweep_huber_delta", type=float, nargs="*", default=[0.5, 1.0])
     ap.add_argument("--sweep_charbonnier_eps", type=float, nargs="*", default=[1e-3, 3e-3])
+
     ap.add_argument("--sweep_lr1", type=float, nargs="*", default=[1e-4, 5e-5])
     ap.add_argument("--sweep_lr2", type=float, nargs="*", default=[8e-5, 5e-5])
     ap.add_argument("--sweep_lr3", type=float, nargs="*", default=[5e-5, 2e-5])
-    ap.add_argument("--sweep_max_combos", type=int, default=0,
-                    help="0 = try all combos; >0 = random subset of this many.")
-    ap.add_argument("--no_final_full", action="store_true", help="Skip full retrain with best config after sweep.")
+    ap.add_argument("--sweep_max_combos", type=int, default=0)
+    ap.add_argument("--no_final_full", action="store_true")
 
     ap.add_argument("--wandb_project", type=str, default=None)
     ap.add_argument("--wandb_entity", type=str, default=None)
@@ -1152,6 +1241,9 @@ def main():
     ap.add_argument("--wandb_tags", type=str, nargs="*", default=None)
     ap.add_argument("--wandb_notes", type=str, default=None)
     ap.add_argument("--wandb_mode", type=str, default="online", choices=["online","offline","disabled"])
+
+    # NEW: single ROI
+    ap.add_argument("--target_roi", type=int, default=None, help="If set, only this ROI index contributes to loss/diags")
 
     _apply_config_defaults(ap)
     args = ap.parse_args()
@@ -1212,6 +1304,7 @@ def main():
         wandb_tags=args.wandb_tags,
         wandb_notes=args.wandb_notes,
         wandb_mode=args.wandb_mode,
+        target_roi=args.target_roi,
     )
 
     for pth in [cfg.eeg_root, cfg.fmri_root, cfg.a424_label_nii, cfg.brainlm_model_dir]:
@@ -1242,23 +1335,23 @@ def main():
 
     # ---------- AUTO-SWEEP ----------
     if cfg.auto_sweep and args.mode == "train":
-        stage = int(args.stage)
-        sweep_dir = Path(cfg.out_dir) / f"sweeps_stage{stage}"
+        stage_local = int(args.stage)
+        sweep_dir = Path(cfg.out_dir) / f"sweeps_stage{stage_local}"
         os.makedirs(sweep_dir, exist_ok=True)
 
-        combos = _build_sweep_space(cfg, stage)
-        print(f"[sweep] Stage {stage}: trying {len(combos)} trial combos...")
-        results = []
-        sw_epochs = _epochs_for_sweep(cfg, stage)
+        combos = _build_sweep_space(cfg, stage_local)
+        print(f"[sweep] Stage {stage_local}: trying {len(combos)} trial combos...")
+        results: List[Dict[str, Any]] = []
+        sw_epochs = _epochs_for_sweep(cfg, stage_local)
         prev_stage_dir = Path(cfg.out_dir)
 
         for i, trial in enumerate(combos, 1):
             trial_cfg = _apply_trial_loss_cfg(cfg, trial)
             trial_out = sweep_dir / f"trial_{i:03d}_{trial['loss_type']}_lr{trial['lr']:.1e}_cw{trial['corr_w']}_tv{trial['tv_w']}"
-            trial_name = f"s{stage}-trial{i}-{trial['loss_type']}-lr{trial['lr']:.1e}-cw{trial['corr_w']}-tv{trial['tv_w']}"
+            trial_name = f"s{stage_local}-trial{i}-{trial['loss_type']}-lr{trial['lr']:.1e}-cw{trial['corr_w']}-tv{trial['tv_w']}"
             best_val = _train_once_for_cfg(
                 dataclass_replace(trial_cfg, auto_resume=False),
-                stage=stage, trial_name=trial_name,
+                stage=stage_local, trial_name=trial_name,
                 out_dir=trial_out, prev_stage_dir=prev_stage_dir,
                 epochs_override=sw_epochs, lr_override=float(trial["lr"])
             )
@@ -1266,7 +1359,7 @@ def main():
 
         results = sorted(results, key=lambda r: r["best_val_total"])
         best = results[0]
-        print(f"[sweep] ✅ Best (stage {stage}): {best}")
+        print(f"[sweep] ✅ Best (stage {stage_local}): {best}")
 
         with open(sweep_dir / "sweep_results.json", "w") as f:
             json.dump(results, f, indent=2)
@@ -1277,8 +1370,8 @@ def main():
 
         # Full training with best config into the main out_dir
         best_cfg = _apply_trial_loss_cfg(cfg, best)
-        if stage == 1: best_cfg = dataclass_replace(best_cfg, lr_stage1=float(best["lr"]))
-        elif stage == 2: best_cfg = dataclass_replace(best_cfg, lr_stage2=float(best["lr"]))
+        if stage_local == 1: best_cfg = dataclass_replace(best_cfg, lr_stage1=float(best["lr"]))
+        elif stage_local == 2: best_cfg = dataclass_replace(best_cfg, lr_stage2=float(best["lr"]))
         else: best_cfg = dataclass_replace(best_cfg, lr_stage3=float(best["lr"]))
         print(f"[sweep] 🔁 Full training with best config in {cfg.out_dir} ...")
         cfg = best_cfg
@@ -1349,11 +1442,9 @@ def main():
             elif stage == 3:
                 load_modules_if_exist(out_dir, translator, tag="stage2_best", which=["adapter","encoder"], device=device)
         else:
-            # TEST MODE: try to load all components (adapter/encoder/decoder/affine).
-            # If earlier stages didn't save some modules yet, you'll get a warning below.
             default_tag = f"stage{stage}_best"
             tag = args.load_tag or default_tag
-            need = ["adapter","encoder","decoder","affine"]
+            need = ["adapter"] if stage == 1 else (["adapter","encoder"] if stage == 2 else ["adapter","encoder","decoder","affine"])
             loaded = load_modules_if_exist(out_dir, translator, tag=tag, which=need, device=device)
             missing = set(need) - set([n.split("_")[0] for n in loaded])
             if missing:
@@ -1446,12 +1537,12 @@ def main():
                     try:
                         art_best = wandb.Artifact(f"fmri_selfattn_stage{stage}_best", type="model")
                         for p in best_paths.values(): art_best.add_file(str(p))
-                        art_best.add_file(str(ts_best)); run.log_artifact(art_best)
+                        art_best.add_file(str(ts_best))
+                        run.log_artifact(art_best)
                     except Exception:
                         pass
 
     else:  # test mode
-        # Evaluate on requested split, generate diagnostics
         if args.eval_split == "test" and dl_test is not None:
             res = run_epoch("test", dl_test, translator, brainlm, xyz_ref, cfg, device, scaler, opt=None)
             print(f"[TEST][stage {stage}] test_total_loss={res['total']:.6f}")
