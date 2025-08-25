@@ -438,20 +438,22 @@ def make_dataloaders(cfg: TrainCfg, device: torch.device) -> Tuple[DataLoader, D
     inter_keys = collect_common_sr_keys(cfg.eeg_root, cfg.fmri_root)
     if not inter_keys:
         raise RuntimeError("No (subject,task,run) intersections between EEG and fMRI trees.")
-    if cfg.train_subjects or cfg.val_subjects or cfg.test_subjects:
-        train_keys, val_keys, test_keys = fixed_subject_keys(
-            cfg.eeg_root, cfg.fmri_root,
-            cfg.train_subjects or [], cfg.val_subjects or [], cfg.test_subjects or [],
+
+    # Require subject splits from config (no auto-split fallback)
+    if not (cfg.train_subjects and cfg.val_subjects):
+        raise RuntimeError(
+            "Subject splits must be provided in config: train_subjects and val_subjects "
+            "(test_subjects optional)."
         )
-    else:
-        subs = sorted({k[0] for k in inter_keys}, key=int)
-        n = len(subs); nt = max(1, int(0.8*n)); nv = max(1, int(0.1*n))
-        train_sub = set(subs[:nt]); val_sub = set(subs[nt:nt+nv]); test_sub = set(subs[nt+nv:])
-        train_keys = tuple(k for k in inter_keys if k[0] in train_sub)
-        val_keys   = tuple(k for k in inter_keys if k[0] in val_sub)
-        test_keys  = tuple(k for k in inter_keys if k[0] in test_sub)
+
+    train_keys, val_keys, test_keys = fixed_subject_keys(
+        cfg.eeg_root, cfg.fmri_root,
+        cfg.train_subjects, cfg.val_subjects, cfg.test_subjects or [],
+    )
 
     def _dl(keys, name):
+        if len(keys) == 0:
+            raise RuntimeError(f"No samples for split '{name}' with the provided subject list.")
         ds = PairedAlignedDataset(
             eeg_root=cfg.eeg_root, fmri_root=cfg.fmri_root, a424_label_nii=cfg.a424_label_nii,
             window_sec=cfg.window_sec, original_fs=1000, target_fs=200, tr=cfg.tr,
@@ -473,7 +475,11 @@ def make_dataloaders(cfg: TrainCfg, device: torch.device) -> Tuple[DataLoader, D
             print(f"[debug][dataloader] {name}: batches={len(dl)} (bs={cfg.batch_size}, workers={cfg.num_workers}, pin={device.type=='cuda'})")
         return dl
 
-    return _dl(train_keys, "train"), _dl(val_keys, "val"), (_dl(test_keys, "test") if test_keys else None)
+    train_dl = _dl(train_keys, "train")
+    val_dl   = _dl(val_keys,   "val")
+    test_dl  = _dl(test_keys,  "test") if cfg.test_subjects else None
+    return train_dl, val_dl, test_dl
+
 
 def cache_a424_xyz(device: torch.device) -> Optional[torch.Tensor]:
     candidates = [
@@ -1004,11 +1010,12 @@ def _train_once_for_cfg(base_cfg: TrainCfg, stage: int, *, trial_name: str,
     xyz_ref = cache_a424_xyz(device)
     scaler = torch.amp.GradScaler('cuda', enabled=(cfg.amp and device.type=='cuda'))
 
-    # Warm-start (decoder-first chain)
+    # Warm-start (decoder-first chain) — also restore affine
     if stage == 2:
-        load_modules_if_exist(prev_stage_dir, translator, tag="revstage1_best", which=["decoder"], device=device)
+        load_modules_if_exist(prev_stage_dir, translator, tag="revstage1_best", which=["decoder","affine"], device=device)
     elif stage == 3:
-        load_modules_if_exist(prev_stage_dir, translator, tag="revstage2_best", which=["encoder","decoder"], device=device)
+        load_modules_if_exist(prev_stage_dir, translator, tag="revstage2_best", which=["encoder","decoder","affine"], device=device)
+
 
     # Affine is always trainable; no flag needed
     set_stage_rev(translator, stage)
@@ -1434,15 +1441,14 @@ def main():
             if stage == 1:
                 pass  # first in reversed chain: decoder only
             elif stage == 2:
-                load_modules_if_exist(out_dir, translator, tag="revstage1_best", which=["decoder"], device=device)
+                load_modules_if_exist(out_dir, translator, tag="revstage1_best", which=["decoder","affine"], device=device)
             elif stage == 3:
-                load_modules_if_exist(out_dir, translator, tag="revstage2_best", which=["encoder","decoder"], device=device)
+                load_modules_if_exist(out_dir, translator, tag="revstage2_best", which=["encoder","decoder","affine"], device=device)
         else:
             default_tag = f"revstage{stage}_best"
             tag = args.load_tag or default_tag
-            need = (["decoder"] if stage == 1
-                    else (["encoder","decoder"] if stage == 2
-                          else ["adapter","encoder","decoder","affine"]))
+            # Always attempt to load all modules, including affine, at every stage.
+            need = ["adapter","encoder","decoder","affine"]
             loaded = load_modules_if_exist(out_dir, translator, tag=tag, which=need, device=device)
             missing = set(need) - set([n.split("_")[0] for n in loaded])
             if missing:

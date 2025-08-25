@@ -56,12 +56,12 @@ FMRI_ROOT         = Path(r"D:\Neuroinformatics_research_2025\Oddball\ds000116")
 A424_LABEL_NII    = Path(r"D:\Neuroinformatics_research_2025\BrainLM\A424_resampled_to_bold.nii.gz")
 BRAINLM_MODEL_DIR = Path(r"D:\Neuroinformatics_research_2025\MNI_templates\BrainLM\pretrained_models\2023-06-06-22_15_00-checkpoint-1400")
 
-RUN_DIR           = Path(r"D:\Neuroinformatics_research_2025\Multi_modal_NTM\translator_sweep_runs_viz_23aug_reverse_100epoch_sweep\sweeps_revstage2\trial_001_huber_lr8.0e-05_cw0.0_tv0.0")
+RUN_DIR           = Path(r"D:\Neuroinformatics_research_2025\Multi_modal_NTM\runs_fmri_selfattn_24aug_solo_reverse_run_huber_0.5")
 # Keep outputs tidy but colocated with the run:
 SUBSET            = "train"   # "train" | "val" | "test"
 OUT_DIR           = RUN_DIR / f"viz_diagnostics_{SUBSET}"
 
-STAGE             = 1       # 1 | 2 | 3 (only used for default tag name)
+STAGE             = 3       # 1 | 2 | 3 (only used for default tag name)
 TAG               = None     # None -> uses f"revstage{STAGE}_best" (matches trainer)
 TOP_K             = 34
 PLOT_MAX_POINTS   = 1000

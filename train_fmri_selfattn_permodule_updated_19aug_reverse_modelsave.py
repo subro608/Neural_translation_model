@@ -27,6 +27,10 @@ Notes
 - Checkpoints/tags are prefixed with 'revstage{N}_...' to keep them separate from forward stages.
 - Supports W&B, auto-resume, YAML/JSON config defaults, and the built-in LR×loss auto-sweep
   (under sweeps_revstage{N}).
+
+Extra in this version:
+- Ensure **affine** (scale/bias) is **always saved and loaded** across all stages and modes (train/test/sweep/resume).
+- Normalize "missing" module warning so names align with requested 'adapter/encoder/decoder/affine'.
 """
 
 from __future__ import annotations
@@ -454,18 +458,18 @@ def make_dataloaders(cfg: TrainCfg, device: torch.device) -> Tuple[DataLoader, D
     inter_keys = collect_common_sr_keys(cfg.eeg_root, cfg.fmri_root)
     if not inter_keys:
         raise RuntimeError("No (subject,task,run) intersections between EEG and fMRI trees.")
-    if cfg.train_subjects or cfg.val_subjects or cfg.test_subjects:
-        train_keys, val_keys, test_keys = fixed_subject_keys(
-            cfg.eeg_root, cfg.fmri_root,
-            cfg.train_subjects or [], cfg.val_subjects or [], cfg.test_subjects or [],
+
+    # Require explicit subject splits from config/CLI; do not auto-split.
+    if not (cfg.train_subjects and cfg.val_subjects):
+        raise RuntimeError(
+            "Provide subject splits via --train_subjects and --val_subjects (and optionally --test_subjects). "
+            "Auto-splitting is disabled."
         )
-    else:
-        subs = sorted({k[0] for k in inter_keys}, key=int)
-        n = len(subs); nt = max(1, int(0.8*n)); nv = max(1, int(0.1*n))
-        train_sub = set(subs[:nt]); val_sub = set(subs[nt:nt+nv]); test_sub = set(subs[nt+nv:])
-        train_keys = tuple(k for k in inter_keys if k[0] in train_sub)
-        val_keys   = tuple(k for k in inter_keys if k[0] in val_sub)
-        test_keys  = tuple(k for k in inter_keys if k[0] in test_sub)
+
+    train_keys, val_keys, test_keys = fixed_subject_keys(
+        cfg.eeg_root, cfg.fmri_root,
+        cfg.train_subjects or [], cfg.val_subjects or [], cfg.test_subjects or [],
+    )
 
     def _dl(keys, name):
         ds = PairedAlignedDataset(
@@ -490,6 +494,7 @@ def make_dataloaders(cfg: TrainCfg, device: torch.device) -> Tuple[DataLoader, D
         return dl
 
     return _dl(train_keys, "train"), _dl(val_keys, "val"), (_dl(test_keys, "test") if test_keys else None)
+
 
 def cache_a424_xyz(device: torch.device) -> Optional[torch.Tensor]:
     candidates = [
@@ -753,7 +758,7 @@ def _plot_topk_and_bars(t: np.ndarray, x_true: np.ndarray, x_rec: np.ndarray,
             ax.plot(tt_d, gtd, label="GT")
             ax.plot(tt_d, rcd, label=f"Recon (calib) a={a:.2f}, b={b:.2f}, R²={R2:.2f}", alpha=0.9)
             ax.set_title(f"ROI {roi} — raw r={r:.3f}")
-            ax.set.xlabel("Time (s)"); ax.set_ylabel("Z-score")
+            ax.set_xlabel("Time (s)"); ax.set_ylabel("Z-score")
             ax.legend(loc="upper right")
         fig.tight_layout()
         fig.savefig(out_dir / "plots" / "topK_fmri_corr_calib.png", dpi=150)
@@ -861,7 +866,7 @@ def generate_fmri_diagnostics(
             pass
 
 # -----------------------------
-# Auto-sweep helpers (unchanged)
+# Auto-sweep helpers (unchanged, but warm-start now loads affine)
 # -----------------------------
 def dataclass_replace(obj, **updates):
     from dataclasses import replace as _replace
@@ -922,7 +927,7 @@ def _train_once_for_cfg(base_cfg: TrainCfg, stage: int, *, trial_name: str,
                         epochs_override: Optional[int], lr_override: Optional[float]) -> float:
     """
     Short trial training for sweep; returns best val_total.
-    Warm-start policy (decoder-first): R2 <- R1_best (decoder), R3 <- R2_best (encoder+decoder)
+    Warm-start policy (decoder-first): R2 <- R1_best (decoder+affine), R3 <- R2_best (encoder+decoder+affine)
     Generates diagnostics when a NEW BEST is found (on the val split).
     """
     cfg = dataclass_replace(base_cfg, out_dir=out_dir)
@@ -936,11 +941,13 @@ def _train_once_for_cfg(base_cfg: TrainCfg, stage: int, *, trial_name: str,
     xyz_ref = cache_a424_xyz(device)
     scaler = torch.amp.GradScaler('cuda', enabled=(cfg.amp and device.type=='cuda'))
 
-    # Warm-start (decoder-first chain)
+    # Warm-start (decoder-first chain) -- NOW INCLUDING AFFINE
     if stage == 2:
-        load_modules_if_exist(prev_stage_dir, translator, tag="revstage1_best", which=["decoder"], device=device)
+        load_modules_if_exist(prev_stage_dir, translator, tag="revstage1_best",
+                              which=["decoder", "affine"], device=device)
     elif stage == 3:
-        load_modules_if_exist(prev_stage_dir, translator, tag="revstage2_best", which=["encoder","decoder"], device=device)
+        load_modules_if_exist(prev_stage_dir, translator, tag="revstage2_best",
+                              which=["encoder", "decoder", "affine"], device=device)
 
     # Affine is always trainable; no flag needed
     set_stage_rev(translator, stage)
@@ -987,7 +994,7 @@ def _train_once_for_cfg(base_cfg: TrainCfg, stage: int, *, trial_name: str,
                 "lr": float(opt.param_groups[0]['lr']),
             }, step=ep)
 
-        # always save "last"
+        # always save "last" (includes affine)
         last_paths = save_modules(cfg.out_dir, translator, tag=f"revstage{stage}_last")
         ts_last = save_trainstate(cfg.out_dir, f"revstage{stage}", tag="last", epoch=ep, best_val=best, opt=opt, scaler=scaler)
         if run is not None:
@@ -1365,21 +1372,39 @@ def main():
     else:
         if mode == "train":
             if stage == 1:
-                pass  # first in reversed chain: decoder only
+                # First reversed stage: start fresh unless resuming
+                pass
             elif stage == 2:
-                load_modules_if_exist(out_dir, translator, tag="revstage1_best", which=["decoder"], device=device)
+                # Warm-start from stage 1 best (decoder + affine)
+                load_modules_if_exist(out_dir, translator, tag="revstage1_best",
+                                      which=["decoder", "affine"], device=device)
             elif stage == 3:
-                load_modules_if_exist(out_dir, translator, tag="revstage2_best", which=["encoder","decoder"], device=device)
+                # Warm-start from stage 2 best (encoder + decoder + affine)
+                load_modules_if_exist(out_dir, translator, tag="revstage2_best",
+                                      which=["encoder", "decoder", "affine"], device=device)
         else:
+            # TEST mode: restore expected modules for this stage (always include affine)
             default_tag = f"revstage{stage}_best"
             tag = args.load_tag or default_tag
-            need = (["decoder"] if stage == 1
-                    else (["encoder","decoder"] if stage == 2
-                          else ["adapter","encoder","decoder","affine"]))
+
+            need = (["decoder", "affine"] if stage == 1
+                    else (["encoder", "decoder", "affine"] if stage == 2
+                          else ["adapter", "encoder", "decoder", "affine"]))
+
             loaded = load_modules_if_exist(out_dir, translator, tag=tag, which=need, device=device)
-            missing = set(need) - set([n.split("_")[0] for n in loaded])
+
+            # Normalize loader-returned names -> {adapter, encoder, decoder, affine}
+            norm_map = {
+                "adapter_fmri": "adapter",
+                "fmri_encoder": "encoder",
+                "fmri_decoder": "decoder",
+                "fmri_affine":  "affine",
+            }
+            loaded_norm = {norm_map.get(n, n) for n in loaded}
+
+            missing = [x for x in need if x not in loaded_norm]
             if missing:
-                print(f"[WARN] Some modules for '{tag}' were not found: {sorted(missing)}")
+                print(f"[WARN] Missing expected modules for '{tag}': {missing}")
 
     # ---------- Set trainable ----------
     set_stage_rev(translator, stage)  # affine always trainable
@@ -1434,7 +1459,7 @@ def main():
                     "resume/start_epoch": start_epoch if ep == start_epoch else None,
                 }, step=ep)
 
-            # always save "last"
+            # always save "last" (includes affine)
             last_paths = save_modules(out_dir, translator, tag=f"revstage{stage}_last")
             ts_last = save_trainstate(out_dir, stage_label, tag="last", epoch=ep, best_val=best_val_total, opt=opt, scaler=scaler)
             if run is not None:
