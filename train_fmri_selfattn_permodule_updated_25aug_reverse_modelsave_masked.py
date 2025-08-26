@@ -1,0 +1,1721 @@
+#!/usr/bin/env python3
+"""
+Reversed stage-wise training (decoder-first) for fMRI-only self-attention with **masked input**:
+
+Option A (recommended): we mask the RAW fMRI window BEFORE BrainLM extraction.
+- BrainLM therefore cannot leak information from masked (t, v) locations.
+- The model must reconstruct masked values using spatiotemporal context via axial-RoPE self-attention.
+
+Stages (unchanged, affine ALWAYS trainable and saved/loaded):
+  - Rev Stage 1:    train decoder only  (+ affine)
+  - Rev Stage 2:    train decoder + encoder  (+ affine)
+  - Rev Stage 3:    train adapter + encoder + decoder  (+ affine)
+
+New in this script:
+- Configurable masking (ratio/shape/fill), enabled by default.
+- Loss on masked positions only (or mixed/all via flags).
+- Diagnostics render masked-input heatmaps and masked-only correlation bars.
+- GradScaler init fixed; “mse+pearson” auto-weights Pearson term when selected.
+"""
+
+from __future__ import annotations
+import os, json, math, argparse, time, platform, sys, csv, random
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, Iterable, List, Dict, Any, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+
+# ---- Matplotlib (no seaborn) ----
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+try:
+    from tqdm import tqdm
+except Exception:
+    tqdm = None
+
+# --- Weights & Biases (optional) ---
+try:
+    import wandb
+except Exception:
+    wandb = None
+
+# -----------------------------
+# Repo paths
+# -----------------------------
+THIS_DIR = Path(__file__).parent
+REPO_ROOT = THIS_DIR.parent
+CBRAMOD_DIR = REPO_ROOT / "CBraMod"
+BRAINLM_DIR = REPO_ROOT / "BrainLM"
+
+sys.path.insert(0, str(THIS_DIR))
+sys.path.insert(0, str(CBRAMOD_DIR))
+sys.path.insert(0, str(THIS_DIR / "CBraMod"))
+candidate_blm_roots = [
+    BRAINLM_DIR,
+    THIS_DIR / "BrainLM",
+    Path(os.environ.get("BRAINLM_DIR", "")),
+    Path(os.environ.get("BRAINLM_DIR", "")) / "brainlm_mae",
+]
+for p in candidate_blm_roots:
+    if not p: continue
+    p = Path(p)
+    if (p / "brainlm_mae").is_dir():
+        sys.path.insert(0, str(p)); break
+    if p.name == "brainlm_mae" and p.is_dir():
+        sys.path.insert(0, str(p.parent)); break
+
+# -----------------------------
+# Local modules (axial RoPE + 2-D decoder)
+# -----------------------------
+from module import (  # type: ignore
+    fMRIInputAdapterConv1d,
+    HierarchicalEncoder,
+    fMRIDecodingAdapter2D,
+)
+
+# BrainLM imports
+from brainlm_mae.modeling_brainlm import BrainLMForPretraining  # type: ignore
+from brainlm_mae.configuration_brainlm import BrainLMConfig     # type: ignore
+
+# Data utilities
+from data_oddball import (  # type: ignore
+    PairedAlignedDataset,
+    collate_paired,
+    pad_timepoints_for_brainlm_torch,
+    load_a424_coords,
+    collect_common_sr_keys,
+    fixed_subject_keys,
+)
+
+# -----------------------------
+# Utils / config
+# -----------------------------
+def seed_all(seed:int):
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+def worker_init_fn(seed):
+    def _fn(_):
+        random.seed(seed); np.random.seed(seed)
+    return _fn
+
+def fmt_mem() -> str:
+    if not torch.cuda.is_available(): return "cuda:N/A"
+    a = torch.cuda.memory_allocated() / (1024**2)
+    r = torch.cuda.memory_reserved() / (1024**2)
+    return f"cuda: alloc={a:.1f}MB, reserv={r:.1f}MB"
+
+# --- Torch load compat (PyTorch >=2.6 & earlier) ---
+def _torch_load_compat(path: Path, map_location, *, allow_weights_only: bool = False):
+    try:
+        return torch.load(str(path), map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(str(path), map_location=map_location)
+    except Exception as e1:
+        if allow_weights_only:
+            try:
+                import torch.serialization as ts
+                try:
+                    from torch.torch_version import TorchVersion  # type: ignore
+                    ts.add_safe_globals([TorchVersion])
+                except Exception:
+                    pass
+                return torch.load(str(path), map_location=map_location, weights_only=True)
+            except Exception as e2:
+                raise RuntimeError(f"Failed to load {path.name} via classic and safe weights_only paths:\n{e1}\n{e2}") from e2
+        raise
+
+@dataclass
+class TrainCfg:
+    # data / models
+    eeg_root: Path
+    fmri_root: Path
+    a424_label_nii: Path
+    brainlm_model_dir: Path
+    out_dir: Path
+
+    # training + arch
+    device: str = "cpu"
+    seed: int = 42
+    window_sec: int = 30
+    tr: float = 2.0
+    fmri_voxels: int = 424
+    batch_size: int = 8
+    num_workers: int = 0
+    stride_sec: Optional[int] = None
+    fmri_norm: str = "zscore"
+
+    # token dims
+    d_model: int = 128
+    n_heads: int = 4
+    d_ff: int = 512
+    dropout: float = 0.1
+
+    # encoder depth/rope + decoder rank
+    n_layers_per_stack: int = 1
+    rope_fraction: float = 1.0
+    decoder_rank: int = 32
+
+    # stages (epoch/LR knobs)
+    stage1_epochs: int = 3
+    stage2_epochs: int = 5
+    stage3_epochs: int = 3
+    lr_stage1: float = 1e-4
+    lr_stage2: float = 8e-5
+    lr_stage3: float = 5e-5
+    weight_decay: float = 1e-4
+    amp: bool = False
+
+    # affine policy (ignored; affine always trainable)
+    train_affine_stage3: bool = True
+
+    # splits
+    train_subjects: Optional[List[int]] = None
+    val_subjects:   Optional[List[int]] = None
+    test_subjects:  Optional[List[int]] = None
+
+    # debug controls
+    debug: bool = False
+    profile_first_n: int = 0
+    max_batches_per_epoch: int = 0
+    log_every: int = 10
+
+    # resume
+    auto_resume: bool = True
+
+    # ----- Loss fields -----
+    loss_type: str = "mse"   # {"mse","mae","huber","charbonnier","mse+pearson"}
+    recon_loss_w: float = 1.0
+    corr_loss_w: float = 0.0       # used unless loss_type == "mse+pearson" (auto weight)
+    tv_loss_w: float = 0.0
+    huber_delta: float = 1.0
+    charbonnier_eps: float = 1e-3
+    loss_on: str = "masked"        # {"masked","mixed","all"}
+    unmasked_weight: float = 0.05   # only for loss_on == "mixed"
+
+    # ----- Masking (Option A: before BrainLM) -----
+    masking_enable: bool = True
+    mask_ratio: float = 0.5
+    mask_axis: str = "block"       # {"uniform","voxel","time","both","block"}
+    mask_block_T: int = 3
+    mask_block_V: int = 12
+    mask_fill: str = "zero"        # {"zero","mean","noise"}
+    mask_noise_std_frac: float = 0.1
+
+    # ----- Sweep controls -----
+    auto_sweep: bool = False
+    sweep_epochs: int = 0
+    sweep_loss_list: Optional[List[str]] = None
+    sweep_corr_w: Optional[List[float]] = None
+    sweep_tv_w: Optional[List[float]] = None
+    sweep_huber_delta: Optional[List[float]] = None
+    sweep_charbonnier_eps: Optional[List[float]] = None
+    sweep_lr1: Optional[List[float]] = None
+    sweep_lr2: Optional[List[float]] = None
+    sweep_lr3: Optional[List[float]] = None
+    sweep_max_combos: int = 0
+    no_final_full: bool = False
+
+    # --- Weights & Biases ---
+    wandb_project: Optional[str] = None
+    wandb_entity: Optional[str] = None
+    wandb_run_name: Optional[str] = None
+    wandb_group: Optional[str] = None
+    wandb_job_type: Optional[str] = None
+    wandb_tags: Optional[List[str]] = None
+    wandb_notes: Optional[str] = None
+    wandb_mode: str = "online"  # "online" | "offline" | "disabled"
+
+# -----------------------------
+# Frozen BrainLM
+# -----------------------------
+class FrozenBrainLM(nn.Module):
+    def __init__(self, model_dir: Path, device: torch.device):
+        super().__init__()
+        cfg_path = model_dir / "config.json"
+        w_path   = model_dir / "pytorch_model.bin"
+        with open(cfg_path, "r") as f:
+            cfg = BrainLMConfig(**json.load(f))
+        self.model = BrainLMForPretraining(cfg)
+        try:
+            ckpt = _torch_load_compat(w_path, map_location=device, allow_weights_only=True)
+            self.model.load_state_dict(ckpt, strict=False)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load BrainLM: {e}")
+        self.model.eval()
+        for p in self.model.parameters(): p.requires_grad = False
+        self.to(device); self.device = device
+
+    @property
+    def n_layers_out(self) -> int:
+        return int(getattr(self.model.config, "num_hidden_layers", 4)) + 1
+
+    @property
+    def hidden_size(self) -> int:
+        return int(getattr(self.model.config, "hidden_size", 256))
+
+    @torch.no_grad()
+    def extract_latents(self, signal_vectors: torch.Tensor, xyz_vectors: torch.Tensor) -> torch.Tensor:
+        embeddings, mask, ids_restore = self.model.vit.embeddings(
+            signal_vectors=signal_vectors, xyz_vectors=xyz_vectors, noise=None
+        )
+        enc = self.model.vit.encoder(hidden_states=embeddings, output_hidden_states=True, return_dict=True)
+        return torch.stack(list(enc.hidden_states), dim=0)  # (L,B,Ttok,Dh)
+
+# -----------------------------
+# Translator (fMRI-only, axial-RoPE self-attn)
+# -----------------------------
+class TranslatorFMRISelfAttn(nn.Module):
+    """
+    fMRI branch:
+      adapter_fmri (→ S=T×V) -> fmri_encoder (axial RoPE) -> fmri_decoder_2d -> tanh + affine
+    """
+    def __init__(self, cfg: TrainCfg, fmri_n_layers:int, fmri_hidden_size:int):
+        super().__init__()
+        self.cfg = cfg
+        T = int(round(cfg.window_sec / cfg.tr))
+        V = int(cfg.fmri_voxels)
+        S = T * V
+
+        # Adapter: stack BrainLM latents → tokens, retarget to S=T×V
+        self.adapter_fmri = fMRIInputAdapterConv1d(
+            seq_len=S,
+            n_layers=fmri_n_layers,
+            input_dim=fmri_hidden_size,
+            output_dim=cfg.d_model,
+            target_seq_len=S
+        )
+
+        # Self-attention encoder
+        self.fmri_encoder = HierarchicalEncoder(
+            cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.dropout,
+            n_layers_per_stack=cfg.n_layers_per_stack, rope_fraction=cfg.rope_fraction
+        )
+
+        # 2-D decoder (predicts (B,T,V) with time-only resize)
+        self.fmri_decoder = fMRIDecodingAdapter2D(
+            target_T=T, target_V=V, d_model=cfg.d_model, rank=cfg.decoder_rank
+        )
+
+        # Output affine (trainable in all stages)
+        self.fmri_out_scale = nn.Parameter(torch.tensor(1.0))
+        self.fmri_out_bias  = nn.Parameter(torch.tensor(0.0))
+
+        self.T = T
+        self.V = V
+
+    def forward(self, fmri_latents: torch.Tensor, fmri_T:int, fmri_V:int) -> torch.Tensor:
+        """
+        fmri_latents: (L,B,Ttok,Dh) from BrainLM (already masked at input if masking_enable)
+        returns: (B,T,V)
+        """
+        fmri_adapt = self.adapter_fmri(fmri_latents)                   # (B,S,D) with S=T×V
+        _, fmr_hi = self.fmri_encoder(fmri_adapt, fmri_adapt, T=fmri_T, V=fmri_V)  # (B,S,D)
+        fmri_sig = self.fmri_decoder(fmr_hi)                           # (B,T,V)
+        fmri_sig = torch.tanh(fmri_sig)
+        fmri_sig = self.fmri_out_scale * fmri_sig + self.fmri_out_bias
+        return fmri_sig
+
+# -----------------------------
+# Freezing policies (reversed)
+# -----------------------------
+def freeze_all(m: nn.Module):
+    for p in m.parameters(): p.requires_grad = False
+
+def set_stage_rev(m: TranslatorFMRISelfAttn, stage: int, *, train_affine_stage3: bool = False):
+    """
+    Reversed (decoder-first) stages:
+      - 1: decoder (+ affine)
+      - 2: decoder + encoder (+ affine)
+      - 3: adapter + encoder + decoder (+ affine)
+    Affine is ALWAYS trainable.
+    """
+    freeze_all(m)
+    if stage == 1:
+        for n, p in m.named_parameters():
+            if n.startswith("fmri_decoder."):
+                p.requires_grad = True
+    elif stage == 2:
+        for n, p in m.named_parameters():
+            if n.startswith("fmri_decoder.") or n.startswith("fmri_encoder."):
+                p.requires_grad = True
+    elif stage == 3:
+        for n, p in m.named_parameters():
+            if (n.startswith("adapter_fmri.") or
+                n.startswith("fmri_encoder.") or
+                n.startswith("fmri_decoder.")):
+                p.requires_grad = True
+    else:
+        raise ValueError(f"Unknown reversed stage {stage}")
+    m.fmri_out_scale.requires_grad = True
+    m.fmri_out_bias.requires_grad  = True
+
+# -----------------------------
+# Per-module save/load helpers
+# -----------------------------
+def _module_paths(out_dir: Path, tag: str):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return {
+        "adapter": out_dir / f"adapter_fmri_{tag}.pt",
+        "encoder": out_dir / f"fmri_encoder_{tag}.pt",
+        "decoder": out_dir / f"fmri_decoder_{tag}.pt",
+        "affine":  out_dir / f"fmri_affine_{tag}.pt",
+    }
+
+def save_modules(out_dir: Path, model: TranslatorFMRISelfAttn, tag: str):
+    paths = _module_paths(out_dir, tag)
+    torch.save(model.adapter_fmri.state_dict(), paths["adapter"])
+    torch.save(model.fmri_encoder.state_dict(), paths["encoder"])
+    torch.save(model.fmri_decoder.state_dict(), paths["decoder"])
+    torch.save({"scale": model.fmri_out_scale.detach().cpu(),
+                "bias":  model.fmri_out_bias.detach().cpu()}, paths["affine"])
+    print(f"[save] modules -> {', '.join(p.name for p in paths.values())}")
+    return paths
+
+def load_modules_if_exist(out_dir: Path, model: TranslatorFMRISelfAttn, tag: str,
+                          which: Optional[Iterable[str]] = None, device: Optional[torch.device] = None):
+    paths = _module_paths(out_dir, tag)
+    which = set(which or ["adapter","encoder","decoder","affine"])
+    loaded = []
+    if "adapter" in which and paths["adapter"].exists():
+        sd = _torch_load_compat(paths["adapter"], map_location=device or "cpu", allow_weights_only=True)
+        model.adapter_fmri.load_state_dict(sd, strict=False); loaded.append("adapter_fmri")
+    if "encoder" in which and paths["encoder"].exists():
+        sd = _torch_load_compat(paths["encoder"], map_location=device or "cpu", allow_weights_only=True)
+        model.fmri_encoder.load_state_dict(sd, strict=False); loaded.append("fmri_encoder")
+    if "decoder" in which and paths["decoder"].exists():
+        sd = _torch_load_compat(paths["decoder"], map_location=device or "cpu", allow_weights_only=True)
+        model.fmri_decoder.load_state_dict(sd, strict=False); loaded.append("fmri_decoder")
+    if "affine" in which and paths["affine"].exists():
+        sd = _torch_load_compat(paths["affine"], map_location=device or "cpu", allow_weights_only=True)
+        if isinstance(sd, dict):
+            with torch.no_grad():
+                if "scale" in sd: model.fmri_out_scale.copy_(sd["scale"].to(model.fmri_out_scale.device))
+                if "bias"  in sd: model.fmri_out_bias.copy_(sd["bias"].to(model.fmri_out_bias.device))
+        loaded.append("fmri_affine")
+    if loaded:
+        print(f"[load] modules restored for tag '{tag}': {', '.join(loaded)}")
+    return loaded
+
+# -----------------------------
+# Trainstate save/load
+# -----------------------------
+def _trainstate_path(out_dir: Path, stage_label: str, tag: str) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir / f"trainstate_{stage_label}_{tag}.pt"
+
+def save_trainstate(out_dir: Path, stage_label: str, tag: str, epoch: int, best_val: float,
+                    opt: Optional[torch.optim.Optimizer], scaler: Optional[torch.cuda.amp.GradScaler]) -> Path:
+    state = {
+        "epoch": int(epoch),
+        "best_val": float(best_val),
+        "optimizer_state": (opt.state_dict() if opt is not None else None),
+        "scaler_state": (scaler.state_dict() if scaler is not None else None),
+        "timestamp": time.time(),
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda if torch.cuda.is_available() else None,
+        "rng_python": random.getstate(),
+        "rng_np": np.random.get_state(),
+        "rng_torch": torch.get_rng_state(),
+        "rng_cuda": (torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None),
+    }
+    p = _trainstate_path(out_dir, stage_label, tag)
+    torch.save(state, p)
+    return p
+
+def load_trainstate_if_exist(out_dir: Path, stage_label: str, tag: str,
+                             opt: Optional[torch.optim.Optimizer],
+                             scaler: Optional[torch.cuda.amp.GradScaler],
+                             device: torch.device) -> Tuple[int, float, bool]:
+    p = _trainstate_path(out_dir, stage_label, tag)
+    if not p.exists():
+        return 1, float('inf'), False
+    try:
+        sd = _torch_load_compat(p, map_location=device, allow_weights_only=False)
+        if opt is not None and sd.get("optimizer_state") is not None:
+            try: opt.load_state_dict(sd["optimizer_state"])
+            except Exception as e: print(f"[resume] WARN optimizer state: {e}")
+        if scaler is not None and sd.get("scaler_state") is not None:
+            try: scaler.load_state_dict(sd["scaler_state"])
+            except Exception as e: print(f"[resume] WARN scaler state: {e}")
+        # restore RNGs (best-effort)
+        try:
+            random.setstate(sd.get("rng_python"))
+            np.random.set_state(sd.get("rng_np"))
+            torch.set_rng_state(sd.get("rng_torch"))
+            if torch.cuda.is_available() and sd.get("rng_cuda") is not None:
+                torch.cuda.set_rng_state_all(sd["rng_cuda"])
+        except Exception:
+            pass
+
+        last_epoch = int(sd.get("epoch", 0))
+        best_val = float(sd.get("best_val", float('inf')))
+        print(f"[resume] Loaded trainstate from {p.name}: epoch={last_epoch}, best_val={best_val:.6f}")
+        return max(1, last_epoch + 1), best_val, True
+    except Exception as e:
+        print(f"[resume] WARN failed to load trainstate ({p.name}): {e}")
+        return 1, float('inf'), False
+
+# -----------------------------
+# Masking utilities (Option A)
+# -----------------------------
+def _make_mask_uniform(B:int, T:int, V:int, ratio:float, device) -> torch.Tensor:
+    return (torch.rand(B, T, V, device=device) < ratio)
+
+def _make_mask_voxel(B:int, T:int, V:int, ratio:float, device) -> torch.Tensor:
+    k = max(1, int(round(ratio * V)))
+    M = torch.zeros(B, T, V, device=device, dtype=torch.bool)
+    for b in range(B):
+        idx = torch.randperm(V, device=device)[:k]
+        M[b, :, idx] = True
+    return M
+
+def _make_mask_time(B:int, T:int, V:int, ratio:float, device) -> torch.Tensor:
+    k = max(1, int(round(ratio * T)))
+    M = torch.zeros(B, T, V, device=device, dtype=torch.bool)
+    for b in range(B):
+        idx = torch.randperm(T, device=device)[:k]
+        M[b, idx, :] = True
+    return M
+
+def _make_mask_both(B:int, T:int, V:int, ratio:float, device) -> torch.Tensor:
+    # split ratio 50/50 into time and voxel masking, clamp to [0,1]
+    r_vox = min(1.0, max(0.0, ratio * 0.5 * 2.0))
+    r_tim = min(1.0, max(0.0, ratio * 0.5 * 2.0))
+    return _make_mask_voxel(B,T,V,r_vox,device) | _make_mask_time(B,T,V,r_tim,device)
+
+def _make_mask_block(B:int, T:int, V:int, ratio:float, BT:int, BV:int, device) -> torch.Tensor:
+    # approximate ratio coverage using random blocks of size (BT × BV)
+    M = torch.zeros(B, T, V, device=device, dtype=torch.bool)
+    block_area = max(1, BT * BV)
+    target = int(round(ratio * T * V))
+    blocks = max(1, target // block_area)
+    for b in range(B):
+        for _ in range(blocks):
+            t0 = int(torch.randint(0, max(1, T - BT + 1), (1,), device=device))
+            v0 = int(torch.randint(0, max(1, V - BV + 1), (1,), device=device))
+            M[b, t0:t0+BT, v0:v0+BV] = True
+    return M
+
+def make_mask(cfg: TrainCfg, B:int, T:int, V:int, device) -> torch.Tensor:
+    r = float(cfg.mask_ratio)
+    axis = cfg.mask_axis.lower()
+    if r <= 0.0: return torch.zeros(B,T,V, device=device, dtype=torch.bool)
+    if axis == "uniform":
+        return _make_mask_uniform(B,T,V,r,device)
+    if axis == "voxel":
+        return _make_mask_voxel(B,T,V,r,device)
+    if axis == "time":
+        return _make_mask_time(B,T,V,r,device)
+    if axis == "both":
+        return _make_mask_both(B,T,V,r,device)
+    # default: block
+    return _make_mask_block(B,T,V,r, cfg.mask_block_T, cfg.mask_block_V, device)
+
+def apply_mask_fill(x: torch.Tensor, M: torch.Tensor, cfg: TrainCfg) -> torch.Tensor:
+    """
+    x: (B,T,V), M: bool (B,T,V) True = masked
+    """
+    if not cfg.masking_enable or (M is None) or (M.sum() == 0):
+        return x
+    x_out = x.clone()
+    fill = cfg.mask_fill.lower()
+    if fill == "zero":
+        x_out[M] = 0.0
+    elif fill == "mean":
+        # per-batch, per-ROI mean across time
+        mu = x.mean(dim=1, keepdim=True)   # (B,1,V)
+        x_out[M] = mu.expand_as(x)[M]
+    elif fill == "noise":
+        # per-batch, per-ROI std across time
+        std = x.std(dim=1, keepdim=True)   # (B,1,V)
+        noise = torch.randn_like(x) * (cfg.mask_noise_std_frac * (std + 1e-6))
+        x_out[M] = noise[M]
+    else:
+        x_out[M] = 0.0
+    return x_out
+
+# -----------------------------
+# Weighted losses (masked)
+# -----------------------------
+def _weighted_mse(recon: torch.Tensor, target: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    num = ((recon - target) ** 2 * w).sum()
+    den = w.sum().clamp_min(1.0)
+    return num / den
+
+def _weighted_l1(recon: torch.Tensor, target: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    num = (recon.sub(target).abs() * w).sum()
+    den = w.sum().clamp_min(1.0)
+    return num / den
+
+def _weighted_huber(recon: torch.Tensor, target: torch.Tensor, w: torch.Tensor, delta: float) -> torch.Tensor:
+    diff = recon - target
+    absd = diff.abs()
+    quad = torch.minimum(absd, torch.tensor(delta, device=diff.device, dtype=diff.dtype))
+    lin  = absd - quad
+    num = (0.5 * quad**2 + delta * lin) * w
+    den = w.sum().clamp_min(1.0)
+    return num.sum() / den
+
+def _weighted_charbonnier(recon: torch.Tensor, target: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+    diff2 = (recon - target) ** 2
+    num = torch.sqrt(diff2 + eps * eps) * w
+    den = w.sum().clamp_min(1.0)
+    return num.sum() / den
+
+def _weighted_corr_loss(recon: torch.Tensor, target: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """
+    Compute (1 - mean Pearson r) across batch and ROI, using weights along time.
+    recon/target: (B,T,V); w: (B,T,V) in [0,1]
+    """
+    eps = 1e-6
+    wsum = w.sum(dim=1, keepdim=True).clamp_min(eps)     # (B,1,V)
+    xr = (recon * w).sum(dim=1, keepdim=True) / wsum     # (B,1,V)
+    yr = (target * w).sum(dim=1, keepdim=True) / wsum
+    x_c = recon - xr
+    y_c = target - yr
+    cov = (w * x_c * y_c).sum(dim=1) / wsum.squeeze(1)   # (B,V)
+    x_var = (w * x_c * x_c).sum(dim=1) / wsum.squeeze(1) # (B,V)
+    y_var = (w * y_c * y_c).sum(dim=1) / wsum.squeeze(1)
+    r = cov / (torch.sqrt(x_var * y_var) + eps)          # (B,V)
+    r = torch.clamp(r, -1.0, 1.0)
+    return (1.0 - r.mean())
+
+def _weighted_tv_time(recon: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """
+    TV along time axis only; weight only where both t and t-1 are masked.
+    recon: (B,T,V); w: (B,T,V)
+    """
+    if w is None:  # fallback to unweighted TV
+        return torch.mean(torch.abs(recon[:, 1:, :] - recon[:, :-1, :]))
+    w_pair = (w[:, 1:, :] * w[:, :-1, :])
+    num = (torch.abs(recon[:, 1:, :] - recon[:, :-1, :]) * w_pair).sum()
+    den = w_pair.sum().clamp_min(1.0)
+    return num / den
+
+def _compute_loss_components(recon: torch.Tensor, target: torch.Tensor, cfg: TrainCfg, mask: Optional[torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """
+    recon/target: (B,T,V)
+    mask: bool (B,T,V), True where **masked** (we want loss there).
+    """
+    if mask is None or (not cfg.masking_enable):
+        w = torch.ones_like(recon)
+    else:
+        if cfg.loss_on == "masked":
+            w = mask.float()
+        elif cfg.loss_on == "mixed":
+            w = mask.float() + float(cfg.unmasked_weight) * (~mask).float()
+        else:
+            w = torch.ones_like(recon)
+
+    # Reconstruction loss
+    if cfg.loss_type in ("mse", "mse+pearson"):
+        recon_loss = _weighted_mse(recon, target, w)
+    elif cfg.loss_type == "mae":
+        recon_loss = _weighted_l1(recon, target, w)
+    elif cfg.loss_type == "huber":
+        recon_loss = _weighted_huber(recon, target, w, float(cfg.huber_delta))
+    elif cfg.loss_type == "charbonnier":
+        recon_loss = _weighted_charbonnier(recon, target, w, float(cfg.charbonnier_eps))
+    else:
+        recon_loss = _weighted_mse(recon, target, w)
+
+    # Correlation loss (weighted along time)
+    corr_loss = torch.tensor(0.0, device=recon.device)
+    need_corr = (cfg.loss_type == "mse+pearson") or (cfg.corr_loss_w and cfg.corr_loss_w > 0)
+    if need_corr:
+        corr_loss = _weighted_corr_loss(recon, target, w)
+
+    # TV loss (weighted pairs in time)
+    tv_loss = torch.tensor(0.0, device=recon.device)
+    if cfg.tv_loss_w and cfg.tv_loss_w > 0:
+        tv_loss = _weighted_tv_time(recon, w)
+
+    # Auto-weight Pearson when loss_type == mse+pearson
+    corr_w_eff = (0.2 if cfg.loss_type == "mse+pearson" and (not cfg.corr_loss_w or cfg.corr_loss_w == 0.0)
+                  else float(cfg.corr_loss_w))
+
+    total = (cfg.recon_loss_w * recon_loss
+             + corr_w_eff * corr_loss
+             + cfg.tv_loss_w * tv_loss)
+    return total, {"recon": recon_loss.detach(), "corr": corr_loss.detach(), "tv": tv_loss.detach()}
+
+# -----------------------------
+# Data & helpers
+# -----------------------------
+def make_dataloaders(cfg: TrainCfg, device: torch.device) -> Tuple[DataLoader, DataLoader, Optional[DataLoader]]:
+    inter_keys = collect_common_sr_keys(cfg.eeg_root, cfg.fmri_root)
+    if not inter_keys:
+        raise RuntimeError("No (subject,task,run) intersections between EEG and fMRI trees.")
+
+    if not (cfg.train_subjects and cfg.val_subjects):
+        raise RuntimeError(
+            "Provide subject splits via --train_subjects and --val_subjects (and optionally --test_subjects). "
+            "Auto-splitting is disabled."
+        )
+
+    train_keys, val_keys, test_keys = fixed_subject_keys(
+        cfg.eeg_root, cfg.fmri_root,
+        cfg.train_subjects or [], cfg.val_subjects or [], cfg.test_subjects or [],
+    )
+
+    gen = torch.Generator()
+    gen.manual_seed(cfg.seed)
+
+    def _dl(keys, name):
+        ds = PairedAlignedDataset(
+            eeg_root=cfg.eeg_root, fmri_root=cfg.fmri_root, a424_label_nii=cfg.a424_label_nii,
+            window_sec=cfg.window_sec, original_fs=1000, target_fs=200, tr=cfg.tr,
+            channels_limit=34, fmri_norm=cfg.fmri_norm, stride_sec=cfg.stride_sec,
+            device='cpu', include_sr_keys=keys
+        )
+        if cfg.debug:
+            print(f"[debug][dataset] {name}: samples={len(ds)} keys={len(keys)}")
+        dl = DataLoader(
+            ds,
+            batch_size=cfg.batch_size,
+            shuffle=(name == "train"),
+            num_workers=cfg.num_workers,
+            pin_memory=(device.type == 'cuda'),
+            collate_fn=collate_paired,
+            drop_last=False,
+            generator=gen,
+            worker_init_fn=worker_init_fn(cfg.seed)
+        )
+        if cfg.debug:
+            print(f"[debug][dataloader] {name}: batches={len(dl)} (bs={cfg.batch_size}, workers={cfg.num_workers}, pin={device.type=='cuda'})")
+        return dl
+
+    return _dl(train_keys, "train"), _dl(val_keys, "val"), (_dl(test_keys, "test") if test_keys else None)
+
+def cache_a424_xyz(device: torch.device) -> Optional[torch.Tensor]:
+    candidates = [
+        THIS_DIR / 'BrainLM' / 'resources' / 'atlases' / 'A424_Coordinates.dat',
+        THIS_DIR / 'resources' / 'atlases' / 'A424_Coordinates.dat',
+        REPO_ROOT / 'BrainLM' / 'toolkit' / 'atlases' / 'A424_Coordinates.dat',
+    ]
+    coords = None
+    for p in candidates:
+        if p.exists():
+            try:
+                arr = load_a424_coords(p)
+                arr = arr / (float(np.max(np.abs(arr))) or 1.0)
+                coords = torch.from_numpy(arr.astype(np.float32)).to(device)
+                break
+            except Exception:
+                pass
+    return coords
+
+def _grad_norm(model: nn.Module) -> float:
+    tot = 0.0
+    for p in model.parameters():
+        if p.requires_grad and p.grad is not None:
+            param_norm = p.grad.data.norm(2).item()
+            tot += param_norm * param_norm
+    return float(math.sqrt(tot)) if tot > 0 else 0.0
+
+# -----------------------------
+# Epoch runner (masked input before BrainLM)
+# -----------------------------
+def run_epoch(mode:str, dl, model, brainlm, xyz_ref, cfg:TrainCfg, device, scaler, opt=None):
+    is_train = (mode == 'train')
+    model.train(is_train)
+    tot, steps = 0.0, 0
+    comp_acc = {"recon": 0.0, "corr": 0.0, "tv": 0.0}
+
+    iterator = tqdm(dl, total=len(dl), leave=False, desc=f"{mode}") if tqdm is not None else dl
+    prev_end = time.time()
+
+    for bidx, batch in enumerate(iterator):
+        t_fetch = time.time() - prev_end
+        t0 = time.time()
+
+        fmri_t = batch['fmri_window'].to(device, non_blocking=True)  # (B,T,V)
+        B,T,V = fmri_t.shape
+
+        # Create mask on the unpadded window (B,T,V)
+        M = make_mask(cfg, B, T, V, device) if cfg.masking_enable else torch.zeros(B,T,V, device=device, dtype=torch.bool)
+        fmri_in = apply_mask_fill(fmri_t, M, cfg)  # masked input for BrainLM
+
+        # Pad BOTH the input (masked) and (optionally) we could pad mask, but not needed here
+        t_pad0 = time.time()
+        fmri_pad = pad_timepoints_for_brainlm_torch(fmri_in, patch_size=20)  # (B,Tp,V)
+        signal_vectors = fmri_pad.permute(0,2,1).contiguous()               # (B,V,Tp)
+        if xyz_ref is not None and V == cfg.fmri_voxels:
+            xyz = xyz_ref.unsqueeze(0).repeat(B,1,1)
+        else:
+            xyz = torch.zeros(B, V, 3, device=device)
+        t_pad = time.time() - t_pad0
+
+        # BrainLM latents (frozen) from **masked** input
+        t_blm0 = time.time()
+        with torch.no_grad():
+            fmri_latents = brainlm.extract_latents(signal_vectors, xyz)     # (L,B,Ttok,Dh)
+        t_blm = time.time() - t_blm0
+
+        if is_train:
+            opt.zero_grad(set_to_none=True)
+
+        # Forward + loss (loss computed **on masked positions** per cfg.loss_on)
+        t_fwd0 = time.time()
+        autocast_enabled = (cfg.amp and device.type=='cuda')
+        with torch.cuda.amp.autocast(enabled=autocast_enabled):
+            recon = model(fmri_latents, fmri_T=T, fmri_V=V)                  # (B,T,V)
+            total_loss, comps = _compute_loss_components(recon, fmri_t, cfg, M)
+        t_fwd = time.time() - t_fwd0
+
+        t_bwd = t_step = gnorm = 0.0
+        if is_train:
+            t_bwd0 = time.time()
+            scaler.scale(total_loss).backward()
+            scaler.unscale_(opt)
+            gnorm = _grad_norm(model)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            t_bwd = time.time() - t_bwd0
+
+            t_step0 = time.time()
+            scaler.step(opt); scaler.update()
+            t_step = time.time() - t_step0
+
+        loss_val = float(total_loss.detach().cpu())
+        tot += loss_val; steps += 1
+        for k in comp_acc.keys():
+            comp_acc[k] += float(comps[k].detach().cpu())
+
+        t_tot = time.time() - t0
+        if cfg.debug:
+            if bidx < max(1, cfg.profile_first_n):
+                mem = fmt_mem()
+                print(
+                    f"[{mode}] b{bidx:04d} fetch={t_fetch:.3f}s | pad={t_pad:.3f}s | brainlm={t_blm:.3f}s | "
+                    f"fwd={t_fwd:.3f}s | bwd={t_bwd:.3f}s | step={t_step:.3f}s | total={t_tot:.3f}s | "
+                    f"loss={loss_val:.6f} | gnorm={gnorm:.3f} | {mem} | "
+                    f"shapes: fmri={tuple(fmri_t.shape)} latents={tuple(fmri_latents.shape)} mask_ratio={cfg.mask_ratio}"
+                )
+            elif (bidx+1) % max(1, cfg.log_every) == 0:
+                mem = fmt_mem()
+                if tqdm is not None:
+                    iterator.set_postfix_str(f"loss={loss_val:.4f} f={t_fetch:.2f}s p={t_pad:.2f}s blm={t_blm:.2f}s fwd={t_fwd:.2f}s {mem}")
+                else:
+                    print(f"[{mode}] b{bidx+1}/{len(dl)} loss={loss_val:.5f} fwd={t_fwd:.3f}s gnorm={gnorm:.2f} {mem}")
+
+        if cfg.debug and (wandb is not None) and (cfg.wandb_mode != "disabled") and is_train:
+            alloc = torch.cuda.memory_allocated()/(1024**2) if torch.cuda.is_available() else 0.0
+            reserv = torch.cuda.memory_reserved()/(1024**2) if torch.cuda.is_available() else 0.0
+            wandb.log({
+                "batch/total_loss": loss_val,
+                "batch/recon_loss": float(comps["recon"].cpu()),
+                "batch/corr_loss":  float(comps["corr"].cpu()),
+                "batch/tv_loss":    float(comps["tv"].cpu()),
+                "batch/fetch_s": t_fetch, "batch/pad_s": t_pad, "batch/brainlm_s": t_blm,
+                "batch/fwd_s": t_fwd, "batch/bwd_s": t_bwd, "batch/step_s": t_step, "batch/total_s": t_tot,
+                "cuda/alloc_mb": alloc, "cuda/reserved_mb": reserv,
+            })
+
+        prev_end = time.time()
+        if cfg.max_batches_per_epoch and steps >= cfg.max_batches_per_epoch:
+            if cfg.debug:
+                print(f"[debug] Reached --max_batches_per_epoch={cfg.max_batches_per_epoch}, breaking early.")
+            break
+
+    avg = {
+        "total": tot / max(1, steps),
+        "recon": comp_acc["recon"] / max(1, steps),
+        "corr":  comp_acc["corr"] / max(1, steps),
+        "tv":    comp_acc["tv"] / max(1, steps),
+    }
+    return avg
+
+# -----------------------------
+# Diagnostics (masked input)
+# -----------------------------
+def _pearsonr_masked(a: np.ndarray, b: np.ndarray, m: np.ndarray) -> float:
+    # a,b: (T,), m: (T,) bool, compute Pearson only where m==True
+    sel = m.astype(bool)
+    if sel.sum() < 3: return 0.0
+    a = a[sel]; b = b[sel]
+    sa = a.std(); sb = b.std()
+    if sa == 0.0 or sb == 0.0: return 0.0
+    r = np.corrcoef(a, b)[0,1]
+    return float(r) if np.isfinite(r) else 0.0
+
+def _downsample(x: np.ndarray, y: np.ndarray, max_points: int) -> Tuple[np.ndarray, np.ndarray]:
+    n = int(x.shape[0])
+    if n <= max_points: return x, y
+    step = int(math.ceil(n / max_points))
+    return x[::step], y[::step]
+
+def _ensure_dirs(out_dir: Path):
+    (out_dir / "plots").mkdir(parents=True, exist_ok=True)
+    (out_dir / "tables").mkdir(parents=True, exist_ok=True)
+
+def _plot_heatmap(arr: np.ndarray, title: str, out_path: Path, xlabel="ROI", ylabel="Time (TR)", cmap="viridis"):
+    plt.figure(figsize=(12, 6))
+    plt.imshow(arr.T, aspect="auto", interpolation="nearest", origin="upper", cmap=cmap)
+    plt.colorbar()
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+
+def _plot_topk_masked(t: np.ndarray, x_true: np.ndarray, x_rec: np.ndarray, M: np.ndarray,
+                      out_dir: Path, TR: float, top_k: int = 12, plot_max_points: int = 1000):
+    T, V = x_true.shape
+    rs: List[Tuple[int,float]] = []
+    for roi in range(V):
+        r = _pearsonr_masked(x_true[:, roi], x_rec[:, roi], M[:, roi])
+        rs.append((roi, r))
+    rs.sort(key=lambda t_: t_[1], reverse=True)
+    top = rs[:min(top_k, len(rs))]
+
+    if len(top) > 0:
+        fig, axes = plt.subplots(nrows=len(top), ncols=1, figsize=(12, 2.2*len(top)), sharex=False)
+        if len(top) == 1: axes = [axes]
+        for ax, (roi, r) in zip(axes, top):
+            gt = x_true[:, roi]; rc = x_rec[:, roi]; m = M[:, roi].astype(bool)
+            tt = np.arange(T) * float(TR)
+            tt_d, gtd = _downsample(tt, gt, plot_max_points)
+            _,    rcd = _downsample(tt, rc, plot_max_points)
+            ax.plot(tt_d, gtd, label="GT")
+            ax.plot(tt_d, rcd, label="Recon", alpha=0.9)
+            ax.fill_between(tt, gt.min(), gt.max(), where=m, color="gray", alpha=0.15, step=None, label="masked")
+            ax.set_title(f"ROI {roi} — r(masked)={r:.3f}")
+            ax.set_xlabel("Time (s)"); ax.set_ylabel("Z-score")
+            ax.legend(loc="upper right")
+        fig.tight_layout()
+        fig.savefig(out_dir / "plots" / "topK_fmri_corr_masked.png", dpi=150)
+        plt.close(fig)
+
+    all_roi = [roi for roi,_ in rs]
+    all_r   = [r for _,r in rs]
+    order = np.argsort(all_r)[::-1]
+    figw = max(12, 0.03 * len(all_roi) + 10)
+    plt.figure(figsize=(figw, 5))
+    plt.bar(np.arange(len(all_roi)), np.array(all_r)[order])
+    plt.ylim(-1.0, 1.0)
+    step = max(1, len(all_roi)//40)
+    plt.xticks(np.arange(0,len(all_roi),step), [str(all_roi[i]) for i in order[::step]], rotation=90)
+    plt.xlabel("fMRI ROI (sorted by r on MASKED)")
+    plt.ylabel("Pearson r (masked only)")
+    plt.title("fMRI: Pearson r per ROI (masked positions only)")
+    plt.tight_layout()
+    plt.savefig(out_dir / "plots" / "corr_bars_fmri_masked.png", dpi=150)
+    plt.close()
+    return rs
+
+@torch.no_grad()
+def generate_fmri_diagnostics_masked(
+    cfg: TrainCfg,
+    out_dir: Path,
+    stage: int,
+    model: TranslatorFMRISelfAttn,
+    brainlm: FrozenBrainLM,
+    dl_eval: DataLoader,
+    device: torch.device,
+    xyz_ref: Optional[torch.Tensor],
+    *,
+    top_k: int = 12,
+    plot_max_points: int = 1000,
+    wandb_run=None,
+    tag_for_logging: Optional[str] = None,
+):
+    """Use first batch from dl_eval; run masked-input inference; write plots/CSV."""
+    _ensure_dirs(out_dir)
+    model.eval()
+
+    try:
+        batch = next(iter(dl_eval))
+    except StopIteration:
+        print("[diag] WARNING: empty eval dataloader; skipping diagnostics.")
+        return
+
+    fmri_t = batch['fmri_window'].to(device)  # (B,T,V)
+    B, T, V = map(int, fmri_t.shape)
+
+    # Mask and fill
+    M = make_mask(cfg, B, T, V, device) if cfg.masking_enable else torch.zeros(B,T,V, device=device, dtype=torch.bool)
+    fmri_in = apply_mask_fill(fmri_t, M, cfg)
+
+    # BrainLM inputs from **masked** signal
+    fmri_pad = pad_timepoints_for_brainlm_torch(fmri_in, patch_size=20)  # (B,Tp,V)
+    signal_vectors = fmri_pad.permute(0,2,1).contiguous()               # (B,V,Tp)
+    xyz = (xyz_ref.unsqueeze(0).repeat(B,1,1) if (xyz_ref is not None and V == cfg.fmri_voxels)
+           else torch.zeros(B, V, 3, device=device))
+    fmri_latents = brainlm.extract_latents(signal_vectors, xyz)         # (L,B,Ttok,Dh)
+    recon = model(fmri_latents, fmri_T=T, fmri_V=V)                     # (B,T,V)
+
+    b = 0
+    x_true = fmri_t[b].detach().cpu().numpy()    # (T,V)
+    x_rec  = recon[b].detach().cpu().numpy()     # (T,V)
+    m_np   = M[b].detach().cpu().numpy().astype(np.bool_)
+
+    # Plots
+    _plot_heatmap(x_true, "GT (T×V)", out_dir / "plots" / "heatmap_gt.png")
+    _plot_heatmap(fmri_in[b].detach().cpu().numpy(), "Input (masked) (T×V)", out_dir / "plots" / "heatmap_input_masked.png")
+    _plot_heatmap(x_rec,  "Recon (T×V) — masked input", out_dir / "plots" / "heatmap_recon_maskedinput.png")
+    _plot_heatmap(np.abs(x_true - x_rec), "|GT - Recon| (T×V)", out_dir / "plots" / "heatmap_absdiff_masked.png", cmap="magma")
+    _plot_heatmap(m_np.astype(np.float32), "Mask (1=masked)", out_dir / "plots" / "mask.png", cmap="gray")
+
+    # Top-K on masked positions only
+    rs = _plot_topk_masked(
+        t=np.arange(T)*float(cfg.tr),
+        x_true=x_true, x_rec=x_rec, M=m_np,
+        out_dir=out_dir, TR=cfg.tr, top_k=top_k, plot_max_points=plot_max_points
+    )
+
+    # CSV per-ROI metrics (masked only)
+    rows: List[List[float]] = []
+    for roi in range(V):
+        m = m_np[:, roi].astype(bool)
+        if m.sum() < 3:
+            r_mask = 0.0; std_gt = float(x_true[:,roi].std()); std_rec = float(x_rec[:,roi].std())
+            rows.append([roi, r_mask, std_gt, std_rec, np.nan, np.nan])
+            continue
+        r_mask = _pearsonr_masked(x_true[:, roi], x_rec[:, roi], m_np[:, roi])
+        rows.append([roi, r_mask, float(x_true[:,roi][m].std()), float(x_rec[:,roi][m].std()), float(m.mean()), float(m.sum())])
+    csv_path = out_dir / "tables" / "fmri_roi_diagnostics_masked.csv"
+    with open(csv_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["roi","r_masked","std_gt_masked","std_rec_masked","mask_frac","mask_count"])
+        for row in rows:
+            w.writerow(row)
+    print(f"[diag] wrote diagnostics -> {csv_path}")
+
+    if wandb_run is not None:
+        try:
+            wandb_run.log({"diag/revstage": stage, "diag/tag": tag_for_logging or ""})
+            for name in ["heatmap_gt.png", "heatmap_input_masked.png", "heatmap_recon_maskedinput.png",
+                         "heatmap_absdiff_masked.png", "mask.png",
+                         "topK_fmri_corr_masked.png", "corr_bars_fmri_masked.png"]:
+                p = out_dir / "plots" / name
+                if p.exists():
+                    wandb_run.log({f"plots/{name}": wandb.Image(str(p))})
+        except Exception:
+            pass
+
+# -----------------------------
+# Auto-sweep helpers (unchanged core)
+# -----------------------------
+def dataclass_replace(obj, **updates):
+    from dataclasses import replace as _replace
+    return _replace(obj, **updates)
+
+def _build_sweep_space(cfg: TrainCfg, stage:int) -> List[Dict[str, Any]]:
+    lrs = cfg.sweep_lr1 if stage == 1 else (cfg.sweep_lr2 if stage == 2 else cfg.sweep_lr3)
+    loss_list = cfg.sweep_loss_list or ["mse","mae","huber","charbonnier","mse+pearson"]
+    corr_ws = cfg.sweep_corr_w or [0.0, 0.2]
+    tv_ws   = cfg.sweep_tv_w or [0.0]
+    deltas  = cfg.sweep_huber_delta or [0.5, 1.0]
+    epses   = cfg.sweep_charbonnier_eps or [1e-3, 3e-3]
+
+    combos = []
+    for loss_type in loss_list:
+        for lr in (lrs or [1e-4]):
+            if loss_type == "huber":
+                for d in deltas:
+                    for tv in tv_ws:
+                        combos.append(dict(loss_type=loss_type, lr=lr,
+                                           corr_w=0.0, tv_w=tv, huber_delta=d, charbonnier_eps=cfg.charbonnier_eps))
+            elif loss_type == "charbonnier":
+                for e in epses:
+                    for tv in tv_ws:
+                        combos.append(dict(loss_type=loss_type, lr=lr,
+                                           corr_w=0.0, tv_w=tv, huber_delta=cfg.huber_delta, charbonnier_eps=e))
+            elif loss_type == "mse+pearson":
+                for cw in corr_ws:
+                    for tv in tv_ws:
+                        combos.append(dict(loss_type=loss_type, lr=lr,
+                                           corr_w=cw, tv_w=tv, huber_delta=cfg.huber_delta, charbonnier_eps=cfg.charbonnier_eps))
+            else:
+                for tv in tv_ws:
+                    combos.append(dict(loss_type=loss_type, lr=lr,
+                                       corr_w=0.0, tv_w=tv, huber_delta=cfg.huber_delta, charbonnier_eps=cfg.charbonnier_eps))
+    if cfg.sweep_max_combos and cfg.sweep_max_combos > 0 and len(combos) > cfg.sweep_max_combos:
+        rng = np.random.RandomState(cfg.seed)
+        idx = rng.choice(len(combos), size=cfg.sweep_max_combos, replace=False)
+        combos = [combos[i] for i in idx]
+    return combos
+
+def _apply_trial_loss_cfg(cfg: TrainCfg, trial: Dict[str, Any]) -> TrainCfg:
+    return dataclass_replace(
+        cfg,
+        loss_type=trial["loss_type"],
+        corr_loss_w=float(trial["corr_w"]),
+        tv_loss_w=float(trial["tv_w"]),
+        huber_delta=float(trial["huber_delta"]),
+        charbonnier_eps=float(trial["charbonnier_eps"]),
+    )
+
+def _epochs_for_sweep(cfg: TrainCfg, stage:int) -> int:
+    base = (cfg.stage1_epochs if stage==1 else cfg.stage2_epochs if stage==2 else cfg.stage3_epochs)
+    return min(base, 2) if (cfg.sweep_epochs is None or cfg.sweep_epochs <= 0) else int(cfg.sweep_epochs)
+
+def _train_once_for_cfg(base_cfg: TrainCfg, stage: int, *, trial_name: str,
+                        out_dir: Path, prev_stage_dir: Path,
+                        epochs_override: Optional[int], lr_override: Optional[float]) -> float:
+    """
+    Short trial training for sweep; returns best val_total.
+    Warm-start policy (decoder-first): R2 <- R1_best (decoder+affine), R3 <- R2_best (encoder+decoder+affine)
+    Diagnostics: masked-input evaluation on best.
+    """
+    cfg = dataclass_replace(base_cfg, out_dir=out_dir)
+    device = torch.device(cfg.device)
+    os.makedirs(cfg.out_dir, exist_ok=True)
+    _ensure_dirs(cfg.out_dir)
+
+    dl_train, dl_val, _ = make_dataloaders(cfg, device)
+    brainlm = FrozenBrainLM(cfg.brainlm_model_dir, device)
+    translator = TranslatorFMRISelfAttn(cfg, fmri_n_layers=brainlm.n_layers_out, fmri_hidden_size=brainlm.hidden_size).to(device)
+    xyz_ref = cache_a424_xyz(device)
+
+    # ---- GradScaler (fixed init) ----
+    from torch.cuda.amp import GradScaler
+    scaler = GradScaler(enabled=(cfg.amp and device.type=='cuda'))
+
+    # Warm-start (decoder-first chain) -- including affine
+    if stage == 2:
+        load_modules_if_exist(prev_stage_dir, translator, tag="revstage1_best",
+                              which=["decoder", "affine"], device=device)
+    elif stage == 3:
+        load_modules_if_exist(prev_stage_dir, translator, tag="revstage2_best",
+                              which=["encoder", "decoder", "affine"], device=device)
+
+    set_stage_rev(translator, stage)
+
+    # Epochs & LR
+    if stage == 1:   epochs, lr = cfg.stage1_epochs, cfg.lr_stage1
+    elif stage == 2: epochs, lr = cfg.stage2_epochs, cfg.lr_stage2
+    else:            epochs, lr = cfg.stage3_epochs, cfg.lr_stage3
+
+    if epochs_override is not None and epochs_override > 0: epochs = int(epochs_override)
+    if lr_override is not None and lr_override > 0:
+        if stage == 1: cfg = dataclass_replace(cfg, lr_stage1=float(lr_override))
+        elif stage == 2: cfg = dataclass_replace(cfg, lr_stage2=float(lr_override))
+        else: cfg = dataclass_replace(cfg, lr_stage3=float(lr_override))
+        lr = float(lr_override)
+
+    opt = torch.optim.AdamW([p for p in translator.parameters() if p.requires_grad], lr=lr, weight_decay=cfg.weight_decay)
+
+    run = None
+    if (wandb is not None) and (cfg.wandb_mode != "disabled"):
+        tags = (cfg.wandb_tags or []) + [f"revstage:{stage}", "sweep:trial", "masked:input"]
+        run = wandb.init(
+            project=cfg.wandb_project, entity=cfg.wandb_entity,
+            group=cfg.wandb_group or f"fmri-selfattn-sweep-rev-s{stage}",
+            job_type=f"sweep-rev-stage{stage}", name=trial_name,
+            notes=cfg.wandb_notes, tags=tags,
+            mode=("disabled" if cfg.wandb_mode == "disabled" else cfg.wandb_mode),
+            config={**vars(cfg), "revstage": stage, "trial_name": trial_name,
+                    "epochs": epochs, "lr_used": lr},
+            reinit=True,
+        )
+        try: wandb.watch(translator, log="gradients", log_freq=max(1, cfg.log_every))
+        except Exception: pass
+
+    best = float('inf')
+    for ep in range(1, epochs+1):
+        tr = run_epoch("train", dl_train, translator, brainlm, xyz_ref, cfg, device, scaler, opt)
+        va = run_epoch("val",   dl_val,   translator, brainlm, xyz_ref, cfg, device, scaler, opt=None)
+        if run is not None:
+            wandb.log({
+                "epoch": ep, "train/total_loss": tr["total"], "val/total_loss": va["total"],
+                "train/recon_loss": tr["recon"], "train/corr_loss": tr["corr"], "train/tv_loss": tr["tv"],
+                "val/recon_loss": va["recon"], "val/corr_loss": va["corr"], "val/tv_loss": va["tv"],
+                "lr": float(opt.param_groups[0]['lr']),
+            }, step=ep)
+
+        # always save "last"
+        last_paths = save_modules(cfg.out_dir, translator, tag=f"revstage{stage}_last")
+        ts_last = save_trainstate(cfg.out_dir, f"revstage{stage}", tag="last", epoch=ep, best_val=best, opt=opt, scaler=scaler)
+        if run is not None:
+            try:
+                art_last = wandb.Artifact(f"fmri_selfattn_revstage{stage}_last_trial", type="model")
+                for p in last_paths.values(): art_last.add_file(str(p))
+                art_last.add_file(str(ts_last)); run.log_artifact(art_last)
+            except Exception:
+                pass
+
+        # update "best" + DIAGNOSTICS (masked)
+        if va["total"] < best:
+            best = va["total"]
+            best_paths = save_modules(cfg.out_dir, translator, tag=f"revstage{stage}_best")
+            ts_best = save_trainstate(cfg.out_dir, f"revstage{stage}", tag="best", epoch=ep, best_val=best, opt=opt, scaler=scaler)
+            print(f"[RevStage{stage}][trial] ✅ new best {best:.6f}")
+
+            try:
+                generate_fmri_diagnostics_masked(
+                    cfg=cfg, out_dir=cfg.out_dir, stage=stage,
+                    model=translator, brainlm=brainlm, dl_eval=dl_val,
+                    device=device, xyz_ref=xyz_ref, top_k=12,
+                    wandb_run=run, tag_for_logging=f"trial_best_ep{ep}"
+                )
+            except Exception as e:
+                print(f"[diag] WARN trial diagnostics failed: {e}")
+
+            if run is not None:
+                wandb.summary[f"revstage{stage}/best_val_total"] = float(best)
+                try:
+                    art_best = wandb.Artifact(f"fmri_selfattn_revstage{stage}_best_trial", type="model")
+                    for p in best_paths.values(): art_best.add_file(str(p))
+                    art_best.add_file(str(ts_best)); run.log_artifact(art_best)
+                except Exception:
+                    pass
+
+    if run is not None:
+        try: run.finish()
+        except Exception: pass
+
+    return float(best)
+
+# -----------------------------
+# Config loader
+# -----------------------------
+def _load_config_file(path: Path) -> Dict[str, Any]:
+    with open(path, "r") as f:
+        if path.suffix.lower() in (".yaml", ".yml"):
+            try:
+                import yaml  # type: ignore
+            except Exception as e:
+                raise RuntimeError("PyYAML is required for YAML configs. Install with 'pip install pyyaml'.") from e
+            data = yaml.safe_load(f)
+        else:
+            data = json.load(f)
+    if isinstance(data, dict) and "train" in data:
+        return data["train"] or {}
+    return data or {}
+
+def _apply_config_defaults(parser: argparse.ArgumentParser) -> Dict[str, Any]:
+    temp = argparse.ArgumentParser(add_help=False)
+    temp.add_argument("--config", type=str, default=None)
+    known, _ = temp.parse_known_args()
+    cfg_defaults: Dict[str, Any] = {}
+    if known.config:
+        raw = _load_config_file(Path(known.config))
+
+        if "out_dir" not in raw and "output_dir" in raw:
+            raw["out_dir"] = raw["output_dir"]
+
+        if "epochs" in raw and not any(k in raw for k in ("stage1_epochs","stage2_epochs","stage3_epochs")):
+            total = int(raw["epochs"])
+            s1 = max(1, total // 4); s2 = max(1, total // 2); s3 = max(1, total - s1 - s2)
+            raw["stage1_epochs"], raw["stage2_epochs"], raw["stage3_epochs"] = s1, s2, s3
+
+        if "lr" in raw:
+            for k in ("lr1","lr2","lr3"):
+                if k not in raw: raw[k] = float(raw["lr"])
+
+        for key in ("amp", "train_affine_stage3", "debug", "auto_resume", "auto_sweep", "no_final_full"):
+            if key in raw: raw[key] = bool(raw[key])
+
+        pass_through_keys = [
+            "eeg_root","fmri_root","a424_label_nii","brainlm_model_dir","out_dir",
+            "device","seed","window_sec","stride_sec","batch_size","num_workers","amp",
+            "stage1_epochs","stage2_epochs","stage3_epochs","lr1","lr2","lr3","weight_decay",
+            "fmri_voxels","tr","fmri_norm",
+            "train_subjects","val_subjects","test_subjects","train_affine_stage3",
+            "debug","profile_first_n","max_batches_per_epoch","log_every",
+            "auto_resume",
+            # arch knobs
+            "d_model","n_heads","d_ff","dropout",
+            "n_layers_per_stack","rope_fraction","decoder_rank",
+            # loss
+            "loss_type","recon_loss_w","corr_loss_w","tv_loss_w","huber_delta","charbonnier_eps",
+            "loss_on","unmasked_weight",
+            # masking
+            "masking_enable","mask_ratio","mask_axis","mask_block_T","mask_block_V","mask_fill","mask_noise_std_frac",
+            # sweep
+            "auto_sweep","sweep_epochs","sweep_loss_list","sweep_corr_w","sweep_tv_w",
+            "sweep_huber_delta","sweep_charbonnier_eps","sweep_lr1","sweep_lr2","sweep_lr3",
+            "sweep_max_combos","no_final_full",
+            # W&B
+            "wandb_project","wandb_entity","wandb_run_name","wandb_group","wandb_job_type",
+            "wandb_tags","wandb_notes","wandb_mode",
+        ]
+        cfg_defaults = {k: raw[k] for k in pass_through_keys if k in raw}
+        parser.set_defaults(**cfg_defaults)
+    return cfg_defaults
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    ap = argparse.ArgumentParser(description="Reversed (decoder-first) fMRI masked-input recon (axial RoPE + 2-D decoder) + per-module checkpoints + W&B + Auto-Resume + Auto-Sweep + Diagnostics")
+    ap.add_argument("--config", type=str, default=None, help="YAML/JSON config; if YAML has sections, uses 'train'")
+    ap.add_argument("--eeg_root", type=str)
+    ap.add_argument("--fmri_root", type=str)
+    ap.add_argument("--a424_label_nii", type=str)
+    ap.add_argument("--brainlm_model_dir", type=str)
+    ap.add_argument("--out_dir", type=str, default=str(THIS_DIR/"runs_fmri_selfattn_rev_masked"))
+    ap.add_argument("--device", type=str, default="cpu")
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--window_sec", type=int, default=30)
+    ap.add_argument("--tr", type=float, default=2.0)
+    ap.add_argument("--fmri_voxels", type=int, default=424)
+    ap.add_argument("--batch_size", type=int, default=8)
+    ap.add_argument("--num_workers", type=int, default=0)
+    ap.add_argument("--stride_sec", type=int, default=None)
+    ap.add_argument("--fmri_norm", type=str, default="zscore", choices=["zscore","psc","mad","none"])
+    ap.add_argument("--amp", action="store_true")
+
+    # Arch knobs
+    ap.add_argument("--d_model", type=int, default=128)
+    ap.add_argument("--n_heads", type=int, default=4)
+    ap.add_argument("--d_ff", type=int, default=512)
+    ap.add_argument("--dropout", type=float, default=0.1)
+    ap.add_argument("--n_layers_per_stack", type=int, default=1)
+    ap.add_argument("--rope_fraction", type=float, default=1.0)
+    ap.add_argument("--decoder_rank", type=int, default=32)
+
+    # Stage schedule
+    ap.add_argument("--stage1_epochs", type=int, default=3)
+    ap.add_argument("--stage2_epochs", type=int, default=5)
+    ap.add_argument("--stage3_epochs", type=int, default=3)
+    ap.add_argument("--lr1", type=float, default=1e-4)
+    ap.add_argument("--lr2", type=float, default=8e-5)
+    ap.add_argument("--lr3", type=float, default=5e-5)
+    ap.add_argument("--weight_decay", type=float, default=1e-4)
+    ap.add_argument("--train_affine_stage3", action="store_true",
+                    help="(ignored) Backward-compat only — affine is always trainable in ALL stages.")
+
+    # Splits
+    ap.add_argument("--train_subjects", type=int, nargs="*", default=None)
+    ap.add_argument("--val_subjects",   type=int, nargs="*", default=None)
+    ap.add_argument("--test_subjects",  type=int, nargs="*", default=None)
+
+    # Run control
+    ap.add_argument("--stage", type=int, required=True, choices=[1,2,3], help="Reversed stage to run (1|2|3)")
+    ap.add_argument("--mode", type=str, required=True, choices=["train","test"], help="Run mode: train or test")
+    ap.add_argument("--eval_split", type=str, default="val", choices=["val","test"], help="Which split to evaluate in test mode")
+    ap.add_argument("--load_tag", type=str, default=None, help="Override which checkpoint tag to load in test mode (default: revstageX_best)")
+
+    # Debug knobs
+    ap.add_argument("--debug", action="store_true", help="Verbose debug output")
+    ap.add_argument("--profile_first_n", type=int, default=0, help="Profile/timestamp the first N batches in each epoch")
+    ap.add_argument("--max_batches_per_epoch", type=int, default=0, help="Cap number of batches per epoch (0 = all)")
+    ap.add_argument("--log_every", type=int, default=10, help="Print mem/grad every N batches when debug")
+
+    # Resume
+    ap.add_argument("--no_resume", action="store_true", help="Disable auto-resume even if last checkpoints exist")
+
+    # ----- Loss config -----
+    ap.add_argument("--loss_type", type=str, choices=["mse","mae","huber","charbonnier","mse+pearson"], default="mse")
+    ap.add_argument("--recon_loss_w", type=float, default=1.0)
+    ap.add_argument("--corr_loss_w", type=float, default=0.0)
+    ap.add_argument("--tv_loss_w", type=float, default=0.0)
+    ap.add_argument("--huber_delta", type=float, default=1.0)
+    ap.add_argument("--charbonnier_eps", type=float, default=1e-3)
+    ap.add_argument("--loss_on", type=str, default="masked", choices=["masked","mixed","all"])
+    ap.add_argument("--unmasked_weight", type=float, default=0.05)
+
+    # ----- Masking (enabled by default) -----
+    ap.add_argument("--masking_enable", dest="masking_enable", action="store_true")
+    ap.add_argument("--masking_disable", dest="masking_enable", action="store_false")
+    ap.set_defaults(masking_enable=True)
+    ap.add_argument("--mask_ratio", type=float, default=0.5)
+    ap.add_argument("--mask_axis", type=str, default="block", choices=["uniform","voxel","time","both","block"])
+    ap.add_argument("--mask_block_T", type=int, default=3)
+    ap.add_argument("--mask_block_V", type=int, default=12)
+    ap.add_argument("--mask_fill", type=str, default="zero", choices=["zero","mean","noise"])
+    ap.add_argument("--mask_noise_std_frac", type=float, default=0.1)
+
+    # ----- Auto-sweep -----
+    ap.add_argument("--auto_sweep", action="store_true",
+                    help="Run automatic LR×loss sweep, pick best by val/total_loss, then retrain fully.")
+    ap.add_argument("--sweep_epochs", type=int, default=0,
+                    help="Epochs per trial during sweep (0 -> auto: min(2, stage_epochs)).")
+    ap.add_argument("--sweep_loss_list", type=str, nargs="*", default=["mse","mae","huber","charbonnier","mse+pearson"])
+    ap.add_argument("--sweep_corr_w", type=float, nargs="*", default=[0.0, 0.2])
+    ap.add_argument("--sweep_tv_w", type=float, nargs="*", default=[0.0])
+    ap.add_argument("--sweep_huber_delta", type=float, nargs="*", default=[0.5, 1.0])
+    ap.add_argument("--sweep_charbonnier_eps", type=float, nargs="*", default=[1e-3, 3e-3])
+    ap.add_argument("--sweep_lr1", type=float, nargs="*", default=[1e-4, 5e-5])
+    ap.add_argument("--sweep_lr2", type=float, nargs="*", default=[8e-5, 5e-5])
+    ap.add_argument("--sweep_lr3", type=float, nargs="*", default=[5e-5, 2e-5])
+    ap.add_argument("--sweep_max_combos", type=int, default=0, help="0 = try all combos; >0 = random subset of this many.")
+    ap.add_argument("--no_final_full", action="store_true", help="Skip full retrain with best config after sweep.")
+
+    # --- W&B args ---
+    ap.add_argument("--wandb_project", type=str, default=None)
+    ap.add_argument("--wandb_entity", type=str, default=None)
+    ap.add_argument("--wandb_run_name", type=str, default=None)
+    ap.add_argument("--wandb_group", type=str, default=None)
+    ap.add_argument("--wandb_job_type", type=str, default=None)
+    ap.add_argument("--wandb_tags", type=str, nargs="*", default=None)
+    ap.add_argument("--wandb_notes", type=str, default=None)
+    ap.add_argument("--wandb_mode", type=str, default="online", choices=["online","offline","disabled"])
+
+    _apply_config_defaults(ap)
+    args = ap.parse_args()
+
+    cfg = TrainCfg(
+        eeg_root=Path(args.eeg_root),
+        fmri_root=Path(args.fmri_root),
+        a424_label_nii=Path(args.a424_label_nii),
+        brainlm_model_dir=Path(args.brainlm_model_dir),
+        out_dir=Path(args.out_dir),
+        device=args.device,
+        seed=args.seed,
+        window_sec=args.window_sec,
+        tr=args.tr,
+        fmri_voxels=args.fmri_voxels,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        stride_sec=args.stride_sec,
+        amp=bool(args.amp),
+        fmri_norm=args.fmri_norm,
+        # arch
+        d_model=args.d_model, n_heads=args.n_heads, d_ff=args.d_ff, dropout=args.dropout,
+        n_layers_per_stack=args.n_layers_per_stack, rope_fraction=args.rope_fraction, decoder_rank=args.decoder_rank,
+        # stages
+        stage1_epochs=args.stage1_epochs,
+        stage2_epochs=args.stage2_epochs,
+        stage3_epochs=args.stage3_epochs,
+        lr_stage1=args.lr1,
+        lr_stage2=args.lr2,
+        lr_stage3=args.lr3,
+        weight_decay=args.weight_decay,
+        train_affine_stage3=True,
+        # splits
+        train_subjects=args.train_subjects,
+        val_subjects=args.val_subjects,
+        test_subjects=args.test_subjects,
+        # debug
+        debug=bool(args.debug),
+        profile_first_n=int(args.profile_first_n),
+        max_batches_per_epoch=int(args.max_batches_per_epoch),
+        log_every=int(args.log_every),
+        auto_resume=not bool(args.no_resume),
+        # loss
+        loss_type=args.loss_type,
+        recon_loss_w=args.recon_loss_w,
+        corr_loss_w=args.corr_loss_w,
+        tv_loss_w=args.tv_loss_w,
+        huber_delta=args.huber_delta,
+        charbonnier_eps=args.charbonnier_eps,
+        loss_on=args.loss_on,
+        unmasked_weight=args.unmasked_weight,
+        # masking
+        masking_enable=bool(args.masking_enable),
+        mask_ratio=args.mask_ratio,
+        mask_axis=args.mask_axis,
+        mask_block_T=args.mask_block_T,
+        mask_block_V=args.mask_block_V,
+        mask_fill=args.mask_fill,
+        mask_noise_std_frac=args.mask_noise_std_frac,
+        # sweep
+        auto_sweep=bool(args.auto_sweep),
+        sweep_epochs=int(args.sweep_epochs),
+        sweep_loss_list=args.sweep_loss_list,
+        sweep_corr_w=args.sweep_corr_w,
+        sweep_tv_w=args.sweep_tv_w,
+        sweep_huber_delta=args.sweep_huber_delta,
+        sweep_charbonnier_eps=args.sweep_charbonnier_eps,
+        sweep_lr1=args.sweep_lr1,
+        sweep_lr2=args.sweep_lr2,
+        sweep_lr3=args.sweep_lr3,
+        sweep_max_combos=int(args.sweep_max_combos),
+        no_final_full=bool(args.no_final_full),
+        # W&B
+        wandb_project=args.wandb_project,
+        wandb_entity=args.wandb_entity,
+        wandb_run_name=args.wandb_run_name,
+        wandb_group=args.wandb_group,
+        wandb_job_type=args.wandb_job_type,
+        wandb_tags=args.wandb_tags,
+        wandb_notes=args.wandb_notes,
+        wandb_mode=args.wandb_mode,
+    )
+
+    # Checks
+    for pth in [cfg.eeg_root, cfg.fmri_root, cfg.a424_label_nii, cfg.brainlm_model_dir]:
+        if pth is None:
+            raise RuntimeError("Missing required path(s) in config/CLI.")
+    if not Path(cfg.a424_label_nii).exists():
+        raise FileNotFoundError(f"A424 atlas not found: {cfg.a424_label_nii}")
+    if not Path(cfg.brainlm_model_dir).exists():
+        raise FileNotFoundError(f"BrainLM checkpoint dir not found: {cfg.brainlm_model_dir}")
+
+    seed_all(cfg.seed)
+    device = torch.device(cfg.device)
+    os.makedirs(cfg.out_dir, exist_ok=True)
+    _ensure_dirs(cfg.out_dir)
+
+    if cfg.debug:
+        print(f"[debug] torch {torch.__version__} | cuda available={torch.cuda.is_available()} | device={device}")
+        if torch.cuda.is_available(): print(f"[debug] GPU: {torch.cuda.get_device_name(0)}")
+        print(f"[debug] platform={platform.platform()} | python={sys.version.split()[0]}")
+        print(f"[debug] cfg={cfg}")
+        try:
+            import brainlm_mae  # type: ignore
+            print(f"[debug] brainlm_mae -> {getattr(brainlm_mae, '__file__', '<pkg>')}")
+        except Exception as e:
+            print(f"[debug] brainlm_mae import check failed: {e}")
+        print(f"[debug] sys.path[:5] = {sys.path[:5]}")
+
+    # ---------- AUTO-SWEEP ----------
+    if cfg.auto_sweep and args.mode == "train":
+        stage = int(args.stage)
+        sweep_dir = Path(cfg.out_dir) / f"sweeps_revstage{stage}"
+        os.makedirs(sweep_dir, exist_ok=True)
+
+        combos = _build_sweep_space(cfg, stage)
+        print(f"[sweep] Rev Stage {stage}: trying {len(combos)} trial combos...")
+        results = []
+        sw_epochs = _epochs_for_sweep(cfg, stage)
+        prev_stage_dir = Path(cfg.out_dir)
+
+        for i, trial in enumerate(combos, 1):
+            trial_cfg = _apply_trial_loss_cfg(cfg, trial)
+            trial_out = sweep_dir / f"trial_{i:03d}_{trial['loss_type']}_lr{trial['lr']:.1e}_cw{trial['corr_w']}_tv{trial['tv_w']}"
+            trial_name = f"rev-s{stage}-trial{i}-{trial['loss_type']}-lr{trial['lr']:.1e}-cw{trial['corr_w']}-tv{trial['tv_w']}"
+            best_val = _train_once_for_cfg(
+                dataclass_replace(trial_cfg, auto_resume=False),
+                stage=stage, trial_name=trial_name,
+                out_dir=trial_out, prev_stage_dir=prev_stage_dir,
+                epochs_override=sw_epochs, lr_override=float(trial["lr"])
+            )
+            results.append(dict(idx=i, best_val_total=float(best_val), **trial))
+
+        results = sorted(results, key=lambda r: r["best_val_total"])
+        best = results[0]
+        print(f"[sweep] ✅ Best (rev stage {stage}): {best}")
+
+        with open(sweep_dir / "sweep_results.json", "w") as f:
+            json.dump(results, f, indent=2)
+
+        if cfg.no_final_full:
+            print("[sweep] Skipping final full retrain (--no_final_full).")
+            return
+
+        # Full training with best config into the main out_dir
+        best_cfg = _apply_trial_loss_cfg(cfg, best)
+        if stage == 1: best_cfg = dataclass_replace(best_cfg, lr_stage1=float(best["lr"]))
+        elif stage == 2: best_cfg = dataclass_replace(best_cfg, lr_stage2=float(best["lr"]))
+        else: best_cfg = dataclass_replace(best_cfg, lr_stage3=float(best["lr"]))
+        print(f"[sweep] 🔁 Full training with best config in {cfg.out_dir} ...")
+        cfg = best_cfg
+
+    # Data
+    dl_train, dl_val, dl_test = make_dataloaders(cfg, device)
+
+    # Models
+    brainlm = FrozenBrainLM(cfg.brainlm_model_dir, device)
+    translator = TranslatorFMRISelfAttn(cfg, fmri_n_layers=brainlm.n_layers_out, fmri_hidden_size=brainlm.hidden_size).to(device)
+    xyz_ref = cache_a424_xyz(device)
+
+    # ---- GradScaler (fixed init) ----
+    from torch.cuda.amp import GradScaler
+    scaler = GradScaler(enabled=(cfg.amp and device.type=='cuda'))
+
+    # ---------- Stage + Mode ----------
+    stage = int(args.stage)
+    mode = str(args.mode)
+    stage_label = f"revstage{stage}"
+
+    # ---------- W&B init ----------
+    def _wandb_enabled() -> bool:
+        return (wandb is not None) and (cfg.wandb_mode != "disabled")
+
+    run = None
+    if _wandb_enabled():
+        run_name = cfg.wandb_run_name or f"fmri-selfattn-rev-masked-s{stage}-{mode}"
+        tags = (cfg.wandb_tags or []) + [f"revstage:{stage}", f"mode:{mode}", "masked:input"]
+        run = wandb.init(
+            project=cfg.wandb_project,
+            entity=cfg.wandb_entity,
+            name=run_name,
+            group=cfg.wandb_group,
+            job_type=cfg.wandb_job_type or f"revstage{stage}",
+            notes=cfg.wandb_notes,
+            tags=tags,
+            mode=("disabled" if cfg.wandb_mode == "disabled" else cfg.wandb_mode),
+            config={**vars(cfg), "revstage": stage, "mode": mode},
+        )
+        try: wandb.watch(translator, log="gradients", log_freq=max(1, cfg.log_every))
+        except Exception: pass
+
+    os.environ["STAGE_ENV"] = f"R{stage}"
+
+    # ---------- Warm-start / Resume ----------
+    out_dir = Path(cfg.out_dir)
+
+    def _any_last_modules_exist_rev(s: int) -> bool:
+        tag = f"revstage{s}_last"
+        paths = _module_paths(out_dir, tag)
+        return any(p.exists() for p in paths.values())
+
+    start_epoch = 1
+    best_val_total = float('inf')
+    resumed = False
+
+    if mode == "train" and cfg.auto_resume and _any_last_modules_exist_rev(stage):
+        print(f"[resume] Detected existing revstage{stage}_last modules. Resuming training...")
+        load_modules_if_exist(out_dir, translator, tag=f"revstage{stage}_last",
+                              which=["adapter","encoder","decoder","affine"], device=device)
+        resumed = True
+    else:
+        if mode == "train":
+            if stage == 1:
+                pass
+            elif stage == 2:
+                load_modules_if_exist(out_dir, translator, tag="revstage1_best",
+                                      which=["decoder", "affine"], device=device)
+            elif stage == 3:
+                load_modules_if_exist(out_dir, translator, tag="revstage2_best",
+                                      which=["encoder", "decoder", "affine"], device=device)
+        else:
+            default_tag = f"revstage{stage}_best"
+            tag = args.load_tag or default_tag
+            need = (["decoder", "affine"] if stage == 1
+                    else (["encoder", "decoder", "affine"] if stage == 2
+                          else ["adapter", "encoder", "decoder", "affine"]))
+            loaded = load_modules_if_exist(out_dir, translator, tag=tag, which=need, device=device)
+            norm_map = {"adapter_fmri": "adapter","fmri_encoder": "encoder","fmri_decoder": "decoder","fmri_affine": "affine"}
+            loaded_norm = {norm_map.get(n, n) for n in loaded}
+            missing = [x for x in need if x not in loaded_norm]
+            if missing:
+                print(f"[WARN] Missing expected modules for '{tag}': {missing}")
+
+    # ---------- Set trainable ----------
+    set_stage_rev(translator, stage)
+    trainable = [n for n,p in translator.named_parameters() if p.requires_grad]
+    print(f"[rev stage {stage}][{mode}] trainable: {len(trainable)} tensors")
+    for n in trainable: print("  -", n)
+
+    # ---------- Run ----------
+    if mode == "train":
+        if stage == 1:   epochs, lr = cfg.stage1_epochs, cfg.lr_stage1
+        elif stage == 2: epochs, lr = cfg.stage2_epochs, cfg.lr_stage2
+        else:            epochs, lr = cfg.stage3_epochs, cfg.lr_stage3
+
+        opt = torch.optim.AdamW([p for p in translator.parameters() if p.requires_grad], lr=lr, weight_decay=cfg.weight_decay)
+
+        if resumed:
+            start_epoch, best_val_total, _ = load_trainstate_if_exist(out_dir, stage_label, tag="last", opt=opt, scaler=scaler, device=device)
+
+        if start_epoch > epochs:
+            print(f"[resume] start_epoch ({start_epoch}) > total epochs ({epochs}); nothing to do.")
+            if run is not None:
+                wandb.log({"resume/nothing_to_do": 1, "revstage": stage})
+            if run is not None:
+                try: run.finish()
+                except Exception: pass
+            return
+
+        for ep in range(start_epoch, epochs+1):
+            t_ep0 = time.time()
+            tr = run_epoch("train", dl_train, translator, brainlm, xyz_ref, cfg, device, scaler, opt)
+            va = run_epoch("val",   dl_val,   translator, brainlm, xyz_ref, cfg, device, scaler, opt=None)
+            t_ep = time.time() - t_ep0
+            print(f"[RevStage{stage}][{ep}/{epochs}] "
+                  f"train_total={tr['total']:.6f} val_total={va['total']:.6f} "
+                  f"| train(recon={tr['recon']:.4f}, corr={tr['corr']:.4f}, tv={tr['tv']:.4f}) "
+                  f"| val(recon={va['recon']:.4f}, corr={va['corr']:.4f}, tv={va['tv']:.4f}) "
+                  f"| epoch_time={t_ep:.1f}s | lr={opt.param_groups[0]['lr']:.2e} | {fmt_mem()}")
+
+            if run is not None:
+                alloc = torch.cuda.memory_allocated()/(1024**2) if torch.cuda.is_available() else 0.0
+                reserv = torch.cuda.memory_reserved()/(1024**2) if torch.cuda.is_available() else 0.0
+                wandb.log({
+                    "revstage": stage, "epoch": ep,
+                    "train/total_loss": tr["total"], "train/recon_loss": tr["recon"],
+                    "train/corr_loss": tr["corr"], "train/tv_loss": tr["tv"],
+                    "val/total_loss": va["total"], "val/recon_loss": va["recon"],
+                    "val/corr_loss": va["corr"], "val/tv_loss": va["tv"],
+                    "lr": float(opt.param_groups[0]['lr']),
+                    "time/epoch_s": t_ep,
+                    "cuda/alloc_mb": alloc,
+                    "cuda/reserved_mb": reserv,
+                    "resume/start_epoch": start_epoch if ep == start_epoch else None,
+                }, step=ep)
+
+            # always save "last"
+            last_paths = save_modules(out_dir, translator, tag=f"revstage{stage}_last")
+            ts_last = save_trainstate(out_dir, stage_label, tag="last", epoch=ep, best_val=best_val_total, opt=opt, scaler=scaler)
+            if run is not None:
+                try:
+                    art_last = wandb.Artifact(f"fmri_selfattn_revstage{stage}_last", type="model")
+                    for p in last_paths.values(): art_last.add_file(str(p))
+                    art_last.add_file(str(ts_last)); run.log_artifact(art_last)
+                except Exception:
+                    pass
+
+            # update "best" + DIAGNOSTICS (masked)
+            if va["total"] < best_val_total:
+                best_val_total = va["total"]
+                best_paths = save_modules(out_dir, translator, tag=f"revstage{stage}_best")
+                ts_best = save_trainstate(out_dir, stage_label, tag="best", epoch=ep, best_val=best_val_total, opt=opt, scaler=scaler)
+                print(f"[RevStage{stage}] ✅ new best {best_val_total:.6f}")
+
+                try:
+                    generate_fmri_diagnostics_masked(
+                        cfg=cfg, out_dir=out_dir, stage=stage,
+                        model=translator, brainlm=brainlm, dl_eval=dl_val,
+                        device=device, xyz_ref=xyz_ref, top_k=12,
+                        wandb_run=run, tag_for_logging=f"main_best_ep{ep}"
+                    )
+                except Exception as e:
+                    print(f"[diag] WARN diagnostics failed: {e}")
+
+                if run is not None:
+                    wandb.summary[f"revstage{stage}/best_val_total"] = float(best_val_total)
+                    try:
+                        art_best = wandb.Artifact(f"fmri_selfattn_revstage{stage}_best", type="model")
+                        for p in best_paths.values(): art_best.add_file(str(p))
+                        art_best.add_file(str(ts_best)); run.log_artifact(art_best)
+                    except Exception:
+                        pass
+
+    else:  # test mode
+        if args.eval_split == "test" and dl_test is not None:
+            res = run_epoch("test", dl_test, translator, brainlm, xyz_ref, cfg, device, scaler, opt=None)
+            print(f"[TEST][revstage {stage}] test_total_loss={res['total']:.6f}")
+            if run is not None:
+                wandb.log({"test/total_loss": float(res["total"]), "revstage": stage})
+            try:
+                generate_fmri_diagnostics_masked(
+                    cfg=cfg, out_dir=out_dir, stage=stage,
+                    model=translator, brainlm=brainlm, dl_eval=dl_test,
+                    device=device, xyz_ref=xyz_ref, top_k=12,
+                    wandb_run=run, tag_for_logging="test_eval"
+                )
+            except Exception as e:
+                print(f"[diag] WARN test diagnostics failed: {e}")
+        else:
+            res = run_epoch("val", dl_val, translator, brainlm, xyz_ref, cfg, device, scaler, opt=None)
+            print(f"[TEST][revstage {stage}] val_total_loss={res['total']:.6f}")
+            if run is not None:
+                wandb.log({"val/total_loss": float(res["total"]), "revstage": stage})
+            try:
+                generate_fmri_diagnostics_masked(
+                    cfg=cfg, out_dir=out_dir, stage=stage,
+                    model=translator, brainlm=brainlm, dl_eval=dl_val,
+                    device=device, xyz_ref=xyz_ref, top_k=12,
+                    wandb_run=run, tag_for_logging="val_eval"
+                )
+            except Exception as e:
+                print(f"[diag] WARN val diagnostics failed: {e}")
+
+    if run is not None:
+        try: run.finish()
+        except Exception:
+            pass
+
+if __name__ == "__main__":
+    main()
+
+# Example:
+# python train_fmri_selfattn_masked_rev.py \
+#   --config configs/fmri_selfattn_rev.yaml --stage 2 --mode train \
+#   --mask_ratio 0.6 --mask_axis block --mask_block_T 3 --mask_block_V 16 \
+#   --loss_type mse+pearson --tv_loss_w 0.05 --n_layers_per_stack 2 --rope_fraction 1.0 \
+#   --num_workers 4 --amp
