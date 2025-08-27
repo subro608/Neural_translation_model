@@ -1215,7 +1215,7 @@ def main():
     ap.add_argument("--wandb_entity", type=str, default=None)
     ap.add_argument("--wandb_run_name", type=str, default=None)
     ap.add_argument("--wandb_group", type=str, default=None)
-    ap.add_argument("--wandb_job_type", type:str, default=None)
+    ap.add_argument("--wandb_job_type", type=str, default=None)
     ap.add_argument("--wandb_tags", type=str, nargs="*", default=None)
     ap.add_argument("--wandb_notes", type=str, default=None)
     ap.add_argument("--wandb_mode", type=str, default="online", choices=["online","offline","disabled"])
