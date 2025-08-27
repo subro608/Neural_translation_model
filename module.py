@@ -326,6 +326,36 @@ class TransformerLayer(nn.Module):
         z = y + self.ff(self.n2(y))
         return z
 
+
+class VoxelPositionalEncoding(nn.Module):
+    """
+    Mandatory voxel embedding: learned ID + XYZ MLP (required).
+    Returns (B,T,V,D) to be ADDED to the token grid.
+    """
+    def __init__(self, V: int, D: int):
+        super().__init__()
+        self.id_table = nn.Parameter(torch.zeros(V, D))
+        nn.init.trunc_normal_(self.id_table, std=0.02)
+
+        self.xyz_mlp = nn.Sequential(
+            nn.Linear(3, D), nn.GELU(),
+            nn.Linear(D, D)
+        )
+        for m in self.xyz_mlp:
+            if isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, B: int, T: int, xyz: torch.Tensor) -> torch.Tensor:
+        # xyz is REQUIRED
+        assert xyz is not None, "XYZ coordinates are required (use_xyz_voxel_pe is mandatory)."
+        # xyz: (B,V,3)
+        base = self.id_table.unsqueeze(0).unsqueeze(0).expand(B, T, -1, -1)  # (B,T,V,D)
+        x = self.xyz_mlp(xyz)                                                # (B,V,D)
+        x = x.unsqueeze(1).expand(B, T, -1, -1)                              # (B,T,V,D)
+        return base + x
+
+
 class HierarchicalEncoder(nn.Module):
     def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float, n_layers_per_stack: int, rope_fraction: float = 1.0):
         super().__init__()

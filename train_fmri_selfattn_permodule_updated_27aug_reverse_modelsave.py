@@ -1,19 +1,38 @@
 #!/usr/bin/env python3
 """
-Reversed stage-wise training (decoder-first) for fMRI-only self-attention model,
-with minimal, non-optional masking applied BEFORE BrainLM.
+Reversed stage-wise training (decoder-first) for fMRI-only self-attention model.
 
-Masking rules (always on, no flags):
-- Sample r_t ~ Uniform[0.3, 0.8], mask r_t fraction of time steps (entire rows)
-- Sample r_v ~ Uniform[0.3, 0.8], mask r_v fraction of voxels (entire columns)
-- Final mask = union(time-rows, voxel-columns)
-- Masked entries in the BrainLM input are set to ZERO (no mean/noise options)
+Order:
+  - Rev Stage 1:    train **decoder only**  (**affine trainable**)
+  - Rev Stage 2:    train **decoder + encoder + voxel_pe** (warm-start from Stage 1 best; **affine trainable**)
+  - Rev Stage 3:    train **adapter + encoder + decoder + voxel_pe** (**affine trainable**)
 
-Loss:
-- Unchanged: computed on ALL positions with equal weight 1
-- Reconstruction still targets the original (unmasked) fMRI
+What this script adds / fixes (updated):
+- Uses fMRIDecodingAdapter2D (predicts V channels first; time-only resize) to remove rank-1-over-voxels bug.
+- No fixed 512 tokens. The adapter retargets to the true sequence length S = T×V.
+- Drops 1-D additive positional encodings; encoder uses axial RoPE along (time, ROI) via HierarchicalEncoder.
+- **Mandatory XYZ voxel positional encoding** (learned ID + MLP(XYZ)), added on the (B,T,V,D) grid.
+- BEST & LAST checkpoints for every sweep trial and the main run.
+- On every NEW BEST: generate diagnostics under out_dir:
+    plots/topK_fmri_corr.png
+    plots/topK_fmri_corr_calib.png
+    plots/corr_bars_fmri.png
+    plots/heatmap_gt.png
+    plots/heatmap_recon.png
+    plots/heatmap_absdiff.png
+    tables/fmri_roi_diagnostics.csv
+- Optional W&B logging of these images & artifacts.
 
-Everything else (stages, checkpoints, W&B, diagnostics) is unchanged.
+Notes
+- "translator" in your phrasing maps to the transformer **encoder** module here.
+- Checkpoints/tags are prefixed with 'revstage{N}_...' to keep them separate from forward stages.
+- Supports W&B, auto-resume, YAML/JSON config defaults, and the built-in LR×loss auto-sweep
+  (under sweeps_revstage{N}).
+
+Extra in this version:
+- Ensure **affine** (scale/bias) is **always saved and loaded** across all stages and modes (train/test/sweep/resume).
+- Normalize "missing" module warning so names align with requested 'adapter/encoder/decoder/voxel_pe/affine'.
+- **XYZ coords are mandatory** (no silent zeros fallback). Script fails fast if absent or mismatched V.
 """
 
 from __future__ import annotations
@@ -75,7 +94,8 @@ for p in candidate_blm_roots:
 from module import (  # type: ignore
     fMRIInputAdapterConv1d,
     HierarchicalEncoder,          # axial RoPE inside
-    fMRIDecodingAdapter2D,        # 2-D decoder
+    fMRIDecodingAdapter2D,        # fixed 2-D decoder
+    VoxelPositionalEncoding,      # <-- mandatory voxel PE (you added this in module.py)
 )
 
 # BrainLM imports
@@ -251,7 +271,8 @@ class FrozenBrainLM(nn.Module):
 class TranslatorFMRISelfAttn(nn.Module):
     """
     fMRI branch:
-      adapter_fmri (→ S=T×V) -> fmri_encoder (axial RoPE) -> fmri_decoder_2d -> tanh + affine
+      adapter_fmri (→ S=T×V) -> + voxel_pe on (B,T,V,D) -> fmri_encoder (axial RoPE)
+      -> fmri_decoder_2d -> tanh + affine
     """
     def __init__(self, cfg: TrainCfg, fmri_n_layers:int, fmri_hidden_size:int):
         super().__init__()
@@ -269,38 +290,58 @@ class TranslatorFMRISelfAttn(nn.Module):
             target_seq_len=S
         )
 
+        # Mandatory voxel positional encoding (learned ID + MLP(XYZ))
+        self.voxel_pe = VoxelPositionalEncoding(V, cfg.d_model)
+
         # Self-attention encoder (lower/higher stacks identical here; we use 'higher')
         self.fmri_encoder = HierarchicalEncoder(
             cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.dropout,
             n_layers_per_stack=1, rope_fraction=1.0
         )
 
-        # 2-D decoder: predicts (B,T,V) with time-only up/downsample
+        # 2-D decoder (FIXED): predicts (B,T,V) with time-only up/downsample
         self.fmri_decoder = fMRIDecodingAdapter2D(
             target_T=T, target_V=V, d_model=cfg.d_model, rank=32
         )
 
-        # Output affine (per-run learnable; always trainable)
+        # Output affine (per-run learnable; **trainable in all stages**)
         self.fmri_out_scale = nn.Parameter(torch.tensor(1.0))
         self.fmri_out_bias  = nn.Parameter(torch.tensor(0.0))
 
         self.T = T
         self.V = V
 
-    def forward(self, fmri_latents: torch.Tensor, fmri_T:int, fmri_V:int) -> torch.Tensor:
+    def forward(self, fmri_latents: torch.Tensor, fmri_T:int, fmri_V:int,
+                xyz: torch.Tensor) -> torch.Tensor:
         """
         fmri_latents: (L,B,Ttok,Dh) from BrainLM
+        xyz: (B,V,3) REQUIRED
         returns: (B,T,V)
         """
+        # Project & retarget to S=T×V
         fmri_adapt = self.adapter_fmri(fmri_latents)       # (B,S,D) with S=T×V
-        _, fmr_hi = self.fmri_encoder(fmri_adapt, fmri_adapt, T=fmri_T, V=fmri_V)  # (B,S,D)
-        fmri_sig = self.fmri_decoder(fmr_hi)               # (B,T,V)
+        B, S, D = fmri_adapt.shape
+        assert S == fmri_T * fmri_V, f"Expected S=T×V, got S={S}, T×V={fmri_T*fmri_V}"
+        assert xyz is not None and xyz.shape == (B, fmri_V, 3), \
+            f"xyz must be (B,V,3); got {tuple(xyz.shape)}"
+
+        # Add voxel PE on (B,T,V,D)
+        grid = fmri_adapt.view(B, fmri_T, fmri_V, D)       # (B,T,V,D)
+        grid = grid + self.voxel_pe(B, fmri_T, xyz)        # (B,T,V,D)
+        x = grid.view(B, fmri_T * fmri_V, D)               # (B,S,D)
+
+        # Axial-RoPE encoder
+        _, fmr_hi = self.fmri_encoder(x, x, T=fmri_T, V=fmri_V)  # (B,S,D)
+
+        # 2-D decoder -> (B,T,V)
+        fmri_sig = self.fmri_decoder(fmr_hi)
+        # squash + affine
         fmri_sig = torch.tanh(fmri_sig)
         fmri_sig = self.fmri_out_scale * fmri_sig + self.fmri_out_bias
         return fmri_sig
 
 # -----------------------------
-# Freezing policies (REVERSED: decoder → decoder+encoder → all three)
+# Freezing policies (REVERSED: decoder → decoder+encoder(+voxel_pe) → all)
 # -----------------------------
 def freeze_all(m: nn.Module):
     for p in m.parameters(): p.requires_grad = False
@@ -308,27 +349,36 @@ def freeze_all(m: nn.Module):
 def set_stage_rev(m: TranslatorFMRISelfAttn, stage: int, *, train_affine_stage3: bool = False):
     """
     Reversed (decoder-first) stages:
-      - 1: decoder (affine trainable)
-      - 2: decoder + encoder (affine trainable)
-      - 3: adapter + encoder + decoder (affine trainable)
+      - 1: decoder (**affine trainable**)
+      - 2: decoder + encoder + voxel_pe (**affine trainable**)
+      - 3: adapter + encoder + decoder + voxel_pe (**affine trainable**)
+
+    NOTE: `train_affine_stage3` is ignored; affine is always trainable in all stages.
     """
+    # freeze everything first
     freeze_all(m)
+
     if stage == 1:
         for n, p in m.named_parameters():
             if n.startswith("fmri_decoder."):
                 p.requires_grad = True
     elif stage == 2:
         for n, p in m.named_parameters():
-            if n.startswith("fmri_decoder.") or n.startswith("fmri_encoder."):
+            if (n.startswith("fmri_decoder.") or
+                n.startswith("fmri_encoder.") or
+                n.startswith("voxel_pe.")):
                 p.requires_grad = True
     elif stage == 3:
         for n, p in m.named_parameters():
             if (n.startswith("adapter_fmri.") or
                 n.startswith("fmri_encoder.") or
-                n.startswith("fmri_decoder.")):
+                n.startswith("fmri_decoder.") or
+                n.startswith("voxel_pe.")):
                 p.requires_grad = True
     else:
         raise ValueError(f"Unknown reversed stage {stage}")
+
+    # Affine ALWAYS learnable in ALL stages
     m.fmri_out_scale.requires_grad = True
     m.fmri_out_bias.requires_grad  = True
 
@@ -338,10 +388,11 @@ def set_stage_rev(m: TranslatorFMRISelfAttn, stage: int, *, train_affine_stage3:
 def _module_paths(out_dir: Path, tag: str):
     out_dir.mkdir(parents=True, exist_ok=True)
     return {
-        "adapter": out_dir / f"adapter_fmri_{tag}.pt",
-        "encoder": out_dir / f"fmri_encoder_{tag}.pt",
-        "decoder": out_dir / f"fmri_decoder_{tag}.pt",
-        "affine":  out_dir / f"fmri_affine_{tag}.pt",
+        "adapter":  out_dir / f"adapter_fmri_{tag}.pt",
+        "encoder":  out_dir / f"fmri_encoder_{tag}.pt",
+        "decoder":  out_dir / f"fmri_decoder_{tag}.pt",
+        "voxel_pe": out_dir / f"voxel_pe_{tag}.pt",
+        "affine":   out_dir / f"fmri_affine_{tag}.pt",
     }
 
 def save_modules(out_dir: Path, model: TranslatorFMRISelfAttn, tag: str):
@@ -349,6 +400,7 @@ def save_modules(out_dir: Path, model: TranslatorFMRISelfAttn, tag: str):
     torch.save(model.adapter_fmri.state_dict(), paths["adapter"])
     torch.save(model.fmri_encoder.state_dict(), paths["encoder"])
     torch.save(model.fmri_decoder.state_dict(), paths["decoder"])
+    torch.save(model.voxel_pe.state_dict(),    paths["voxel_pe"])
     torch.save({"scale": model.fmri_out_scale.detach().cpu(),
                 "bias":  model.fmri_out_bias.detach().cpu()}, paths["affine"])
     print(f"[save] modules -> {', '.join(p.name for p in paths.values())}")
@@ -357,7 +409,7 @@ def save_modules(out_dir: Path, model: TranslatorFMRISelfAttn, tag: str):
 def load_modules_if_exist(out_dir: Path, model: TranslatorFMRISelfAttn, tag: str,
                           which: Optional[Iterable[str]] = None, device: Optional[torch.device] = None):
     paths = _module_paths(out_dir, tag)
-    which = set(which or ["adapter","encoder","decoder","affine"])
+    which = set(which or ["adapter","encoder","decoder","voxel_pe","affine"])
     loaded = []
     if "adapter" in which and paths["adapter"].exists():
         sd = _torch_load_compat(paths["adapter"], map_location=device or "cpu", allow_weights_only=True)
@@ -368,6 +420,9 @@ def load_modules_if_exist(out_dir: Path, model: TranslatorFMRISelfAttn, tag: str
     if "decoder" in which and paths["decoder"].exists():
         sd = _torch_load_compat(paths["decoder"], map_location=device or "cpu", allow_weights_only=True)
         model.fmri_decoder.load_state_dict(sd, strict=False); loaded.append("fmri_decoder")
+    if "voxel_pe" in which and paths["voxel_pe"].exists():
+        sd = _torch_load_compat(paths["voxel_pe"], map_location=device or "cpu", allow_weights_only=True)
+        model.voxel_pe.load_state_dict(sd, strict=False); loaded.append("voxel_pe")
     if "affine" in which and paths["affine"].exists():
         sd = _torch_load_compat(paths["affine"], map_location=device or "cpu", allow_weights_only=True)
         if isinstance(sd, dict):
@@ -495,42 +550,6 @@ def _grad_norm(model: nn.Module) -> float:
             tot += param_norm * param_norm
     return float(math.sqrt(tot)) if tot > 0 else 0.0
 
-# === NEW: MASKING (minimal) ==================================================
-@torch.no_grad()
-def _make_union_time_voxel_mask(B: int, T: int, V: int, device: torch.device) -> torch.Tensor:
-    """
-    Minimal, non-optional mask:
-    - Pick r_t ~ U[0.3, 0.8], mask r_t*T time rows
-    - Pick r_v ~ U[0.3, 0.8], mask r_v*V voxel columns
-    - Return union mask M (B, T, V) [True = masked]
-    Same (rows/cols) are used for all items in the batch for simplicity.
-    """
-    # sample ratios
-    r_t = 0.3 + 0.5 * torch.rand(1, device=device).item()
-    r_v = 0.3 + 0.5 * torch.rand(1, device=device).item()
-    k_t = max(1, int(round(r_t * T)))
-    k_v = max(1, int(round(r_v * V)))
-
-    # choose indices
-    time_idx  = torch.randperm(T, device=device)[:k_t]
-    voxel_idx = torch.randperm(V, device=device)[:k_v]
-
-    # build mask
-    M = torch.zeros((B, T, V), dtype=torch.bool, device=device)
-    M[:, time_idx, :] = True
-    M[:, :, voxel_idx] = True
-    return M
-
-@torch.no_grad()
-def _apply_zero_mask(x_BTV: torch.Tensor, M_BTV: torch.Tensor) -> torch.Tensor:
-    """
-    Zero-out masked entries. No optionality.
-    """
-    y = x_BTV.clone()
-    y[M_BTV] = 0.0
-    return y
-# ============================================================================
-
 # -----------------------------
 # Loss computation & epoch runner
 # -----------------------------
@@ -582,18 +601,18 @@ def run_epoch(mode:str, dl, model, brainlm, xyz_ref, cfg:TrainCfg, device, scale
         fmri_t = batch['fmri_window'].to(device, non_blocking=True)  # (B,T,V)
         B,T,V = fmri_t.shape
 
-        # === NEW: MASKING (minimal) — build union mask & zero masked entries BEFORE BrainLM ===
-        M = _make_union_time_voxel_mask(B, T, V, device=fmri_t.device)   # True = masked
-        fmri_in = _apply_zero_mask(fmri_t, M)                            # zero fill only
-
-        # BrainLM inputs (use masked input)
+        # BrainLM inputs
         t_pad0 = time.time()
-        fmri_pad = pad_timepoints_for_brainlm_torch(fmri_in, patch_size=20)  # (B,Tp,V)
+        fmri_pad = pad_timepoints_for_brainlm_torch(fmri_t, patch_size=20)  # (B,Tp,V)
         signal_vectors = fmri_pad.permute(0,2,1).contiguous()               # (B,V,Tp)
-        if xyz_ref is not None and V == cfg.fmri_voxels:
-            xyz = xyz_ref.unsqueeze(0).repeat(B,1,1)
-        else:
-            xyz = torch.zeros(B, V, 3, device=device)
+
+        # XYZ is MANDATORY and must match V
+        if (xyz_ref is None) or (V != cfg.fmri_voxels):
+            raise RuntimeError(
+                f"XYZ coords required and must match V. Have V={V}, expected {cfg.fmri_voxels}. "
+                "Ensure A424_Coordinates.dat is present and fmri_voxels matches."
+            )
+        xyz = xyz_ref.unsqueeze(0).repeat(B,1,1)  # (B,V,3)
         t_pad = time.time() - t_pad0
 
         # BrainLM latents (frozen)
@@ -605,10 +624,10 @@ def run_epoch(mode:str, dl, model, brainlm, xyz_ref, cfg:TrainCfg, device, scale
         if is_train:
             opt.zero_grad(set_to_none=True)
 
-        # Forward + loss (unchanged loss: all positions, weight 1)
+        # Forward + loss
         t_fwd0 = time.time()
         with torch.amp.autocast('cuda', enabled=(cfg.amp and device.type=='cuda')):
-            recon = model(fmri_latents, fmri_T=T, fmri_V=V)                 # (B,T,V)
+            recon = model(fmri_latents, fmri_T=T, fmri_V=V, xyz=xyz)        # (B,T,V)
             total_loss, comps = _compute_loss_components(recon, fmri_t, cfg)
         t_fwd = time.time() - t_fwd0
 
@@ -634,14 +653,10 @@ def run_epoch(mode:str, dl, model, brainlm, xyz_ref, cfg:TrainCfg, device, scale
         if cfg.debug:
             if bidx < max(1, cfg.profile_first_n):
                 mem = fmt_mem()
-                # report sampled ratios via counts
-                masked_t = M[0].any(dim=1).float().mean().item()  # fraction of time rows masked
-                masked_v = M[0].any(dim=0).float().mean().item()  # fraction of voxel cols masked
                 print(
                     f"[{mode}] b{bidx:04d} fetch={t_fetch:.3f}s | pad={t_pad:.3f}s | brainlm={t_blm:.3f}s | "
                     f"fwd={t_fwd:.3f}s | bwd={t_bwd:.3f}s | step={t_step:.3f}s | total={t_tot:.3f}s | "
                     f"loss={loss_val:.6f} | gnorm={gnorm:.3f} | {mem} | "
-                    f"mask(fr_t~{masked_t:.2f}, fr_v~{masked_v:.2f}) | "
                     f"shapes: fmri={tuple(fmri_t.shape)} latents={tuple(fmri_latents.shape)}"
                 )
             elif (bidx+1) % max(1, cfg.log_every) == 0:
@@ -679,7 +694,7 @@ def run_epoch(mode:str, dl, model, brainlm, xyz_ref, cfg:TrainCfg, device, scale
     return avg
 
 # -----------------------------
-# Diagnostics (plots + CSV) — unchanged
+# Diagnostics (plots + CSV)
 # -----------------------------
 def _pearsonr_safe(a: np.ndarray, b: np.ndarray) -> float:
     a = np.asarray(a).ravel(); b = np.asarray(b).ravel()
@@ -752,13 +767,33 @@ def _plot_topk_and_bars(t: np.ndarray, x_true: np.ndarray, x_rec: np.ndarray,
         for ax, (roi, r) in zip(axes, top):
             gt = x_true[:, roi]; rc = x_rec[:, roi]
             tt = np.arange(T) * float(TR)
-            ax.plot(tt, gt, label="GT")
-            ax.plot(tt, rc, label="Recon", alpha=0.9)
+            tt_d, gtd = _downsample(tt, gt, plot_max_points)
+            _,    rcd = _downsample(tt, rc, plot_max_points)
+            ax.plot(tt_d, gtd, label="GT")
+            ax.plot(tt_d, rcd, label="Recon", alpha=0.9)
             ax.set_title(f"ROI {roi} — r={r:.3f}")
             ax.set_xlabel("Time (s)"); ax.set_ylabel("Z-score")
             ax.legend(loc="upper right")
         fig.tight_layout()
         fig.savefig(out_dir / "plots" / "topK_fmri_corr.png", dpi=150)
+        plt.close(fig)
+
+    if make_calib and len(top) > 0:
+        fig, axes = plt.subplots(nrows=len(top), ncols=1, figsize=(12, 2.2*len(top)), sharex=False)
+        if len(top) == 1: axes = [axes]
+        for ax, (roi, r) in zip(axes, top):
+            gt = x_true[:, roi]; rc = x_rec[:, roi]
+            a, b, rc_lin, R2, nrmse = _lin_calibrate(rc, gt)
+            tt = np.arange(T) * float(TR)
+            tt_d, gtd = _downsample(tt, gt, plot_max_points)
+            _,    rcd = _downsample(tt, rc_lin, plot_max_points)
+            ax.plot(tt_d, gtd, label="GT")
+            ax.plot(tt_d, rcd, label=f"Recon (calib) a={a:.2f}, b={b:.2f}, R²={R2:.2f}", alpha=0.9)
+            ax.set_title(f"ROI {roi} — raw r={r:.3f}")
+            ax.set_xlabel("Time (s)"); ax.set_ylabel("Z-score")
+            ax.legend(loc="upper right")
+        fig.tight_layout()
+        fig.savefig(out_dir / "plots" / "topK_fmri_corr_calib.png", dpi=150)
         plt.close(fig)
 
     all_roi = [roi for roi,_ in rs]
@@ -809,20 +844,20 @@ def generate_fmri_diagnostics(
     fmri_t = batch['fmri_window'].to(device)  # (B,T,V)
     B, T, V = map(int, fmri_t.shape)
 
-    # BrainLM inputs (masked here too for consistency)
-    # Build mask & zero
-    M = _make_union_time_voxel_mask(B, T, V, device=fmri_t.device)
-    fmri_in = _apply_zero_mask(fmri_t, M)
-
-    fmri_pad = pad_timepoints_for_brainlm_torch(fmri_in, patch_size=20)  # (B,Tp,V)
+    # BrainLM inputs
+    fmri_pad = pad_timepoints_for_brainlm_torch(fmri_t, patch_size=20)  # (B,Tp,V)
     signal_vectors = fmri_pad.permute(0,2,1).contiguous()               # (B,V,Tp)
-    if xyz_ref is not None and V == cfg.fmri_voxels:
-        xyz = xyz_ref.unsqueeze(0).repeat(B,1,1)
-    else:
-        xyz = torch.zeros(B, V, 3, device=device)
+
+    # Enforce XYZ presence
+    if (xyz_ref is None) or (V != cfg.fmri_voxels):
+        raise RuntimeError(
+            f"XYZ coords required and must match V. Have V={V}, expected {cfg.fmri_voxels}. "
+            "Ensure A424_Coordinates.dat is present and fmri_voxels matches."
+        )
+    xyz = xyz_ref.unsqueeze(0).repeat(B,1,1)
 
     fmri_latents = brainlm.extract_latents(signal_vectors, xyz)  # (L,B,Ttok,Dh)
-    recon = model(fmri_latents, fmri_T=T, fmri_V=V)              # (B,T,V)
+    recon = model(fmri_latents, fmri_T=T, fmri_V=V, xyz=xyz)     # (B,T,V)
 
     b = 0
     x_true = fmri_t[b].detach().cpu().numpy()    # (T,V)
@@ -832,7 +867,7 @@ def generate_fmri_diagnostics(
     _plot_heatmap(x_rec,  "Recon (T×V)", out_dir / "plots" / "heatmap_recon.png")
     _plot_heatmap(np.abs(x_true - x_rec), "|GT - Recon| (T×V)", out_dir / "plots" / "heatmap_absdiff.png", cmap="magma")
 
-    _ = _plot_topk_and_bars(
+    rs = _plot_topk_and_bars(
         t=np.arange(T)*float(cfg.tr),
         x_true=x_true, x_rec=x_rec,
         out_dir=out_dir, TR=cfg.tr, top_k=top_k,
@@ -859,7 +894,7 @@ def generate_fmri_diagnostics(
         try:
             wandb_run.log({"diag/revstage": stage, "diag/tag": tag_for_logging or ""})
             for name in ["heatmap_gt.png", "heatmap_recon.png", "heatmap_absdiff.png",
-                         "topK_fmri_corr.png", "corr_bars_fmri.png"]:
+                         "topK_fmri_corr.png", "corr_bars_fmri.png", "topK_fmri_corr_calib.png"]:
                 p = out_dir / "plots" / name
                 if p.exists():
                     wandb_run.log({f"plots/{name}": wandb.Image(str(p))})
@@ -867,7 +902,7 @@ def generate_fmri_diagnostics(
             pass
 
 # -----------------------------
-# Auto-sweep helpers (unchanged)
+# Auto-sweep helpers (unchanged, but warm-start now loads affine)
 # -----------------------------
 def dataclass_replace(obj, **updates):
     from dataclasses import replace as _replace
@@ -928,8 +963,8 @@ def _train_once_for_cfg(base_cfg: TrainCfg, stage: int, *, trial_name: str,
                         epochs_override: Optional[int], lr_override: Optional[float]) -> float:
     """
     Short trial training for sweep; returns best val_total.
-    Warm-start policy (decoder-first): R2 <- R1_best, R3 <- R2_best
-    Diagnostics on new BEST (unchanged).
+    Warm-start policy (decoder-first): R2 <- R1_best (decoder+affine), R3 <- R2_best (encoder+decoder+voxel_pe+affine)
+    Generates diagnostics when a NEW BEST is found (on the val split).
     """
     cfg = dataclass_replace(base_cfg, out_dir=out_dir)
     device = torch.device(cfg.device)
@@ -940,21 +975,27 @@ def _train_once_for_cfg(base_cfg: TrainCfg, stage: int, *, trial_name: str,
     brainlm = FrozenBrainLM(cfg.brainlm_model_dir, device)
     translator = TranslatorFMRISelfAttn(cfg, fmri_n_layers=brainlm.n_layers_out, fmri_hidden_size=brainlm.hidden_size).to(device)
     xyz_ref = cache_a424_xyz(device)
+    if xyz_ref is None:
+        raise FileNotFoundError("Mandatory XYZ coordinates not found. "
+                                "Place A424_Coordinates.dat in an expected location.")
     scaler = torch.amp.GradScaler('cuda', enabled=(cfg.amp and device.type=='cuda'))
 
-    # Warm-start chain
+    # Warm-start (decoder-first chain) -- NOW INCLUDING AFFINE (+voxel_pe where applicable)
     if stage == 2:
         load_modules_if_exist(prev_stage_dir, translator, tag="revstage1_best",
                               which=["decoder", "affine"], device=device)
     elif stage == 3:
         load_modules_if_exist(prev_stage_dir, translator, tag="revstage2_best",
-                              which=["encoder", "decoder", "affine"], device=device)
+                              which=["encoder", "decoder", "voxel_pe", "affine"], device=device)
 
+    # Affine is always trainable; no flag needed
     set_stage_rev(translator, stage)
 
+    # Epochs & LR
     if stage == 1:   epochs, lr = cfg.stage1_epochs, cfg.lr_stage1
     elif stage == 2: epochs, lr = cfg.stage2_epochs, cfg.lr_stage2
     else:            epochs, lr = cfg.stage3_epochs, cfg.lr_stage3
+
     if epochs_override is not None and epochs_override > 0: epochs = int(epochs_override)
     if lr_override is not None and lr_override > 0:
         if stage == 1: cfg = dataclass_replace(cfg, lr_stage1=float(lr_override))
@@ -992,6 +1033,7 @@ def _train_once_for_cfg(base_cfg: TrainCfg, stage: int, *, trial_name: str,
                 "lr": float(opt.param_groups[0]['lr']),
             }, step=ep)
 
+        # always save "last" (includes voxel_pe + affine)
         last_paths = save_modules(cfg.out_dir, translator, tag=f"revstage{stage}_last")
         ts_last = save_trainstate(cfg.out_dir, f"revstage{stage}", tag="last", epoch=ep, best_val=best, opt=opt, scaler=scaler)
         if run is not None:
@@ -1002,12 +1044,14 @@ def _train_once_for_cfg(base_cfg: TrainCfg, stage: int, *, trial_name: str,
             except Exception:
                 pass
 
+        # update "best" + DIAGNOSTICS
         if va["total"] < best:
             best = va["total"]
             best_paths = save_modules(cfg.out_dir, translator, tag=f"revstage{stage}_best")
             ts_best = save_trainstate(cfg.out_dir, f"revstage{stage}", tag="best", epoch=ep, best_val=best, opt=opt, scaler=scaler)
             print(f"[RevStage{stage}][trial] ✅ new best {best:.6f}")
 
+            # diagnostics on BEST
             try:
                 generate_fmri_diagnostics(
                     cfg=cfg, out_dir=cfg.out_dir, stage=stage,
@@ -1035,7 +1079,7 @@ def _train_once_for_cfg(base_cfg: TrainCfg, stage: int, *, trial_name: str,
     return float(best)
 
 # -----------------------------
-# Config loader (unchanged)
+# Config loader
 # -----------------------------
 def _load_config_file(path: Path) -> Dict[str, Any]:
     with open(path, "r") as f:
@@ -1099,7 +1143,7 @@ def _apply_config_defaults(parser: argparse.ArgumentParser) -> Dict[str, Any]:
 # Main
 # -----------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Reversed (decoder-first) stage-wise fMRI-only training/testing (axial RoPE + 2-D decoder) with minimal pre-BrainLM masking + per-module checkpoints + W&B + Auto-Resume + Auto-Sweep + Diagnostics")
+    ap = argparse.ArgumentParser(description="Reversed (decoder-first) stage-wise fMRI-only training/testing (axial RoPE + 2-D decoder + mandatory XYZ voxel PE) + per-module checkpoints + W&B + Auto-Resume + Auto-Sweep + Diagnostics")
     ap.add_argument("--config", type=str, default=None, help="YAML/JSON config; if YAML has sections, uses 'train'")
     ap.add_argument("--eeg_root", type=str)
     ap.add_argument("--fmri_root", type=str)
@@ -1142,7 +1186,7 @@ def main():
     # Resume
     ap.add_argument("--no_resume", action="store_true", help="Disable auto-resume even if last checkpoints exist")
 
-    # ----- Loss config (unchanged) -----
+    # ----- Loss config -----
     ap.add_argument("--loss_type", type=str, choices=["mse","mae","huber","charbonnier","mse+pearson"], default="mse")
     ap.add_argument("--recon_loss_w", type=float, default=1.0)
     ap.add_argument("--corr_loss_w", type=float, default=0.0)
@@ -1150,7 +1194,7 @@ def main():
     ap.add_argument("--huber_delta", type=float, default=1.0)
     ap.add_argument("--charbonnier_eps", type=float, default=1e-3)
 
-    # ----- Auto-sweep (unchanged) -----
+    # ----- Auto-sweep -----
     ap.add_argument("--auto_sweep", action="store_true",
                     help="Run automatic LR×loss sweep, pick best by val/total_loss, then retrain fully.")
     ap.add_argument("--sweep_epochs", type=int, default=0,
@@ -1166,12 +1210,12 @@ def main():
     ap.add_argument("--sweep_max_combos", type=int, default=0, help="0 = try all combos; >0 = random subset of this many.")
     ap.add_argument("--no_final_full", action="store_true", help="Skip full retrain with best config after sweep.")
 
-    # --- W&B args (unchanged) ---
+    # --- W&B args ---
     ap.add_argument("--wandb_project", type=str, default=None)
     ap.add_argument("--wandb_entity", type=str, default=None)
     ap.add_argument("--wandb_run_name", type=str, default=None)
     ap.add_argument("--wandb_group", type=str, default=None)
-    ap.add_argument("--wandb_job_type", type=str, default=None)
+    ap.add_argument("--wandb_job_type", type:str, default=None)
     ap.add_argument("--wandb_tags", type=str, nargs="*", default=None)
     ap.add_argument("--wandb_notes", type=str, default=None)
     ap.add_argument("--wandb_mode", type=str, default="online", choices=["online","offline","disabled"])
@@ -1266,55 +1310,18 @@ def main():
             print(f"[debug] brainlm_mae import check failed: {e}")
         print(f"[debug] sys.path[:5] = {sys.path[:5]}")
 
-    # ---------- AUTO-SWEEP ----------
-    if cfg.auto_sweep and args.mode == "train":
-        stage = int(args.stage)
-        sweep_dir = Path(cfg.out_dir) / f"sweeps_revstage{stage}"
-        os.makedirs(sweep_dir, exist_ok=True)
-
-        combos = _build_sweep_space(cfg, stage)
-        print(f"[sweep] Rev Stage {stage}: trying {len(combos)} trial combos...")
-        results = []
-        sw_epochs = _epochs_for_sweep(cfg, stage)
-        prev_stage_dir = Path(cfg.out_dir)
-
-        for i, trial in enumerate(combos, 1):
-            trial_cfg = _apply_trial_loss_cfg(cfg, trial)
-            trial_out = sweep_dir / f"trial_{i:03d}_{trial['loss_type']}_lr{trial['lr']:.1e}_cw{trial['corr_w']}_tv{trial['tv_w']}"
-            trial_name = f"rev-s{stage}-trial{i}-{trial['loss_type']}-lr{trial['lr']:.1e}-cw{trial['corr_w']}-tv{trial['tv_w']}"
-            best_val = _train_once_for_cfg(
-                dataclass_replace(trial_cfg, auto_resume=False),
-                stage=stage, trial_name=trial_name,
-                out_dir=trial_out, prev_stage_dir=prev_stage_dir,
-                epochs_override=sw_epochs, lr_override=float(trial["lr"])
-            )
-            results.append(dict(idx=i, best_val_total=float(best_val), **trial))
-
-        results = sorted(results, key=lambda r: r["best_val_total"])
-        best = results[0]
-        print(f"[sweep] ✅ Best (rev stage {stage}): {best}")
-
-        with open(sweep_dir / "sweep_results.json", "w") as f:
-            json.dump(results, f, indent=2)
-
-        if cfg.no_final_full:
-            print("[sweep] Skipping final full retrain (--no_final_full).")
-            return
-
-        best_cfg = _apply_trial_loss_cfg(cfg, best)
-        if stage == 1: best_cfg = dataclass_replace(best_cfg, lr_stage1=float(best["lr"]))
-        elif stage == 2: best_cfg = dataclass_replace(best_cfg, lr_stage2=float(best["lr"]))
-        else: best_cfg = dataclass_replace(best_cfg, lr_stage3=float(best["lr"]))
-        print(f"[sweep] 🔁 Full training with best config in {cfg.out_dir} ...")
-        cfg = best_cfg
-
     # Data
     dl_train, dl_val, dl_test = make_dataloaders(cfg, device)
 
     # Models
     brainlm = FrozenBrainLM(cfg.brainlm_model_dir, device)
     translator = TranslatorFMRISelfAttn(cfg, fmri_n_layers=brainlm.n_layers_out, fmri_hidden_size=brainlm.hidden_size).to(device)
+
+    # Cache XYZ (MANDATORY)
     xyz_ref = cache_a424_xyz(device)
+    if xyz_ref is None:
+        raise FileNotFoundError("Mandatory XYZ coordinates not found. "
+                                "Place A424_Coordinates.dat in one of the expected locations.")
     scaler = torch.amp.GradScaler('cuda', enabled=(cfg.amp and device.type=='cuda'))
 
     # ---------- Stage + Mode ----------
@@ -1346,7 +1353,7 @@ def main():
 
     os.environ["STAGE_ENV"] = f"R{stage}"
 
-    # ---------- Warm-start / Resume ----------
+    # ---------- Warm-start / Resume (decoder-first) ----------
     out_dir = Path(cfg.out_dir)
 
     def _any_last_modules_exist_rev(s: int) -> bool:
@@ -1361,41 +1368,53 @@ def main():
     if mode == "train" and cfg.auto_resume and _any_last_modules_exist_rev(stage):
         print(f"[resume] Detected existing revstage{stage}_last modules. Resuming training...")
         load_modules_if_exist(out_dir, translator, tag=f"revstage{stage}_last",
-                              which=["adapter","encoder","decoder","affine"], device=device)
+                              which=["adapter","encoder","decoder","voxel_pe","affine"], device=device)
         resumed = True
     else:
         if mode == "train":
             if stage == 1:
+                # First reversed stage: start fresh unless resuming
                 pass
             elif stage == 2:
+                # Warm-start from stage 1 best (decoder + affine)
                 load_modules_if_exist(out_dir, translator, tag="revstage1_best",
                                       which=["decoder", "affine"], device=device)
             elif stage == 3:
+                # Warm-start from stage 2 best (encoder + decoder + voxel_pe + affine)
                 load_modules_if_exist(out_dir, translator, tag="revstage2_best",
-                                      which=["encoder", "decoder", "affine"], device=device)
+                                      which=["encoder", "decoder", "voxel_pe", "affine"], device=device)
         else:
+            # TEST mode: restore expected modules for this stage (always include affine)
             default_tag = f"revstage{stage}_best"
             tag = args.load_tag or default_tag
+
             need = (["decoder", "affine"] if stage == 1
-                    else (["encoder", "decoder", "affine"] if stage == 2
-                          else ["adapter", "encoder", "decoder", "affine"]))
+                    else (["encoder", "decoder", "voxel_pe", "affine"] if stage == 2
+                          else ["adapter", "encoder", "decoder", "voxel_pe", "affine"]))
+
             loaded = load_modules_if_exist(out_dir, translator, tag=tag, which=need, device=device)
+
+            # Normalize loader-returned names -> {adapter, encoder, decoder, voxel_pe, affine}
             norm_map = {
                 "adapter_fmri": "adapter",
                 "fmri_encoder": "encoder",
                 "fmri_decoder": "decoder",
+                "voxel_pe":     "voxel_pe",
                 "fmri_affine":  "affine",
             }
             loaded_norm = {norm_map.get(n, n) for n in loaded}
+
             missing = [x for x in need if x not in loaded_norm]
             if missing:
                 print(f"[WARN] Missing expected modules for '{tag}': {missing}")
 
-    set_stage_rev(translator, stage)
+    # ---------- Set trainable ----------
+    set_stage_rev(translator, stage)  # affine always trainable
     trainable = [n for n,p in translator.named_parameters() if p.requires_grad]
     print(f"[rev stage {stage}][{mode}] trainable: {len(trainable)} tensors")
     for n in trainable: print("  -", n)
 
+    # ---------- Run ----------
     if mode == "train":
         if stage == 1:   epochs, lr = cfg.stage1_epochs, cfg.lr_stage1
         elif stage == 2: epochs, lr = cfg.stage2_epochs, cfg.lr_stage2
@@ -1442,6 +1461,7 @@ def main():
                     "resume/start_epoch": start_epoch if ep == start_epoch else None,
                 }, step=ep)
 
+            # always save "last" (includes voxel_pe + affine)
             last_paths = save_modules(out_dir, translator, tag=f"revstage{stage}_last")
             ts_last = save_trainstate(out_dir, stage_label, tag="last", epoch=ep, best_val=best_val_total, opt=opt, scaler=scaler)
             if run is not None:
@@ -1452,6 +1472,7 @@ def main():
                 except Exception:
                     pass
 
+            # update "best" + DIAGNOSTICS
             if va["total"] < best_val_total:
                 best_val_total = va["total"]
                 best_paths = save_modules(out_dir, translator, tag=f"revstage{stage}_best")
@@ -1519,6 +1540,7 @@ if __name__ == "__main__":
     main()
 
 # Example:
-# python train_fmri_selfattn_masked_rev_minimal.py \
+# python train_fmri_selfattn_permodule_updated_19aug_reverse_modelsave.py \
 #   --config configs/fmri_selfattn_rev.yaml --stage 1 --mode train \
-#   --num_workers 4
+#   --auto_sweep --sweep_epochs 5 --sweep_loss_list huber charbonnier mse mae \
+#   --sweep_lr1 5e-4 5e-5 1e-4 5e-2 --num_workers 4

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Reversed stage-wise training (decoder-first) for fMRI-only self-attention model,
-with minimal, non-optional masking applied BEFORE BrainLM.
+with minimal, non-optional masking applied BEFORE BrainLM, and mandatory voxel
+positional encoding (learned ID + XYZ MLP) added at the token-grid level.
 
 Masking rules (always on, no flags):
 - Sample r_t ~ Uniform[0.3, 0.8], mask r_t fraction of time steps (entire rows)
@@ -9,11 +10,15 @@ Masking rules (always on, no flags):
 - Final mask = union(time-rows, voxel-columns)
 - Masked entries in the BrainLM input are set to ZERO (no mean/noise options)
 
+Voxel positional encoding:
+- New module.VoxelPositionalEncoding(V,D) returns (B,T,V,D) to ADD to the token grid
+  (B,S=D_model tokens are reshaped to (B,T,V,D_model), PE is added, then flattened back)
+
 Loss:
 - Unchanged: computed on ALL positions with equal weight 1
 - Reconstruction still targets the original (unmasked) fMRI
 
-Everything else (stages, checkpoints, W&B, diagnostics) is unchanged.
+Everything else (stages, checkpoints incl. voxel_pe, W&B, diagnostics) is unchanged.
 """
 
 from __future__ import annotations
@@ -76,6 +81,7 @@ from module import (  # type: ignore
     fMRIInputAdapterConv1d,
     HierarchicalEncoder,          # axial RoPE inside
     fMRIDecodingAdapter2D,        # 2-D decoder
+    VoxelPositionalEncoding,      # <-- NEW: learned ID + XYZ MLP
 )
 
 # BrainLM imports
@@ -251,7 +257,11 @@ class FrozenBrainLM(nn.Module):
 class TranslatorFMRISelfAttn(nn.Module):
     """
     fMRI branch:
-      adapter_fmri (→ S=T×V) -> fmri_encoder (axial RoPE) -> fmri_decoder_2d -> tanh + affine
+      adapter_fmri (→ S=T×V)
+      + voxel PE (learned ID + XYZ MLP) on reshaped grid (B,T,V,D)
+      -> fmri_encoder (axial RoPE)
+      -> fmri_decoder_2d
+      -> tanh + affine
     """
     def __init__(self, cfg: TrainCfg, fmri_n_layers:int, fmri_hidden_size:int):
         super().__init__()
@@ -268,6 +278,9 @@ class TranslatorFMRISelfAttn(nn.Module):
             output_dim=cfg.d_model,
             target_seq_len=S
         )
+
+        # NEW: voxel positional encoding (learned ID + XYZ MLP)
+        self.voxel_pe = VoxelPositionalEncoding(V=V, D=cfg.d_model)
 
         # Self-attention encoder (lower/higher stacks identical here; we use 'higher')
         self.fmri_encoder = HierarchicalEncoder(
@@ -287,14 +300,29 @@ class TranslatorFMRISelfAttn(nn.Module):
         self.T = T
         self.V = V
 
-    def forward(self, fmri_latents: torch.Tensor, fmri_T:int, fmri_V:int) -> torch.Tensor:
+    def forward(self, fmri_latents: torch.Tensor, fmri_T:int, fmri_V:int, xyz: torch.Tensor) -> torch.Tensor:
         """
         fmri_latents: (L,B,Ttok,Dh) from BrainLM
+        xyz: (B,V,3) voxel coordinates (required for voxel PE)
         returns: (B,T,V)
         """
+        # Adapter to (B,S,D)
         fmri_adapt = self.adapter_fmri(fmri_latents)       # (B,S,D) with S=T×V
-        _, fmr_hi = self.fmri_encoder(fmri_adapt, fmri_adapt, T=fmri_T, V=fmri_V)  # (B,S,D)
+
+        # Add voxel PE on the (B,T,V,D) grid
+        B = fmri_adapt.shape[0]
+        f_grid = fmri_adapt.view(B, fmri_T, fmri_V, -1).contiguous()        # (B,T,V,D)
+        pe = self.voxel_pe(B, fmri_T, xyz)                                  # (B,T,V,D)
+        f_grid = f_grid + pe                                                 # (B,T,V,D)
+
+        # Flatten back to (B,S,D) and encode with axial-RoPE
+        f_tokens = f_grid.view(B, fmri_T * fmri_V, -1).contiguous()         # (B,S,D)
+        _, fmr_hi = self.fmri_encoder(f_tokens, f_tokens, T=fmri_T, V=fmri_V)  # (B,S,D)
+
+        # 2-D decoder -> (B,T,V)
         fmri_sig = self.fmri_decoder(fmr_hi)               # (B,T,V)
+
+        # squash + affine
         fmri_sig = torch.tanh(fmri_sig)
         fmri_sig = self.fmri_out_scale * fmri_sig + self.fmri_out_bias
         return fmri_sig
@@ -308,24 +336,28 @@ def freeze_all(m: nn.Module):
 def set_stage_rev(m: TranslatorFMRISelfAttn, stage: int, *, train_affine_stage3: bool = False):
     """
     Reversed (decoder-first) stages:
-      - 1: decoder (affine trainable)
-      - 2: decoder + encoder (affine trainable)
-      - 3: adapter + encoder + decoder (affine trainable)
+      - 1: decoder (affine trainable)         [voxel_pe frozen]
+      - 2: decoder + encoder + voxel_pe (affine trainable)
+      - 3: adapter + encoder + decoder + voxel_pe (affine trainable)
     """
     freeze_all(m)
     if stage == 1:
         for n, p in m.named_parameters():
             if n.startswith("fmri_decoder."):
                 p.requires_grad = True
+        # voxel_pe remains frozen in stage 1
     elif stage == 2:
         for n, p in m.named_parameters():
-            if n.startswith("fmri_decoder.") or n.startswith("fmri_encoder."):
+            if (n.startswith("fmri_decoder.") or
+                n.startswith("fmri_encoder.") or
+                n.startswith("voxel_pe.")):
                 p.requires_grad = True
     elif stage == 3:
         for n, p in m.named_parameters():
             if (n.startswith("adapter_fmri.") or
                 n.startswith("fmri_encoder.") or
-                n.startswith("fmri_decoder.")):
+                n.startswith("fmri_decoder.") or
+                n.startswith("voxel_pe.")):
                 p.requires_grad = True
     else:
         raise ValueError(f"Unknown reversed stage {stage}")
@@ -333,12 +365,13 @@ def set_stage_rev(m: TranslatorFMRISelfAttn, stage: int, *, train_affine_stage3:
     m.fmri_out_bias.requires_grad  = True
 
 # -----------------------------
-# Per-module save/load helpers
+# Per-module save/load helpers (UPDATED: voxel_pe)
 # -----------------------------
 def _module_paths(out_dir: Path, tag: str):
     out_dir.mkdir(parents=True, exist_ok=True)
     return {
         "adapter": out_dir / f"adapter_fmri_{tag}.pt",
+        "voxel_pe": out_dir / f"voxel_pe_{tag}.pt",            # NEW
         "encoder": out_dir / f"fmri_encoder_{tag}.pt",
         "decoder": out_dir / f"fmri_decoder_{tag}.pt",
         "affine":  out_dir / f"fmri_affine_{tag}.pt",
@@ -347,6 +380,7 @@ def _module_paths(out_dir: Path, tag: str):
 def save_modules(out_dir: Path, model: TranslatorFMRISelfAttn, tag: str):
     paths = _module_paths(out_dir, tag)
     torch.save(model.adapter_fmri.state_dict(), paths["adapter"])
+    torch.save(model.voxel_pe.state_dict(), paths["voxel_pe"])             # NEW
     torch.save(model.fmri_encoder.state_dict(), paths["encoder"])
     torch.save(model.fmri_decoder.state_dict(), paths["decoder"])
     torch.save({"scale": model.fmri_out_scale.detach().cpu(),
@@ -357,11 +391,14 @@ def save_modules(out_dir: Path, model: TranslatorFMRISelfAttn, tag: str):
 def load_modules_if_exist(out_dir: Path, model: TranslatorFMRISelfAttn, tag: str,
                           which: Optional[Iterable[str]] = None, device: Optional[torch.device] = None):
     paths = _module_paths(out_dir, tag)
-    which = set(which or ["adapter","encoder","decoder","affine"])
+    which = set(which or ["adapter","voxel_pe","encoder","decoder","affine"])  # include voxel_pe by default
     loaded = []
     if "adapter" in which and paths["adapter"].exists():
         sd = _torch_load_compat(paths["adapter"], map_location=device or "cpu", allow_weights_only=True)
         model.adapter_fmri.load_state_dict(sd, strict=False); loaded.append("adapter_fmri")
+    if "voxel_pe" in which and paths["voxel_pe"].exists():
+        sd = _torch_load_compat(paths["voxel_pe"], map_location=device or "cpu", allow_weights_only=True)
+        model.voxel_pe.load_state_dict(sd, strict=False); loaded.append("voxel_pe")
     if "encoder" in which and paths["encoder"].exists():
         sd = _torch_load_compat(paths["encoder"], map_location=device or "cpu", allow_weights_only=True)
         model.fmri_encoder.load_state_dict(sd, strict=False); loaded.append("fmri_encoder")
@@ -432,7 +469,6 @@ def make_dataloaders(cfg: TrainCfg, device: torch.device) -> Tuple[DataLoader, D
     if not inter_keys:
         raise RuntimeError("No (subject,task,run) intersections between EEG and fMRI trees.")
 
-    # Require explicit subject splits from config/CLI; do not auto-split.
     if not (cfg.train_subjects and cfg.val_subjects):
         raise RuntimeError(
             "Provide subject splits via --train_subjects and --val_subjects (and optionally --test_subjects). "
@@ -467,7 +503,6 @@ def make_dataloaders(cfg: TrainCfg, device: torch.device) -> Tuple[DataLoader, D
         return dl
 
     return _dl(train_keys, "train"), _dl(val_keys, "val"), (_dl(test_keys, "test") if test_keys else None)
-
 
 def cache_a424_xyz(device: torch.device) -> Optional[torch.Tensor]:
     candidates = [
@@ -505,17 +540,12 @@ def _make_union_time_voxel_mask(B: int, T: int, V: int, device: torch.device) ->
     - Return union mask M (B, T, V) [True = masked]
     Same (rows/cols) are used for all items in the batch for simplicity.
     """
-    # sample ratios
     r_t = 0.3 + 0.5 * torch.rand(1, device=device).item()
     r_v = 0.3 + 0.5 * torch.rand(1, device=device).item()
     k_t = max(1, int(round(r_t * T)))
     k_v = max(1, int(round(r_v * V)))
-
-    # choose indices
     time_idx  = torch.randperm(T, device=device)[:k_t]
     voxel_idx = torch.randperm(V, device=device)[:k_v]
-
-    # build mask
     M = torch.zeros((B, T, V), dtype=torch.bool, device=device)
     M[:, time_idx, :] = True
     M[:, :, voxel_idx] = True
@@ -523,9 +553,6 @@ def _make_union_time_voxel_mask(B: int, T: int, V: int, device: torch.device) ->
 
 @torch.no_grad()
 def _apply_zero_mask(x_BTV: torch.Tensor, M_BTV: torch.Tensor) -> torch.Tensor:
-    """
-    Zero-out masked entries. No optionality.
-    """
     y = x_BTV.clone()
     y[M_BTV] = 0.0
     return y
@@ -589,9 +616,9 @@ def run_epoch(mode:str, dl, model, brainlm, xyz_ref, cfg:TrainCfg, device, scale
         # BrainLM inputs (use masked input)
         t_pad0 = time.time()
         fmri_pad = pad_timepoints_for_brainlm_torch(fmri_in, patch_size=20)  # (B,Tp,V)
-        signal_vectors = fmri_pad.permute(0,2,1).contiguous()               # (B,V,Tp)
+        signal_vectors = fmri_pad.permute(0,2,1).contiguous()                # (B,V,Tp)
         if xyz_ref is not None and V == cfg.fmri_voxels:
-            xyz = xyz_ref.unsqueeze(0).repeat(B,1,1)
+            xyz = xyz_ref.unsqueeze(0).repeat(B,1,1)                         # (B,V,3)
         else:
             xyz = torch.zeros(B, V, 3, device=device)
         t_pad = time.time() - t_pad0
@@ -599,7 +626,7 @@ def run_epoch(mode:str, dl, model, brainlm, xyz_ref, cfg:TrainCfg, device, scale
         # BrainLM latents (frozen)
         t_blm0 = time.time()
         with torch.no_grad():
-            fmri_latents = brainlm.extract_latents(signal_vectors, xyz)     # (L,B,Ttok,Dh)
+            fmri_latents = brainlm.extract_latents(signal_vectors, xyz)      # (L,B,Ttok,Dh)
         t_blm = time.time() - t_blm0
 
         if is_train:
@@ -608,7 +635,7 @@ def run_epoch(mode:str, dl, model, brainlm, xyz_ref, cfg:TrainCfg, device, scale
         # Forward + loss (unchanged loss: all positions, weight 1)
         t_fwd0 = time.time()
         with torch.amp.autocast('cuda', enabled=(cfg.amp and device.type=='cuda')):
-            recon = model(fmri_latents, fmri_T=T, fmri_V=V)                 # (B,T,V)
+            recon = model(fmri_latents, fmri_T=T, fmri_V=V, xyz=xyz)         # <-- pass xyz for voxel PE
             total_loss, comps = _compute_loss_components(recon, fmri_t, cfg)
         t_fwd = time.time() - t_fwd0
 
@@ -634,7 +661,6 @@ def run_epoch(mode:str, dl, model, brainlm, xyz_ref, cfg:TrainCfg, device, scale
         if cfg.debug:
             if bidx < max(1, cfg.profile_first_n):
                 mem = fmt_mem()
-                # report sampled ratios via counts
                 masked_t = M[0].any(dim=1).float().mean().item()  # fraction of time rows masked
                 masked_v = M[0].any(dim=0).float().mean().item()  # fraction of voxel cols masked
                 print(
@@ -679,7 +705,7 @@ def run_epoch(mode:str, dl, model, brainlm, xyz_ref, cfg:TrainCfg, device, scale
     return avg
 
 # -----------------------------
-# Diagnostics (plots + CSV) — unchanged
+# Diagnostics (plots + CSV) — unchanged, but forward() now passes xyz
 # -----------------------------
 def _pearsonr_safe(a: np.ndarray, b: np.ndarray) -> float:
     a = np.asarray(a).ravel(); b = np.asarray(b).ravel()
@@ -810,19 +836,18 @@ def generate_fmri_diagnostics(
     B, T, V = map(int, fmri_t.shape)
 
     # BrainLM inputs (masked here too for consistency)
-    # Build mask & zero
     M = _make_union_time_voxel_mask(B, T, V, device=fmri_t.device)
     fmri_in = _apply_zero_mask(fmri_t, M)
 
     fmri_pad = pad_timepoints_for_brainlm_torch(fmri_in, patch_size=20)  # (B,Tp,V)
     signal_vectors = fmri_pad.permute(0,2,1).contiguous()               # (B,V,Tp)
     if xyz_ref is not None and V == cfg.fmri_voxels:
-        xyz = xyz_ref.unsqueeze(0).repeat(B,1,1)
+        xyz = xyz_ref.unsqueeze(0).repeat(B,1,1)                         # (B,V,3)
     else:
         xyz = torch.zeros(B, V, 3, device=device)
 
-    fmri_latents = brainlm.extract_latents(signal_vectors, xyz)  # (L,B,Ttok,Dh)
-    recon = model(fmri_latents, fmri_T=T, fmri_V=V)              # (B,T,V)
+    fmri_latents = brainlm.extract_latents(signal_vectors, xyz)         # (L,B,Ttok,Dh)
+    recon = model(fmri_latents, fmri_T=T, fmri_V=V, xyz=xyz)            # (B,T,V)
 
     b = 0
     x_true = fmri_t[b].detach().cpu().numpy()    # (T,V)
@@ -942,13 +967,13 @@ def _train_once_for_cfg(base_cfg: TrainCfg, stage: int, *, trial_name: str,
     xyz_ref = cache_a424_xyz(device)
     scaler = torch.amp.GradScaler('cuda', enabled=(cfg.amp and device.type=='cuda'))
 
-    # Warm-start chain
+    # Warm-start chain (now includes voxel_pe where present)
     if stage == 2:
         load_modules_if_exist(prev_stage_dir, translator, tag="revstage1_best",
-                              which=["decoder", "affine"], device=device)
+                              which=["decoder", "affine", "voxel_pe"], device=device)
     elif stage == 3:
         load_modules_if_exist(prev_stage_dir, translator, tag="revstage2_best",
-                              which=["encoder", "decoder", "affine"], device=device)
+                              which=["encoder", "decoder", "affine", "voxel_pe"], device=device)
 
     set_stage_rev(translator, stage)
 
@@ -1099,7 +1124,7 @@ def _apply_config_defaults(parser: argparse.ArgumentParser) -> Dict[str, Any]:
 # Main
 # -----------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Reversed (decoder-first) stage-wise fMRI-only training/testing (axial RoPE + 2-D decoder) with minimal pre-BrainLM masking + per-module checkpoints + W&B + Auto-Resume + Auto-Sweep + Diagnostics")
+    ap = argparse.ArgumentParser(description="Reversed (decoder-first) stage-wise fMRI-only training/testing (axial RoPE + 2-D decoder) with minimal pre-BrainLM masking + voxel positional encoding + per-module checkpoints + W&B + Auto-Resume + Auto-Sweep + Diagnostics")
     ap.add_argument("--config", type=str, default=None, help="YAML/JSON config; if YAML has sections, uses 'train'")
     ap.add_argument("--eeg_root", type=str)
     ap.add_argument("--fmri_root", type=str)
@@ -1361,7 +1386,7 @@ def main():
     if mode == "train" and cfg.auto_resume and _any_last_modules_exist_rev(stage):
         print(f"[resume] Detected existing revstage{stage}_last modules. Resuming training...")
         load_modules_if_exist(out_dir, translator, tag=f"revstage{stage}_last",
-                              which=["adapter","encoder","decoder","affine"], device=device)
+                              which=["adapter","voxel_pe","encoder","decoder","affine"], device=device)
         resumed = True
     else:
         if mode == "train":
@@ -1369,22 +1394,23 @@ def main():
                 pass
             elif stage == 2:
                 load_modules_if_exist(out_dir, translator, tag="revstage1_best",
-                                      which=["decoder", "affine"], device=device)
+                                      which=["decoder", "affine", "voxel_pe"], device=device)
             elif stage == 3:
                 load_modules_if_exist(out_dir, translator, tag="revstage2_best",
-                                      which=["encoder", "decoder", "affine"], device=device)
+                                      which=["encoder", "decoder", "affine", "voxel_pe"], device=device)
         else:
             default_tag = f"revstage{stage}_best"
             tag = args.load_tag or default_tag
-            need = (["decoder", "affine"] if stage == 1
-                    else (["encoder", "decoder", "affine"] if stage == 2
-                          else ["adapter", "encoder", "decoder", "affine"]))
+            need = (["decoder", "affine", "voxel_pe"] if stage == 1
+                    else (["encoder", "decoder", "affine", "voxel_pe"] if stage == 2
+                          else ["adapter", "encoder", "decoder", "affine", "voxel_pe"]))
             loaded = load_modules_if_exist(out_dir, translator, tag=tag, which=need, device=device)
             norm_map = {
                 "adapter_fmri": "adapter",
                 "fmri_encoder": "encoder",
                 "fmri_decoder": "decoder",
                 "fmri_affine":  "affine",
+                "voxel_pe":     "voxel_pe",
             }
             loaded_norm = {norm_map.get(n, n) for n in loaded}
             missing = [x for x in need if x not in loaded_norm]
