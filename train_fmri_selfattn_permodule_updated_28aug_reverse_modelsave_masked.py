@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
 Reversed stage-wise training (decoder-first) for fMRI-only self-attention model,
-with minimal, non-optional masking applied BEFORE BrainLM, and mandatory voxel
-positional encoding (learned ID + XYZ MLP) added at the token-grid level.
+with minimal masking applied BEFORE BrainLM, and mandatory voxel positional
+encoding (learned ID + XYZ MLP) added at the token-grid level.
 
 Masking rules (always on, no flags):
-- Sample r_t ~ Uniform[0.3, 0.8], mask r_t fraction of time steps (entire rows)
-- Sample r_v ~ Uniform[0.3, 0.8], mask r_v fraction of voxels (entire columns)
-- Final mask = union(time-rows, voxel-columns)
-- Masked entries in the BrainLM input are set to ZERO (no mean/noise options)
+- Sample r_t ~ Uniform[0.3, 0.8], pick r_t fraction of **time steps**.
+- For each selected time step, sample r_v_time ~ Uniform[0.3, 0.8] and mask
+  that **fraction of ROIs only within that time** (NO full-row masking).
+- Masked entries in the BrainLM input are set to ZERO (no mean/noise options).
 
 Voxel positional encoding:
-- New module.VoxelPositionalEncoding(V,D) returns (B,T,V,D) to ADD to the token grid
+- module.VoxelPositionalEncoding(V,D) returns (B,T,V,D) to ADD to the token grid
   (B,S=D_model tokens are reshaped to (B,T,V,D_model), PE is added, then flattened back)
 
 Loss:
@@ -75,13 +75,13 @@ for p in candidate_blm_roots:
         sys.path.insert(0, str(p.parent)); break
 
 # -----------------------------
-# Local modules (UPDATED)
+# Local modules (with voxel PE)
 # -----------------------------
 from module import (  # type: ignore
     fMRIInputAdapterConv1d,
     HierarchicalEncoder,          # axial RoPE inside
     fMRIDecodingAdapter2D,        # 2-D decoder
-    VoxelPositionalEncoding,      # <-- NEW: learned ID + XYZ MLP
+    VoxelPositionalEncoding,      # learned ID + XYZ MLP
 )
 
 # BrainLM imports
@@ -365,13 +365,13 @@ def set_stage_rev(m: TranslatorFMRISelfAttn, stage: int, *, train_affine_stage3:
     m.fmri_out_bias.requires_grad  = True
 
 # -----------------------------
-# Per-module save/load helpers (UPDATED: voxel_pe)
+# Per-module save/load helpers (includes voxel_pe)
 # -----------------------------
 def _module_paths(out_dir: Path, tag: str):
     out_dir.mkdir(parents=True, exist_ok=True)
     return {
         "adapter": out_dir / f"adapter_fmri_{tag}.pt",
-        "voxel_pe": out_dir / f"voxel_pe_{tag}.pt",            # NEW
+        "voxel_pe": out_dir / f"voxel_pe_{tag}.pt",
         "encoder": out_dir / f"fmri_encoder_{tag}.pt",
         "decoder": out_dir / f"fmri_decoder_{tag}.pt",
         "affine":  out_dir / f"fmri_affine_{tag}.pt",
@@ -380,7 +380,7 @@ def _module_paths(out_dir: Path, tag: str):
 def save_modules(out_dir: Path, model: TranslatorFMRISelfAttn, tag: str):
     paths = _module_paths(out_dir, tag)
     torch.save(model.adapter_fmri.state_dict(), paths["adapter"])
-    torch.save(model.voxel_pe.state_dict(), paths["voxel_pe"])             # NEW
+    torch.save(model.voxel_pe.state_dict(), paths["voxel_pe"])
     torch.save(model.fmri_encoder.state_dict(), paths["encoder"])
     torch.save(model.fmri_decoder.state_dict(), paths["decoder"])
     torch.save({"scale": model.fmri_out_scale.detach().cpu(),
@@ -391,7 +391,7 @@ def save_modules(out_dir: Path, model: TranslatorFMRISelfAttn, tag: str):
 def load_modules_if_exist(out_dir: Path, model: TranslatorFMRISelfAttn, tag: str,
                           which: Optional[Iterable[str]] = None, device: Optional[torch.device] = None):
     paths = _module_paths(out_dir, tag)
-    which = set(which or ["adapter","voxel_pe","encoder","decoder","affine"])  # include voxel_pe by default
+    which = set(which or ["adapter","voxel_pe","encoder","decoder","affine"])
     loaded = []
     if "adapter" in which and paths["adapter"].exists():
         sd = _torch_load_compat(paths["adapter"], map_location=device or "cpu", allow_weights_only=True)
@@ -530,25 +530,30 @@ def _grad_norm(model: nn.Module) -> float:
             tot += param_norm * param_norm
     return float(math.sqrt(tot)) if tot > 0 else 0.0
 
-# === NEW: MASKING (minimal) ==================================================
+# === NEW: TIME-SPARSE MASKING ==============================================
 @torch.no_grad()
-def _make_union_time_voxel_mask(B: int, T: int, V: int, device: torch.device) -> torch.Tensor:
+def _make_time_sparse_mask(
+    B: int, T: int, V: int, device: torch.device,
+    r_t_range=(0.3, 0.8),          # fraction of time steps selected
+    r_v_in_time_range=(0.3, 0.8),  # fraction of ROIs masked within each selected time
+) -> torch.Tensor:
     """
-    Minimal, non-optional mask:
-    - Pick r_t ~ U[0.3, 0.8], mask r_t*T time rows
-    - Pick r_v ~ U[0.3, 0.8], mask r_v*V voxel columns
-    - Return union mask M (B, T, V) [True = masked]
-    Same (rows/cols) are used for all items in the batch for simplicity.
+    Returns M (B, T, V) [True = masked].
+    - Pick r_t ∈ [0.3,0.8], choose k_t time indices.
+    - For EACH selected time, pick r_v_time ∈ [0.3,0.8], mask k_v_time ROIs *only at that time*.
+    - Same mask for all items in the batch (simple & fast).
     """
-    r_t = 0.3 + 0.5 * torch.rand(1, device=device).item()
-    r_v = 0.3 + 0.5 * torch.rand(1, device=device).item()
+    # time steps to affect
+    r_t = float(torch.rand(1, device=device) * (r_t_range[1] - r_t_range[0]) + r_t_range[0])
     k_t = max(1, int(round(r_t * T)))
-    k_v = max(1, int(round(r_v * V)))
-    time_idx  = torch.randperm(T, device=device)[:k_t]
-    voxel_idx = torch.randperm(V, device=device)[:k_v]
+    time_idx = torch.randperm(T, device=device)[:k_t]
+
     M = torch.zeros((B, T, V), dtype=torch.bool, device=device)
-    M[:, time_idx, :] = True
-    M[:, :, voxel_idx] = True
+    for t in time_idx.tolist():
+        r_v_t = float(torch.rand(1, device=device) * (r_v_in_time_range[1] - r_v_in_time_range[0]) + r_v_in_time_range[0])
+        k_v_t = max(1, int(round(r_v_t * V)))
+        v_idx = torch.randperm(V, device=device)[:k_v_t]
+        M[:, t, v_idx] = True
     return M
 
 @torch.no_grad()
@@ -556,7 +561,7 @@ def _apply_zero_mask(x_BTV: torch.Tensor, M_BTV: torch.Tensor) -> torch.Tensor:
     y = x_BTV.clone()
     y[M_BTV] = 0.0
     return y
-# ============================================================================
+# ===========================================================================
 
 # -----------------------------
 # Loss computation & epoch runner
@@ -609,9 +614,9 @@ def run_epoch(mode:str, dl, model, brainlm, xyz_ref, cfg:TrainCfg, device, scale
         fmri_t = batch['fmri_window'].to(device, non_blocking=True)  # (B,T,V)
         B,T,V = fmri_t.shape
 
-        # === NEW: MASKING (minimal) — build union mask & zero masked entries BEFORE BrainLM ===
-        M = _make_union_time_voxel_mask(B, T, V, device=fmri_t.device)   # True = masked
-        fmri_in = _apply_zero_mask(fmri_t, M)                            # zero fill only
+        # === NEW: TIME-SPARSE MASKING — build mask & zero masked entries BEFORE BrainLM ===
+        M = _make_time_sparse_mask(B, T, V, device=fmri_t.device)    # True = masked
+        fmri_in = _apply_zero_mask(fmri_t, M)                        # zero fill only
 
         # BrainLM inputs (use masked input)
         t_pad0 = time.time()
@@ -635,7 +640,7 @@ def run_epoch(mode:str, dl, model, brainlm, xyz_ref, cfg:TrainCfg, device, scale
         # Forward + loss (unchanged loss: all positions, weight 1)
         t_fwd0 = time.time()
         with torch.amp.autocast('cuda', enabled=(cfg.amp and device.type=='cuda')):
-            recon = model(fmri_latents, fmri_T=T, fmri_V=V, xyz=xyz)         # <-- pass xyz for voxel PE
+            recon = model(fmri_latents, fmri_T=T, fmri_V=V, xyz=xyz)         # pass xyz for voxel PE
             total_loss, comps = _compute_loss_components(recon, fmri_t, cfg)
         t_fwd = time.time() - t_fwd0
 
@@ -661,13 +666,14 @@ def run_epoch(mode:str, dl, model, brainlm, xyz_ref, cfg:TrainCfg, device, scale
         if cfg.debug:
             if bidx < max(1, cfg.profile_first_n):
                 mem = fmt_mem()
-                masked_t = M[0].any(dim=1).float().mean().item()  # fraction of time rows masked
-                masked_v = M[0].any(dim=0).float().mean().item()  # fraction of voxel cols masked
+                # optional quick stats
+                touched_time_frac = M.any(dim=2).float().mean().item()
+                overall_mask_frac = M.float().mean().item()
                 print(
-                    f"[{mode}] b{bidx:04d} fetch={t_fetch:.3f}s | pad={t_pad:.3f}s | brainlm={t_blm:.3f}s | "
+                    f"[{mode}] b{bidx:04d} fetch={t_fetch:.3f}s | pad={t_pad:.3f}s | brainlm]={t_blm:.3f}s | "
                     f"fwd={t_fwd:.3f}s | bwd={t_bwd:.3f}s | step={t_step:.3f}s | total={t_tot:.3f}s | "
                     f"loss={loss_val:.6f} | gnorm={gnorm:.3f} | {mem} | "
-                    f"mask(fr_t~{masked_t:.2f}, fr_v~{masked_v:.2f}) | "
+                    f"mask(time_touched~{touched_time_frac:.2f}, overall~{overall_mask_frac:.2f}) | "
                     f"shapes: fmri={tuple(fmri_t.shape)} latents={tuple(fmri_latents.shape)}"
                 )
             elif (bidx+1) % max(1, cfg.log_every) == 0:
@@ -705,7 +711,7 @@ def run_epoch(mode:str, dl, model, brainlm, xyz_ref, cfg:TrainCfg, device, scale
     return avg
 
 # -----------------------------
-# Diagnostics (plots + CSV) — unchanged, but forward() now passes xyz
+# Diagnostics (plots + CSV) — forward() passes xyz
 # -----------------------------
 def _pearsonr_safe(a: np.ndarray, b: np.ndarray) -> float:
     a = np.asarray(a).ravel(); b = np.asarray(b).ravel()
@@ -835,8 +841,8 @@ def generate_fmri_diagnostics(
     fmri_t = batch['fmri_window'].to(device)  # (B,T,V)
     B, T, V = map(int, fmri_t.shape)
 
-    # BrainLM inputs (masked here too for consistency)
-    M = _make_union_time_voxel_mask(B, T, V, device=fmri_t.device)
+    # TIME-SPARSE MASKING before BrainLM (diagnostics mirrors training)
+    M = _make_time_sparse_mask(B, T, V, device=fmri_t.device)
     fmri_in = _apply_zero_mask(fmri_t, M)
 
     fmri_pad = pad_timepoints_for_brainlm_torch(fmri_in, patch_size=20)  # (B,Tp,V)
@@ -1124,7 +1130,7 @@ def _apply_config_defaults(parser: argparse.ArgumentParser) -> Dict[str, Any]:
 # Main
 # -----------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Reversed (decoder-first) stage-wise fMRI-only training/testing (axial RoPE + 2-D decoder) with minimal pre-BrainLM masking + voxel positional encoding + per-module checkpoints + W&B + Auto-Resume + Auto-Sweep + Diagnostics")
+    ap = argparse.ArgumentParser(description="Reversed (decoder-first) stage-wise fMRI-only training/testing (axial RoPE + 2-D decoder) with time-sparse pre-BrainLM masking + voxel positional encoding + per-module checkpoints + W&B + Auto-Resume + Auto-Sweep + Diagnostics")
     ap.add_argument("--config", type=str, default=None, help="YAML/JSON config; if YAML has sections, uses 'train'")
     ap.add_argument("--eeg_root", type=str)
     ap.add_argument("--fmri_root", type=str)
