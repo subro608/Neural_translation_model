@@ -11,23 +11,34 @@ What's included:
 - PLOTS:
     * top-K GT vs Recon
     * heatmaps of target and reconstructed fMRI (T × V)
-    * **NEW** correlation matrices (fMRI-only):
+    * correlation matrices (fMRI-only):
         - Corr(ROI×ROI) for GT
         - Corr(ROI×ROI) for Recon
         - Cross-corr GT vs Recon (ROI×ROI)
+    * **Mask heatmap** showing where patch-sparse masking was applied
+
+Updates in this version:
+- Mirrors training’s **patch-sparse** masking:
+  - Split time into patches of size PATCH_SIZE (= BrainLM temporal tokenization size).
+  - Sample a fraction of patches r_patch ~ U[0.3, 0.8].
+  - For each selected patch, sample a fraction of ROIs r_v ~ U[0.3, 0.8] and mask those ROIs
+    across the full temporal span of that patch.
+  - Mask is built once for the full session and applied per-chunk **before** BrainLM.
+- Retains all previous diagnostics/plots.
 
 Outputs:
-  <RUN_DIR>/viz_diagnostics/plots/topK_fmri_corr.png
-  <RUN_DIR>/viz_diagnostics/plots/corr_bars_fmri.png
-  <RUN_DIR>/viz_diagnostics/plots/fmri_target_heatmap.png
-  <RUN_DIR>/viz_diagnostics/plots/fmri_recon_heatmap.png
-  <RUN_DIR>/viz_diagnostics/plots/corrmat_fmri_gt.png
-  <RUN_DIR>/viz_diagnostics/plots/corrmat_fmri_recon.png
-  <RUN_DIR>/viz_diagnostics/plots/corrmat_fmri_gt_vs_recon.png
-  <RUN_DIR>/viz_diagnostics/tables/fmri_roi_diagnostics.csv
-  <RUN_DIR>/viz_diagnostics/tables/corrmat_fmri_gt.csv
-  <RUN_DIR>/viz_diagnostics/tables/corrmat_fmri_recon.csv
-  <RUN_DIR>/viz_diagnostics/tables/corrmat_fmri_gt_vs_recon.csv
+  <RUN_DIR>/viz_diagnostics_*/plots/topK_fmri_corr.png
+  <RUN_DIR>/viz_diagnostics_*/plots/corr_bars_fmri.png
+  <RUN_DIR>/viz_diagnostics_*/plots/fmri_target_heatmap.png
+  <RUN_DIR>/viz_diagnostics_*/plots/fmri_recon_heatmap.png
+  <RUN_DIR>/viz_diagnostics_*/plots/fmri_mask_heatmap.png
+  <RUN_DIR>/viz_diagnostics_*/plots/corrmat_fmri_gt.png
+  <RUN_DIR>/viz_diagnostics_*/plots/corrmat_fmri_recon.png
+  <RUN_DIR>/viz_diagnostics_*/plots/corrmat_fmri_gt_vs_recon.png
+  <RUN_DIR>/viz_diagnostics_*/tables/fmri_roi_diagnostics.csv
+  <RUN_DIR>/viz_diagnostics_*/tables/corrmat_fmri_gt.csv
+  <RUN_DIR>/viz_diagnostics_*/tables/corrmat_fmri_recon.csv
+  <RUN_DIR>/viz_diagnostics_*/tables/corrmat_fmri_gt_vs_recon.csv
 """
 
 from __future__ import annotations
@@ -66,7 +77,7 @@ PLOT_MAX_POINTS   = 1000
 MAX_LAG_TR        = 3         # search Pearson r over [-MAX_LAG_TR..+MAX_LAG_TR]
 MAKE_CALIB_PLOTS  = False     # disabled: no calibrated plots
 
-# Apply time-sparse masking before BrainLM, to mirror training
+# Apply patch-sparse masking before BrainLM, to mirror training
 APPLY_TIME_MASK   = True
 
 DEVICE            = "cuda"
@@ -78,6 +89,9 @@ BATCH_SIZE        = 1
 NUM_WORKERS       = 0
 STRIDE_SEC        = 10
 CHANNELS_LIMIT    = 34
+
+# BrainLM tokenization patch size (must match training)
+PATCH_SIZE        = 20
 
 # =========================
 # Repo paths / sys.path
@@ -197,7 +211,7 @@ def lin_calibrate(rc: np.ndarray, gt: np.ndarray) -> Tuple[float, float, np.ndar
 def save_heatmap(arr_TxV: np.ndarray, out_path: Path, title: str, tr: float,
                  cmap: str = "viridis", vlim: Optional[Tuple[float, float]] = None):
     """
-    Save a heatmap for a (T,V) array with Time on X and ROI on Y.
+    Save a heatmap for a (T, V) array with Time on X and ROI on Y.
     - arr_TxV: numpy array shaped (T, V)
     - tr: seconds per timepoint (for x-axis scaling)
     - vlim: optional (vmin, vmax) to share a color scale across plots
@@ -275,6 +289,48 @@ def save_corr_csv(C: np.ndarray, out_path: Path,
         for i in range(C.shape[0]):
             w.writerow([f"{row_prefix}{i}"] +
                        [f"{float(v):.6f}" for v in C[i]])
+
+# === PATCH-SPARSE MASKING (mirror trainer) ===============================
+@torch.no_grad()
+def _make_patch_sparse_mask(
+    B: int, T: int, V: int, device: torch.device,
+    *, patch_size: int = PATCH_SIZE,
+    r_patch_range=(0.3, 0.8),          # fraction of time patches to select
+    r_v_in_patch_range=(0.3, 0.8),     # fraction of ROIs masked within each selected patch
+) -> torch.Tensor:
+    """
+    Returns boolean mask M (B, T, V) with True = masked.
+    - Split T into patches of length patch_size (last may be shorter).
+    - Sample a fraction of patches r_patch in [0.3, 0.8].
+    - For EACH selected patch, sample r_v_patch in [0.3, 0.8] and mask that
+      fraction of ROIs across the full temporal span of that patch.
+    - Same mask for all items in the batch (simple & fast).
+    """
+    n_patches = int(math.ceil(T / float(patch_size)))
+    if n_patches <= 0:
+        return torch.zeros((B, T, V), dtype=torch.bool, device=device)
+
+    r_patch = float(torch.rand(1, device=device) * (r_patch_range[1] - r_patch_range[0]) + r_patch_range[0])
+    k_patch = max(1, int(round(r_patch * n_patches)))
+    sel_patches = torch.randperm(n_patches, device=device)[:k_patch]  # indices in [0, n_patches)
+
+    M = torch.zeros((B, T, V), dtype=torch.bool, device=device)
+    for pidx in sel_patches.tolist():
+        t_start = pidx * patch_size
+        t_end = min((pidx + 1) * patch_size, T)
+        r_v = float(torch.rand(1, device=device) * (r_v_in_patch_range[1] - r_v_in_patch_range[0]) + r_v_in_patch_range[0])
+        k_v = max(1, int(round(r_v * V)))
+        v_idx = torch.randperm(V, device=device)[:k_v]
+        M[:, t_start:t_end, v_idx] = True
+
+    return M
+
+@torch.no_grad()
+def _apply_zero_mask(x_BTV: torch.Tensor, M_BTV: torch.Tensor) -> torch.Tensor:
+    y = x_BTV.clone()
+    y[M_BTV] = 0.0
+    return y
+# =======================================================================
 
 # =========================
 # Torch load compat (match trainer)
@@ -600,6 +656,14 @@ def main():
     B, T, V = map(int, fmri_t.shape)
     print(f"[debug] full-session shapes: fmri={tuple(fmri_t.shape)} | {fmt_mem()}")
 
+    # Build a single session-wide PATCH-SPARSE mask (mirrors training)
+    if APPLY_TIME_MASK:
+        M_full = _make_patch_sparse_mask(B=B, T=T, V=V, device=device, patch_size=PATCH_SIZE)  # True = masked
+        mask_full = M_full[0].detach().cpu().numpy()  # (T,V) for visualization
+    else:
+        M_full = None
+        mask_full = np.zeros((T, V), dtype=bool)
+
     # Frozen BrainLM
     brainlm = FrozenBrainLM(Path(BRAINLM_MODEL_DIR), device)
 
@@ -629,8 +693,6 @@ def main():
     except Exception as e:
         print(f"[warn] failed to load coords: {e}; using zeros.")
 
-    # We'll compute latents chunk-by-chunk to fit GPU memory
-
     # Translator head (aligned to trainer)
     translator = TranslatorFMRISelfAttn(
         fmri_voxels=V, window_sec=WINDOW_SEC, tr=TR,
@@ -657,32 +719,22 @@ def main():
     chunk_T = max(1, int(round(WINDOW_SEC / float(TR))))
     print(f"[infer] chunked inference: WINDOW_SEC={WINDOW_SEC} → chunk_T={chunk_T} TRs, V={V}")
     recon_full = np.zeros((T, V), dtype=np.float32)
-    mask_full  = np.zeros((T, V), dtype=bool)
     with torch.no_grad():
         start = 0
         while start < T:
             end = min(T, start + chunk_T)
             seg_T = end - start
             fmri_seg = fmri_t[:, start:end, :]  # (B, seg_T, V)
-            # Optional time-sparse masking (mirror training)
-            if APPLY_TIME_MASK:
-                r_t = float(torch.rand(1, device=device) * (0.8 - 0.3) + 0.3)
-                k_t = max(1, int(round(r_t * seg_T)))
-                time_idx = torch.randperm(seg_T, device=device)[:k_t]
-                r_v = float(torch.rand(1, device=device) * (0.8 - 0.3) + 0.3)
-                k_v = max(1, int(round(r_v * V)))
-                v_idx = torch.randperm(V, device=device)[:k_v]
-                fmri_seg[:, time_idx[:, None], v_idx] = 0.0
-                # record mask for plotting
-                M_chunk = torch.zeros((seg_T, V), dtype=torch.bool, device=device)
-                M_chunk[time_idx[:, None], v_idx] = True
-                mask_full[start:end, :] = mask_full[start:end, :] | M_chunk.detach().cpu().numpy()
+            # Apply session-wide PATCH-SPARSE mask slice (mirror training)
+            if APPLY_TIME_MASK and M_full is not None:
+                fmri_seg = _apply_zero_mask(fmri_seg, M_full[:, start:end, :])
+
             # pad for BrainLM tokenization
-            fmri_pad = pad_timepoints_for_brainlm_torch(fmri_seg, patch_size=20)  # (B,Tp,V)
-            signal_vectors = fmri_pad.permute(0,2,1).contiguous()                 # (B,V,Tp)
-            fmri_latents = brainlm.extract_latents(signal_vectors, xyz)           # (L,B,Ttok,Dh)
-            recon_chunk = translator(fmri_latents, fmri_T=chunk_T, fmri_V=V)       # (B,chunk_T,V)
-            r_np = recon_chunk[0, :seg_T, :].detach().cpu().numpy()               # (seg_T, V)
+            fmri_pad = pad_timepoints_for_brainlm_torch(fmri_seg, patch_size=PATCH_SIZE)  # (B,Tp,V)
+            signal_vectors = fmri_pad.permute(0,2,1).contiguous()                         # (B,V,Tp)
+            fmri_latents = brainlm.extract_latents(signal_vectors, xyz)                   # (L,B,Ttok,Dh)
+            recon_chunk = translator(fmri_latents, fmri_T=chunk_T, fmri_V=V)              # (B,chunk_T,V)
+            r_np = recon_chunk[0, :seg_T, :].detach().cpu().numpy()                       # (seg_T, V)
             recon_full[start:end, :] = r_np
             start = end
             if torch.cuda.is_available():
@@ -717,7 +769,7 @@ def main():
         save_heatmap(
             mask_full.astype(np.float32),
             out_dir / "plots" / "fmri_mask_heatmap.png",
-            title="Applied time-sparse mask (T × V)",
+            title="Applied patch-sparse mask (T × V)",
             tr=float(TR),
             cmap="Reds",
             vlim=(0.0, 1.0),
@@ -754,7 +806,7 @@ def main():
     print(f"[summary] mean r0={r_vals.mean():.3f} | median r0={np.median(r_vals):.3f} | max r0={r_vals.max():.3f}")
     print(f"[summary] mean std(GT)={std_gt.mean():.3f} | mean std(Rec)={std_rc.mean():.3f} | frac std(Rec)<0.2 = {small_var_frac:.2f}")
 
-    # ---------- NEW: fMRI correlation matrices ----------
+    # ---------- fMRI correlation matrices ----------
     C_fmri_gt  = corr_matrix(x_true)              # (V x V)
     C_fmri_rec = corr_matrix(x_rec)               # (V x V)
     C_fmri_x   = cross_corr_matrix(x_true, x_rec) # (V x V) GT vs Recon
@@ -804,7 +856,6 @@ def main():
             if APPLY_TIME_MASK:
                 m = mask_full[:, roi].astype(bool)
                 if m.any():
-                    # find contiguous segments
                     idx = np.where(m)[0]
                     s = None
                     for i in range(len(idx)):
@@ -820,51 +871,6 @@ def main():
         fig.tight_layout()
         fig.savefig(out_dir / "plots" / "topK_fmri_corr.png", dpi=150)
         plt.close(fig)
-
-    # Zoomed plots over masked regions (separate GT and Recon), for top-K ROIs
-    if APPLY_TIME_MASK and len(top) > 0:
-        zoom_dir = out_dir / "plots" / "masked_zoom"
-        zoom_dir.mkdir(parents=True, exist_ok=True)
-        ZOOM_MAX_SEGS_PER_ROI = 5
-        for roi, r in top:
-            m = mask_full[:, roi].astype(bool)
-            if not m.any():
-                continue
-            idx = np.where(m)[0]
-            # find contiguous segments of masked TRs
-            segments = []
-            s = None
-            for i in range(len(idx)):
-                if s is None:
-                    s = idx[i]
-                if i == len(idx)-1 or idx[i+1] != idx[i] + 1:
-                    e = idx[i]
-                    segments.append((int(s), int(e)))
-                    s = None
-            # limit number of segments per ROI
-            segments = segments[:ZOOM_MAX_SEGS_PER_ROI]
-            for si, (s_idx, e_idx) in enumerate(segments, 1):
-                t_seg = np.arange(s_idx, e_idx+1) * float(TR)
-                gt_seg = x_true[s_idx:e_idx+1, roi]
-                rc_seg = x_rec[s_idx:e_idx+1, roi]
-                # GT only
-                plt.figure(figsize=(8, 3))
-                plt.plot(t_seg, gt_seg, label="GT", color="#1f77b4")
-                plt.title(f"ROI {roi} — Masked segment {si} (GT)")
-                plt.xlabel("Time (s)"); plt.ylabel("Z-score")
-                plt.tight_layout()
-                plt.savefig(zoom_dir / f"roi{roi:03d}_seg{si:02d}_gt.png", dpi=150)
-                plt.close()
-                # Recon only
-                plt.figure(figsize=(8, 3))
-                plt.plot(t_seg, rc_seg, label="Recon", color="#d62728")
-                plt.title(f"ROI {roi} — Masked segment {si} (Recon)")
-                plt.xlabel("Time (s)"); plt.ylabel("Z-score")
-                plt.tight_layout()
-                plt.savefig(zoom_dir / f"roi{roi:03d}_seg{si:02d}_recon.png", dpi=150)
-                plt.close()
-
-    # (calibrated plots removed)
 
     # Bar chart (all ROIs, raw r)
     all_roi = [roi for roi,_ in rs]

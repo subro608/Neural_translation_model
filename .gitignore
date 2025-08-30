@@ -22,6 +22,7 @@ translator_sweep_runs_viz_20aug_reverse/
 translator_sweep_runs_viz_20aug_reverse_100epoch_sweep/
 translator_sweep_runs_viz_20aug_reverse_100epoch_sweep_stage1/
 All_visualizations/
+28_aug_allstages_comparison_reverse_mse5e5_voxelpe_masked/
 ## Python/OS
 __pycache__/
 *.pyc
