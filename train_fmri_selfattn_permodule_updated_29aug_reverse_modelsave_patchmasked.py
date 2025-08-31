@@ -224,20 +224,37 @@ class FrozenBrainLM(nn.Module):
         super().__init__()
         cfg_path = model_dir / "config.json"
         w_path   = model_dir / "pytorch_model.bin"
+
+        # Load config + construct model
         with open(cfg_path, "r") as f:
             cfg = BrainLMConfig(**json.load(f))
         self.model = BrainLMForPretraining(cfg)
+
+        # ⚠️ FORCE-OFF internal MAE masking (we only want your pre-BrainLM patch masking)
+        self.model.config.mask_ratio = 0.0
+        if hasattr(self.model, "vit") and hasattr(self.model.vit, "embeddings"):
+            # some checkpoints read mask_ratio from embeddings at runtime
+            self.model.vit.embeddings.mask_ratio = 0.0
+
+        # Load weights (compat with new/old torch)
         try:
             ckpt = _torch_load_compat(w_path, map_location=device, allow_weights_only=True)
-            self.model.load_state_dict(ckpt, strict=False)
-        except Exception as e:
-            raise RuntimeError(f"Failed to load BrainLM: {e}")
+        except NameError:
+            # fallback if helper isn't in this file
+            ckpt = torch.load(str(w_path), map_location=device)
+        self.model.load_state_dict(ckpt, strict=False)
+
+        # Freeze + eval
         self.model.eval()
-        for p in self.model.parameters(): p.requires_grad = False
-        self.to(device); self.device = device
+        for p in self.model.parameters():
+            p.requires_grad = False
+
+        self.to(device)
+        self.device = device
 
     @property
     def n_layers_out(self) -> int:
+        # encoder hidden_states includes the input + N layers
         return int(getattr(self.model.config, "num_hidden_layers", 4)) + 1
 
     @property
@@ -246,11 +263,48 @@ class FrozenBrainLM(nn.Module):
 
     @torch.no_grad()
     def extract_latents(self, signal_vectors: torch.Tensor, xyz_vectors: torch.Tensor) -> torch.Tensor:
+        """
+        signal_vectors: (B, V, Tp)   — fMRI per-ROI 20-TR patch signals (padded)
+        xyz_vectors:    (B, V, 3)    — ROI coords
+        returns: stacked encoder hidden_states -> (L, B, N, D)
+        """
+        # Embeddings (no internal MAE masking; mask should be all-zero/None)
         embeddings, mask, ids_restore = self.model.vit.embeddings(
             signal_vectors=signal_vectors, xyz_vectors=xyz_vectors, noise=None
         )
-        enc = self.model.vit.encoder(hidden_states=embeddings, output_hidden_states=True, return_dict=True)
-        return torch.stack(list(enc.hidden_states), dim=0)  # (L,B,Ttok,Dh)
+
+        # --- Sanity checks (helpful when debugging tokenization/masking) ---
+        B, V, Tp = signal_vectors.shape
+        # try to read temporal patch size from config; fallback to 20
+        tpatch = (
+            getattr(self.model.config, "temporal_patch_size", None)
+            or getattr(self.model.config, "time_patch_size", None)
+            or getattr(self.model.config, "patch_size", None)
+            or 20
+        )
+        Ttok = int(math.ceil(Tp / float(tpatch)))  # temporal tokens per ROI
+        N = embeddings.shape[1]
+
+        # Some variants add a CLS token -> N == V*Ttok + 1; others do not -> N == V*Ttok
+        if N not in (V * Ttok, V * Ttok + 1):
+            print(f"[FrozenBrainLM][WARN] unexpected token count: N={N}, expected ~{V*Ttok} or {V*Ttok+1} "
+                  f"(V={V}, Tp={Tp}, tpatch={tpatch}, Ttok={Ttok})")
+
+        if mask is not None:
+            nz = int(torch.count_nonzero(mask).item())
+            if nz != 0:
+                print(f"[FrozenBrainLM][WARN] embeddings returned a nonzero mask (sum={nz}). "
+                      f"Ensure mask_ratio=0.0 was applied.")
+
+        # Encoder (return all hidden states)
+        enc = self.model.vit.encoder(
+            hidden_states=embeddings,
+            output_hidden_states=True,
+            return_dict=True
+        )
+        # Shape: hidden_states[i] is (B, N, D). Stack -> (L, B, N, D)
+        return torch.stack(list(enc.hidden_states), dim=0)
+
 
 # -----------------------------
 # Translator (fMRI-only, axial-RoPE self-attn)
