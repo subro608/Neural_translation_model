@@ -219,30 +219,50 @@ class TrainCfg:
 # -----------------------------
 # Frozen BrainLM
 # -----------------------------
+# -----------------------------
+# Frozen BrainLM
+# -----------------------------
 class FrozenBrainLM(nn.Module):
-    def __init__(self, model_dir: Path, device: torch.device):
+    def __init__(self, model_dir: Path, device: torch.device, verbose: bool = False):
         super().__init__()
+        self.verbose = bool(verbose)
+
         cfg_path = model_dir / "config.json"
         w_path   = model_dir / "pytorch_model.bin"
-
-        # Load config + construct model
         with open(cfg_path, "r") as f:
             cfg = BrainLMConfig(**json.load(f))
         self.model = BrainLMForPretraining(cfg)
 
-        # ⚠️ FORCE-OFF internal MAE masking (we only want your pre-BrainLM patch masking)
+        # Force-off internal MAE masking
         self.model.config.mask_ratio = 0.0
         if hasattr(self.model, "vit") and hasattr(self.model.vit, "embeddings"):
-            # some checkpoints read mask_ratio from embeddings at runtime
             self.model.vit.embeddings.mask_ratio = 0.0
 
         # Load weights (compat with new/old torch)
         try:
             ckpt = _torch_load_compat(w_path, map_location=device, allow_weights_only=True)
         except NameError:
-            # fallback if helper isn't in this file
             ckpt = torch.load(str(w_path), map_location=device)
         self.model.load_state_dict(ckpt, strict=False)
+
+        # Infer time patch size robustly (default to 20 TR)
+        def _infer_time_patch_size(model) -> int:
+            cand_objs = [getattr(model.vit, "embeddings", None), getattr(model, "config", None)]
+            cand_names = ["temporal_patch_size", "time_patch_size", "t_patch_size", "patch_size_time"]
+            for obj in cand_objs:
+                for name in cand_names:
+                    if obj is not None and hasattr(obj, name):
+                        try:
+                            val = int(getattr(obj, name))
+                            if val > 0:
+                                return val
+                        except Exception:
+                            pass
+            return 20
+
+        self.time_patch_size = _infer_time_patch_size(self.model)
+        if self.verbose:
+            print(f"[FrozenBrainLM] Using time_patch_size={self.time_patch_size}")
 
         # Freeze + eval
         self.model.eval()
@@ -254,7 +274,6 @@ class FrozenBrainLM(nn.Module):
 
     @property
     def n_layers_out(self) -> int:
-        # encoder hidden_states includes the input + N layers
         return int(getattr(self.model.config, "num_hidden_layers", 4)) + 1
 
     @property
@@ -263,46 +282,25 @@ class FrozenBrainLM(nn.Module):
 
     @torch.no_grad()
     def extract_latents(self, signal_vectors: torch.Tensor, xyz_vectors: torch.Tensor) -> torch.Tensor:
-        """
-        signal_vectors: (B, V, Tp)   — fMRI per-ROI 20-TR patch signals (padded)
-        xyz_vectors:    (B, V, 3)    — ROI coords
-        returns: stacked encoder hidden_states -> (L, B, N, D)
-        """
-        # Embeddings (no internal MAE masking; mask should be all-zero/None)
         embeddings, mask, ids_restore = self.model.vit.embeddings(
             signal_vectors=signal_vectors, xyz_vectors=xyz_vectors, noise=None
         )
 
-        # --- Sanity checks (helpful when debugging tokenization/masking) ---
         B, V, Tp = signal_vectors.shape
-        # try to read temporal patch size from config; fallback to 20
-        tpatch = (
-            getattr(self.model.config, "temporal_patch_size", None)
-            or getattr(self.model.config, "time_patch_size", None)
-            or getattr(self.model.config, "patch_size", None)
-            or 20
-        )
-        Ttok = int(math.ceil(Tp / float(tpatch)))  # temporal tokens per ROI
+        tpatch = int(self.time_patch_size)
+        Ttok = int(math.ceil(Tp / float(tpatch)))
         N = embeddings.shape[1]
 
-        # Some variants add a CLS token -> N == V*Ttok + 1; others do not -> N == V*Ttok
-        if N not in (V * Ttok, V * Ttok + 1):
+        # Only log if verbose
+        if self.verbose and N not in (V * Ttok, V * Ttok + 1):
             print(f"[FrozenBrainLM][WARN] unexpected token count: N={N}, expected ~{V*Ttok} or {V*Ttok+1} "
                   f"(V={V}, Tp={Tp}, tpatch={tpatch}, Ttok={Ttok})")
-
-        if mask is not None:
+        if self.verbose and (mask is not None):
             nz = int(torch.count_nonzero(mask).item())
             if nz != 0:
-                print(f"[FrozenBrainLM][WARN] embeddings returned a nonzero mask (sum={nz}). "
-                      f"Ensure mask_ratio=0.0 was applied.")
+                print(f"[FrozenBrainLM][WARN] embeddings returned a nonzero mask (sum={nz}).")
 
-        # Encoder (return all hidden states)
-        enc = self.model.vit.encoder(
-            hidden_states=embeddings,
-            output_hidden_states=True,
-            return_dict=True
-        )
-        # Shape: hidden_states[i] is (B, N, D). Stack -> (L, B, N, D)
+        enc = self.model.vit.encoder(hidden_states=embeddings, output_hidden_states=True, return_dict=True)
         return torch.stack(list(enc.hidden_states), dim=0)
 
 
@@ -687,7 +685,8 @@ def run_epoch(mode:str, dl, model, brainlm, xyz_ref, cfg: TrainCfg, device, scal
 
         # BrainLM inputs (use masked input)
         t_pad0 = time.time()
-        fmri_pad = pad_timepoints_for_brainlm_torch(fmri_in, patch_size=20)  # (B,Tp,V)
+        fmri_pad = pad_timepoints_for_brainlm_torch(fmri_in, patch_size=int(brainlm.time_patch_size))
+        # fmri_pad = pad_timepoints_for_brainlm_torch(fmri_in, patch_size=20)  # (B,Tp,V)
         signal_vectors = fmri_pad.permute(0,2,1).contiguous()                # (B,V,Tp)
         if xyz_ref is not None and V == cfg.fmri_voxels:
             xyz = xyz_ref.unsqueeze(0).repeat(B,1,1)                         # (B,V,3)
@@ -911,8 +910,8 @@ def generate_fmri_diagnostics(
     # PATCH-SPARSE MASKING before BrainLM (diagnostics mirrors training)
     M = _make_patch_sparse_mask(B, T, V, device=fmri_t.device, patch_size=20)
     fmri_in = _apply_zero_mask(fmri_t, M)
-
-    fmri_pad = pad_timepoints_for_brainlm_torch(fmri_in, patch_size=20)  # (B,Tp,V)
+    fmri_pad = pad_timepoints_for_brainlm_torch(fmri_in, patch_size=int(brainlm.time_patch_size))
+    # fmri_pad = pad_timepoints_for_brainlm_torch(fmri_in, patch_size=20)  # (B,Tp,V)
     signal_vectors = fmri_pad.permute(0,2,1).contiguous()               # (B,V,Tp)
     if xyz_ref is not None and V == cfg.fmri_voxels:
         xyz = xyz_ref.unsqueeze(0).repeat(B,1,1)                         # (B,V,3)
@@ -1035,7 +1034,8 @@ def _train_once_for_cfg(base_cfg: TrainCfg, stage: int, *, trial_name: str,
     _ensure_dirs(cfg.out_dir)
 
     dl_train, dl_val, _ = make_dataloaders(cfg, device)
-    brainlm = FrozenBrainLM(cfg.brainlm_model_dir, device)
+    brainlm = FrozenBrainLM(cfg.brainlm_model_dir, device, verbose=bool(cfg.debug))
+
     translator = TranslatorFMRISelfAttn(cfg, fmri_n_layers=brainlm.n_layers_out, fmri_hidden_size=brainlm.hidden_size).to(device)
     xyz_ref = cache_a424_xyz(device)
     scaler = torch.amp.GradScaler('cuda', enabled=(cfg.amp and device.type=='cuda'))
@@ -1410,7 +1410,8 @@ def main():
     dl_train, dl_val, dl_test = make_dataloaders(cfg, device)
 
     # Models
-    brainlm = FrozenBrainLM(cfg.brainlm_model_dir, device)
+    brainlm = FrozenBrainLM(cfg.brainlm_model_dir, device, verbose=bool(cfg.debug))
+
     translator = TranslatorFMRISelfAttn(cfg, fmri_n_layers=brainlm.n_layers_out, fmri_hidden_size=brainlm.hidden_size).to(device)
     xyz_ref = cache_a424_xyz(device)
     scaler = torch.amp.GradScaler('cuda', enabled=(cfg.amp and device.type=='cuda'))
