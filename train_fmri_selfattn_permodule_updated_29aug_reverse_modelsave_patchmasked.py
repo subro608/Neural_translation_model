@@ -247,17 +247,6 @@ class FrozenBrainLM(nn.Module):
 
         # Infer time patch size robustly (default to 20 TR)
         def _infer_time_patch_size(model) -> int:
-            cand_objs = [getattr(model.vit, "embeddings", None), getattr(model, "config", None)]
-            cand_names = ["temporal_patch_size", "time_patch_size", "t_patch_size", "patch_size_time"]
-            for obj in cand_objs:
-                for name in cand_names:
-                    if obj is not None and hasattr(obj, name):
-                        try:
-                            val = int(getattr(obj, name))
-                            if val > 0:
-                                return val
-                        except Exception:
-                            pass
             return 20
 
         self.time_patch_size = _infer_time_patch_size(self.model)

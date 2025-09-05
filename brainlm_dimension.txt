@@ -1,0 +1,200 @@
+[env] torch=2.6.0+cu124 | cuda_avail=True | device=cuda
+[env] GPU: NVIDIA GeForce RTX 3060 Laptop GPU
+[env] python=3.12.8 | platform=Windows-11-10.0.26100-SP0
+[select] Using session: sub=1 task=task001 run=1
+[load] fMRI parcels loaded: (T=170, V=424) | cuda: alloc=0.0MB, reserv=0.0MB
+[shape] fmri_window (B,T,V)              = (1, 20, 424) | torch.float32 | cuda:0
+[shape] pad_timepoints (B,Tp,V)          = (1, 20, 424) | torch.float32 | cuda:0
+[tokenization] TR=2.0s | WINDOW_TR=20 | Tp(after pad)=20 | PATCH=20 -> Ttok=1 per ROI
+[shape] signal_vectors (B,V,Tp)          = (1, 424, 20) | torch.float32 | cuda:0
+[coords] loaded A424 coords from: D:\Neuroinformatics_research_2025\Multi_modal_NTM\BrainLM\resources\atlases\A424_Coordinates.dat
+[shape] xyz_vectors (B,V,3)              = (1, 424, 3) | torch.float32 | cuda:0
+[BrainLM] loaded. hidden_size=256, num_hidden_layers=4 | cuda: alloc=58.6MB, reserv=60.0MB
+[shape] embeddings (B,N,D)               = (1, 425, 256) | torch.float32 | cuda:0
+[shape] mask                             = (1, 424) | torch.float32 | cuda:0
+[shape] ids_restore                      = (1, 424) | torch.int64 | cuda:0
+[timing] embeddings: 0.311s | cuda: alloc=67.1MB, reserv=82.0MB
+[tokens] V=424, Ttok=1 => expected ~424 tokens; got N=425
+[encoder] layers (including input) = 5
+[shape] encoder.hidden_states[0]         = (1, 425, 256) | torch.float32 | cuda:0
+[shape] encoder.hidden_states[1]         = (1, 425, 256) | torch.float32 | cuda:0
+[shape] encoder.hidden_states[2]         = (1, 425, 256) | torch.float32 | cuda:0
+[shape] encoder.hidden_states[3]         = (1, 425, 256) | torch.float32 | cuda:0
+[shape] encoder.hidden_states[4]         = (1, 425, 256) | torch.float32 | cuda:0
+[shape] encoder.last_hidden_state (final) = (1, 425, 256) | torch.float32 | cuda:0
+[timing] encoder: 0.083s | total elapsed: 0.979s | cuda: alloc=68.8MB, reserv=86.0MB
+
+[done] BrainLM shape-debug complete.
+
+[trace] Registering hooks for full model forward (encoder + decoder)...
+[hook-pre] 0000:vit.embeddings.signal_embedding_projection IN  (1, 424, 1, 20)
+[hook-post]0001:vit.embeddings.signal_embedding_projection OUT (1, 424, 1, 256)
+[hook-pre] 0002:vit.embeddings.xyz_embedding_projection IN  (1, 424, 3)
+[hook-post]0003:vit.embeddings.xyz_embedding_projection OUT (1, 424, 256)
+[hook-pre] 0004:vit.embeddings.pos_embedding.dropout IN  (1, 424, 1, 256)
+[hook-post]0005:vit.embeddings.pos_embedding.dropout OUT (1, 424, 1, 256)
+[hook-pre] 0006:vit.encoder.layer.0 IN  (1, 425, 256)
+[hook-pre] 0007:vit.encoder.layer.0.attention.self.query IN  (1, 425, 256)
+[hook-post]0008:vit.encoder.layer.0.attention.self.query OUT (1, 425, 256)
+[hook-pre] 0009:vit.encoder.layer.0.attention.self.key IN  (1, 425, 256)
+[hook-post]0010:vit.encoder.layer.0.attention.self.key OUT (1, 425, 256)
+[hook-pre] 0011:vit.encoder.layer.0.attention.self.value IN  (1, 425, 256)
+[hook-post]0012:vit.encoder.layer.0.attention.self.value OUT (1, 425, 256)
+[hook-pre] 0013:vit.encoder.layer.0.attention.output.dense IN  (1, 425, 256)
+[hook-post]0014:vit.encoder.layer.0.attention.output.dense OUT (1, 425, 256)
+[hook-pre] 0015:vit.encoder.layer.0.attention.output.dropout IN  (1, 425, 256)
+[hook-post]0016:vit.encoder.layer.0.attention.output.dropout OUT (1, 425, 256)
+[hook-pre] 0017:vit.encoder.layer.0.attention.output.LayerNorm IN  (1, 425, 256)
+[hook-post]0018:vit.encoder.layer.0.attention.output.LayerNorm OUT (1, 425, 256)
+[hook-pre] 0019:vit.encoder.layer.0.intermediate.dense IN  (1, 425, 256)
+[hook-post]0020:vit.encoder.layer.0.intermediate.dense OUT (1, 425, 1024)
+[hook-pre] 0021:vit.encoder.layer.0.output.dense IN  (1, 425, 1024)
+[hook-post]0022:vit.encoder.layer.0.output.dense OUT (1, 425, 256)
+[hook-pre] 0023:vit.encoder.layer.0.output.dropout IN  (1, 425, 256)
+[hook-post]0024:vit.encoder.layer.0.output.dropout OUT (1, 425, 256)
+[hook-pre] 0025:vit.encoder.layer.0.output.LayerNorm IN  (1, 425, 256)
+[hook-post]0026:vit.encoder.layer.0.output.LayerNorm OUT (1, 425, 256)
+[hook-post]0027:vit.encoder.layer.0 OUT [(1, 425, 256)]
+[hook-pre] 0028:vit.encoder.layer.1 IN  (1, 425, 256)
+[hook-pre] 0029:vit.encoder.layer.1.attention.self.query IN  (1, 425, 256)
+[hook-post]0030:vit.encoder.layer.1.attention.self.query OUT (1, 425, 256)
+[hook-pre] 0031:vit.encoder.layer.1.attention.self.key IN  (1, 425, 256)
+[hook-post]0032:vit.encoder.layer.1.attention.self.key OUT (1, 425, 256)
+[hook-pre] 0033:vit.encoder.layer.1.attention.self.value IN  (1, 425, 256)
+[hook-post]0034:vit.encoder.layer.1.attention.self.value OUT (1, 425, 256)
+[hook-pre] 0035:vit.encoder.layer.1.attention.output.dense IN  (1, 425, 256)
+[hook-post]0036:vit.encoder.layer.1.attention.output.dense OUT (1, 425, 256)
+[hook-pre] 0037:vit.encoder.layer.1.attention.output.dropout IN  (1, 425, 256)
+[hook-post]0038:vit.encoder.layer.1.attention.output.dropout OUT (1, 425, 256)
+[hook-pre] 0039:vit.encoder.layer.1.attention.output.LayerNorm IN  (1, 425, 256)
+[hook-post]0040:vit.encoder.layer.1.attention.output.LayerNorm OUT (1, 425, 256)
+[hook-pre] 0041:vit.encoder.layer.1.intermediate.dense IN  (1, 425, 256)
+[hook-post]0042:vit.encoder.layer.1.intermediate.dense OUT (1, 425, 1024)
+[hook-pre] 0043:vit.encoder.layer.1.output.dense IN  (1, 425, 1024)
+[hook-post]0044:vit.encoder.layer.1.output.dense OUT (1, 425, 256)
+[hook-pre] 0045:vit.encoder.layer.1.output.dropout IN  (1, 425, 256)
+[hook-post]0046:vit.encoder.layer.1.output.dropout OUT (1, 425, 256)
+[hook-pre] 0047:vit.encoder.layer.1.output.LayerNorm IN  (1, 425, 256)
+[hook-post]0048:vit.encoder.layer.1.output.LayerNorm OUT (1, 425, 256)
+[hook-post]0049:vit.encoder.layer.1 OUT [(1, 425, 256)]
+[hook-pre] 0050:vit.encoder.layer.2 IN  (1, 425, 256)
+[hook-pre] 0051:vit.encoder.layer.2.attention.self.query IN  (1, 425, 256)
+[hook-post]0052:vit.encoder.layer.2.attention.self.query OUT (1, 425, 256)
+[hook-pre] 0053:vit.encoder.layer.2.attention.self.key IN  (1, 425, 256)
+[hook-post]0054:vit.encoder.layer.2.attention.self.key OUT (1, 425, 256)
+[hook-pre] 0055:vit.encoder.layer.2.attention.self.value IN  (1, 425, 256)
+[hook-post]0056:vit.encoder.layer.2.attention.self.value OUT (1, 425, 256)
+[hook-pre] 0057:vit.encoder.layer.2.attention.output.dense IN  (1, 425, 256)
+[hook-post]0058:vit.encoder.layer.2.attention.output.dense OUT (1, 425, 256)
+[hook-pre] 0059:vit.encoder.layer.2.attention.output.dropout IN  (1, 425, 256)
+[hook-post]0060:vit.encoder.layer.2.attention.output.dropout OUT (1, 425, 256)
+[hook-pre] 0061:vit.encoder.layer.2.attention.output.LayerNorm IN  (1, 425, 256)
+[hook-post]0062:vit.encoder.layer.2.attention.output.LayerNorm OUT (1, 425, 256)
+[hook-pre] 0063:vit.encoder.layer.2.intermediate.dense IN  (1, 425, 256)
+[hook-post]0064:vit.encoder.layer.2.intermediate.dense OUT (1, 425, 1024)
+[hook-pre] 0065:vit.encoder.layer.2.output.dense IN  (1, 425, 1024)
+[hook-post]0066:vit.encoder.layer.2.output.dense OUT (1, 425, 256)
+[hook-pre] 0067:vit.encoder.layer.2.output.dropout IN  (1, 425, 256)
+[hook-post]0068:vit.encoder.layer.2.output.dropout OUT (1, 425, 256)
+[hook-pre] 0069:vit.encoder.layer.2.output.LayerNorm IN  (1, 425, 256)
+[hook-post]0070:vit.encoder.layer.2.output.LayerNorm OUT (1, 425, 256)
+[hook-post]0071:vit.encoder.layer.2 OUT [(1, 425, 256)]
+[hook-pre] 0072:vit.encoder.layer.3 IN  (1, 425, 256)
+[hook-pre] 0073:vit.encoder.layer.3.attention.self.query IN  (1, 425, 256)
+[hook-post]0074:vit.encoder.layer.3.attention.self.query OUT (1, 425, 256)
+[hook-pre] 0075:vit.encoder.layer.3.attention.self.key IN  (1, 425, 256)
+[hook-post]0076:vit.encoder.layer.3.attention.self.key OUT (1, 425, 256)
+[hook-pre] 0077:vit.encoder.layer.3.attention.self.value IN  (1, 425, 256)
+[hook-post]0078:vit.encoder.layer.3.attention.self.value OUT (1, 425, 256)
+[hook-pre] 0079:vit.encoder.layer.3.attention.output.dense IN  (1, 425, 256)
+[hook-post]0080:vit.encoder.layer.3.attention.output.dense OUT (1, 425, 256)
+[hook-pre] 0081:vit.encoder.layer.3.attention.output.dropout IN  (1, 425, 256)
+[hook-post]0082:vit.encoder.layer.3.attention.output.dropout OUT (1, 425, 256)
+[hook-pre] 0083:vit.encoder.layer.3.attention.output.LayerNorm IN  (1, 425, 256)
+[hook-post]0084:vit.encoder.layer.3.attention.output.LayerNorm OUT (1, 425, 256)
+[hook-pre] 0085:vit.encoder.layer.3.intermediate.dense IN  (1, 425, 256)
+[hook-post]0086:vit.encoder.layer.3.intermediate.dense OUT (1, 425, 1024)
+[hook-pre] 0087:vit.encoder.layer.3.output.dense IN  (1, 425, 1024)
+[hook-post]0088:vit.encoder.layer.3.output.dense OUT (1, 425, 256)
+[hook-pre] 0089:vit.encoder.layer.3.output.dropout IN  (1, 425, 256)
+[hook-post]0090:vit.encoder.layer.3.output.dropout OUT (1, 425, 256)
+[hook-pre] 0091:vit.encoder.layer.3.output.LayerNorm IN  (1, 425, 256)
+[hook-post]0092:vit.encoder.layer.3.output.LayerNorm OUT (1, 425, 256)
+[hook-post]0093:vit.encoder.layer.3 OUT [(1, 425, 256)]
+[hook-pre] 0094:vit.layernorm IN  (1, 425, 256)
+[hook-post]0095:vit.layernorm OUT (1, 425, 256)
+[hook-pre] 0000:decoder.decoder_embed IN  (1, 425, 256)
+[hook-post]0001:decoder.decoder_embed OUT (1, 425, 256)
+[hook-pre] 0002:decoder.decoder_xyz_projection IN  (1, 424, 3)
+[hook-post]0003:decoder.decoder_xyz_projection OUT (1, 424, 256)
+[hook-pre] 0004:decoder.pos_embedding.dropout IN  (1, 424, 1, 256)
+[hook-post]0005:decoder.pos_embedding.dropout OUT (1, 424, 1, 256)
+[hook-pre] 0006:decoder.decoder_layers.0 IN  (1, 425, 256)
+[hook-pre] 0007:decoder.decoder_layers.0.attention.self.query IN  (1, 425, 256)
+[hook-post]0008:decoder.decoder_layers.0.attention.self.query OUT (1, 425, 256)
+[hook-pre] 0009:decoder.decoder_layers.0.attention.self.key IN  (1, 425, 256)
+[hook-post]0010:decoder.decoder_layers.0.attention.self.key OUT (1, 425, 256)
+[hook-pre] 0011:decoder.decoder_layers.0.attention.self.value IN  (1, 425, 256)
+[hook-post]0012:decoder.decoder_layers.0.attention.self.value OUT (1, 425, 256)
+[hook-pre] 0013:decoder.decoder_layers.0.attention.output.dense IN  (1, 425, 256)
+[hook-post]0014:decoder.decoder_layers.0.attention.output.dense OUT (1, 425, 256)
+[hook-pre] 0015:decoder.decoder_layers.0.attention.output.dropout IN  (1, 425, 256)
+[hook-post]0016:decoder.decoder_layers.0.attention.output.dropout OUT (1, 425, 256)
+[hook-pre] 0017:decoder.decoder_layers.0.attention.output.LayerNorm IN  (1, 425, 256)
+[hook-post]0018:decoder.decoder_layers.0.attention.output.LayerNorm OUT (1, 425, 256)
+[hook-pre] 0019:decoder.decoder_layers.0.intermediate.dense IN  (1, 425, 256)
+[hook-post]0020:decoder.decoder_layers.0.intermediate.dense OUT (1, 425, 1024)
+[hook-pre] 0021:decoder.decoder_layers.0.output.dense IN  (1, 425, 1024)
+[hook-post]0022:decoder.decoder_layers.0.output.dense OUT (1, 425, 256)
+[hook-pre] 0023:decoder.decoder_layers.0.output.dropout IN  (1, 425, 256)
+[hook-post]0024:decoder.decoder_layers.0.output.dropout OUT (1, 425, 256)
+[hook-pre] 0025:decoder.decoder_layers.0.output.LayerNorm IN  (1, 425, 256)
+[hook-post]0026:decoder.decoder_layers.0.output.LayerNorm OUT (1, 425, 256)
+[hook-post]0027:decoder.decoder_layers.0 OUT [(1, 425, 256)]
+[hook-pre] 0028:decoder.decoder_layers.1 IN  (1, 425, 256)
+[hook-pre] 0029:decoder.decoder_layers.1.attention.self.query IN  (1, 425, 256)
+[hook-post]0030:decoder.decoder_layers.1.attention.self.query OUT (1, 425, 256)
+[hook-pre] 0031:decoder.decoder_layers.1.attention.self.key IN  (1, 425, 256)
+[hook-post]0032:decoder.decoder_layers.1.attention.self.key OUT (1, 425, 256)
+[hook-pre] 0033:decoder.decoder_layers.1.attention.self.value IN  (1, 425, 256)
+[hook-post]0034:decoder.decoder_layers.1.attention.self.value OUT (1, 425, 256)
+[hook-pre] 0035:decoder.decoder_layers.1.attention.output.dense IN  (1, 425, 256)
+[hook-post]0036:decoder.decoder_layers.1.attention.output.dense OUT (1, 425, 256)
+[hook-pre] 0037:decoder.decoder_layers.1.attention.output.dropout IN  (1, 425, 256)
+[hook-post]0038:decoder.decoder_layers.1.attention.output.dropout OUT (1, 425, 256)
+[hook-pre] 0039:decoder.decoder_layers.1.attention.output.LayerNorm IN  (1, 425, 256)
+[hook-post]0040:decoder.decoder_layers.1.attention.output.LayerNorm OUT (1, 425, 256)
+[hook-pre] 0041:decoder.decoder_layers.1.intermediate.dense IN  (1, 425, 256)
+[hook-post]0042:decoder.decoder_layers.1.intermediate.dense OUT (1, 425, 1024)
+[hook-pre] 0043:decoder.decoder_layers.1.output.dense IN  (1, 425, 1024)
+[hook-post]0044:decoder.decoder_layers.1.output.dense OUT (1, 425, 256)
+[hook-pre] 0045:decoder.decoder_layers.1.output.dropout IN  (1, 425, 256)
+[hook-post]0046:decoder.decoder_layers.1.output.dropout OUT (1, 425, 256)
+[hook-pre] 0047:decoder.decoder_layers.1.output.LayerNorm IN  (1, 425, 256)
+[hook-post]0048:decoder.decoder_layers.1.output.LayerNorm OUT (1, 425, 256)
+[hook-post]0049:decoder.decoder_layers.1 OUT [(1, 425, 256)]
+[hook-pre] 0050:decoder.decoder_norm IN  (1, 425, 256)
+[hook-post]0051:decoder.decoder_norm OUT (1, 425, 256)
+[hook-pre] 0052:decoder.decoder_pred1 IN  (1, 425, 256)
+[hook-post]0053:decoder.decoder_pred1 OUT (1, 425, 128)
+[hook-pre] 0054:decoder.decoder_pred2 IN  (1, 425, 128)
+[hook-post]0055:decoder.decoder_pred2 OUT (1, 425, 20)
+[shape] pretraining.logits (B,V,Ttok_patch) = (1, 424, 1, 20) | torch.float32 | cuda:0
+[shape] pretraining.latent (B,N,D)       = (1, 425, 256) | torch.float32 | cuda:0
+[shape] pretraining.mask (B,seq)         = (1, 424, 1) | torch.float32 | cuda:0
+[trace] encoder hidden_states len = 5
+[timing] full-model forward: 0.099s | cuda: alloc=71.3MB, reserv=90.0MB
+[trace] Hooks removed.
+
+
+[first 10 rows (roi_idx, x, y, z)]:
+000     +0.152174       -0.847826       +0.043478
+001     +0.478261       -0.695652       +0.043478
+002     +0.195652       -0.826087       +0.347826
+003     +0.108696       -0.804348       +0.000000
+004     +0.195652       -1.000000       +0.173913
+005     +0.369565       -0.934783       +0.021739
+006     +0.347826       -0.782609       -0.152174
+007     +0.347826       -0.239130       +0.608696
+008     +0.434783       -0.260870       +0.565217
+009     +0.456522       -0.043478       +0.543478

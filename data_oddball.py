@@ -136,10 +136,10 @@ def extract_a424_from_native(bold_path: str, atlas_path: str) -> Tuple[np.ndarra
     bold_img = nib.load(bold_path)
     bold_data = bold_img.get_fdata()  # (X,Y,Z,T)
     atlas_img = nib.load(atlas_path)
-    try:
-        atlas_resampled = resample_to_img(atlas_img, bold_img, interpolation='nearest', force_resample=True, copy_header=True)
-    except TypeError:
-        atlas_resampled = resample_to_img(atlas_img, bold_img, interpolation='nearest')
+    # try:
+    #     atlas_resampled = resample_to_img(atlas_img, bold_img, interpolation='nearest', force_resample=True, copy_header=True)
+    # except TypeError:
+    atlas_resampled = resample_to_img(atlas_img, bold_img, interpolation='nearest')
 
     atlas_data = atlas_resampled.get_fdata()  # (X,Y,Z)
     T = bold_data.shape[-1]
